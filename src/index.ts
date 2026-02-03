@@ -53,3 +53,7 @@ export { PatternDetector } from './learning/patterns.js';
 export { OutcomeRecorder } from './learning/outcomes.js';
 export { calculateSavings, calculateCost, getModelPricing, MODEL_PRICING } from './learning/savings.js';
 export type { SavingsReport, ModelCostBreakdown } from './learning/savings.js';
+
+// Config
+export { loadConfig, watchConfig, getStrategy, getConfigPath, DEFAULT_CONFIG } from './config.js';
+export type { Config, StrategyConfig } from './config.js';

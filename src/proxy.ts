@@ -17,10 +17,11 @@ import * as http from 'node:http';
 import * as url from 'node:url';
 import { RelayPlane } from './relay.js';
 import { inferTaskType, getInferenceConfidence } from './routing/inference.js';
+import { loadConfig, watchConfig, getStrategy, type Config } from './config.js';
 import type { Provider, TaskType } from './types.js';
 
 /** Package version */
-const VERSION = '0.1.7';
+const VERSION = '0.1.8';
 
 /** Recent runs buffer for /runs endpoint */
 interface RecentRun {
@@ -42,6 +43,9 @@ const modelCounts: Record<string, number> = {};
 
 /** Server start time for uptime */
 let serverStartTime: number = 0;
+
+/** Current configuration (hot-reloadable) */
+let currentConfig: Config = loadConfig();
 
 /**
  * Provider endpoint configuration
@@ -1361,41 +1365,55 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // Smart routing only for RelayPlane models
     if (routingMode !== 'passthrough') {
-      // Check if there's a learned rule for this task type
-      const rule = relay.routing.get(taskType);
+      // 1. Check config strategies first (user-defined)
+      const configStrategy = getStrategy(currentConfig, taskType);
 
-      if (rule && rule.preferredModel) {
-        const parsed = parsePreferredModel(rule.preferredModel);
+      if (configStrategy) {
+        const parsed = parsePreferredModel(configStrategy.model);
         if (parsed) {
           targetProvider = parsed.provider;
           targetModel = parsed.model;
-          log(`Using learned rule: ${rule.preferredModel}`);
+          log(`Using config strategy: ${configStrategy.model}`);
+        }
+      }
+
+      // 2. If no config strategy, check learned rules
+      if (!configStrategy) {
+        const rule = relay.routing.get(taskType);
+
+        if (rule && rule.preferredModel) {
+          const parsed = parsePreferredModel(rule.preferredModel);
+          if (parsed) {
+            targetProvider = parsed.provider;
+            targetModel = parsed.model;
+            log(`Using learned rule: ${rule.preferredModel}`);
+          } else {
+            // Fallback to defaults
+            const defaultRoute = DEFAULT_ROUTING[taskType];
+            targetProvider = defaultRoute.provider;
+            targetModel = defaultRoute.model;
+          }
         } else {
-          // Fallback to defaults
+          // Use default routing
           const defaultRoute = DEFAULT_ROUTING[taskType];
           targetProvider = defaultRoute.provider;
           targetModel = defaultRoute.model;
         }
-      } else {
-        // Use default routing
-        const defaultRoute = DEFAULT_ROUTING[taskType];
-        targetProvider = defaultRoute.provider;
-        targetModel = defaultRoute.model;
       }
 
       // Override based on routing mode
       if (routingMode === 'cost') {
-        // Prefer cheapest: Haiku for simple tasks
-        const simpleTasks: TaskType[] = ['summarization', 'data_extraction', 'translation', 'question_answering'];
-        if (simpleTasks.includes(taskType)) {
-          targetModel = 'claude-3-5-haiku-latest';
-          targetProvider = 'anthropic';
-        }
+        // Use config's cost model or fallback
+        const costModel = currentConfig.defaults?.costModel || 'claude-3-5-haiku-latest';
+        targetModel = costModel;
+        targetProvider = 'anthropic';
+        log(`Cost mode: using ${costModel}`);
       } else if (routingMode === 'quality') {
-        // Quality mode: Always use the best available model
-        const qualityModel = process.env['RELAYPLANE_QUALITY_MODEL'] || 'claude-sonnet-4-20250514';
+        // Use config's quality model or fallback
+        const qualityModel = currentConfig.defaults?.qualityModel || process.env['RELAYPLANE_QUALITY_MODEL'] || 'claude-sonnet-4-20250514';
         targetModel = qualityModel;
         targetProvider = 'anthropic';
+        log(`Quality mode: using ${qualityModel}`);
       }
     }
 
@@ -1452,6 +1470,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   });
 
+  // Set up config hot-reload
+  watchConfig((newConfig) => {
+    currentConfig = newConfig;
+    console.log('[relayplane] Config reloaded');
+  });
+
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, host, () => {
@@ -1460,6 +1484,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       console.log(`  Models: relayplane:auto, relayplane:cost, relayplane:quality`);
       console.log(`  Endpoint: POST /v1/chat/completions`);
       console.log(`  Stats: GET /stats, /runs, /health`);
+      console.log(`  Config: ~/.relayplane/config.json (hot-reload enabled)`);
       console.log(`  Streaming: ✅ Enabled`);
       resolve(server);
     });
