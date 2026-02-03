@@ -107,7 +107,7 @@ Or pass through explicit models: `claude-3-5-sonnet-latest`, `gpt-4o`, etc.
 
 | Without RelayPlane | With RelayPlane |
 |-------------------|-----------------|
-| Pay Opus prices for simple tasks | Route simple tasks to Haiku (1/10 cost) |
+| Pay Opus token rates for simple tasks | Route simple tasks to Haiku (1/10 the cost) |
 | Static model selection | Learns from outcomes over time |
 | Manual optimization | Automatic cost-quality balance |
 | No visibility into spend | Built-in savings tracking |
