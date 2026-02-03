@@ -104,11 +104,13 @@ INSERT OR IGNORE INTO schema_version (version) VALUES (1);
  * Using -latest suffix for automatic model updates.
  */
 export const DEFAULT_ROUTING_RULES = [
-  { taskType: 'code_generation', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
-  { taskType: 'code_review', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
+  // Complex tasks → Sonnet (need reasoning & quality)
+  { taskType: 'code_generation', preferredModel: 'anthropic:claude-sonnet-4-20250514' },
+  { taskType: 'code_review', preferredModel: 'anthropic:claude-sonnet-4-20250514' },
+  { taskType: 'analysis', preferredModel: 'anthropic:claude-sonnet-4-20250514' },
+  { taskType: 'creative_writing', preferredModel: 'anthropic:claude-sonnet-4-20250514' },
+  // Simple tasks → Haiku (cost efficient)
   { taskType: 'summarization', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
-  { taskType: 'analysis', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
-  { taskType: 'creative_writing', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
   { taskType: 'data_extraction', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
   { taskType: 'translation', preferredModel: 'anthropic:claude-3-5-haiku-latest' },
   { taskType: 'question_answering', preferredModel: 'anthropic:claude-3-5-haiku-latest' },

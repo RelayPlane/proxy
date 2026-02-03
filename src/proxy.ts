@@ -75,11 +75,16 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
  * Uses Haiku 3.5 for cost optimization, upgrades based on learned rules
  */
 const DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> = {
-  code_generation: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  code_review: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
+  // Complex tasks → Sonnet (need reasoning & quality)
+  code_review: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  analysis: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  creative_writing: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  
+  // Medium tasks → Sonnet (benefit from better model)
+  code_generation: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  
+  // Simple tasks → Haiku (cost efficient)
   summarization: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  analysis: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  creative_writing: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
   data_extraction: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
   translation: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
   question_answering: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
