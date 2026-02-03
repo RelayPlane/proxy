@@ -14,9 +14,34 @@
  */
 
 import * as http from 'node:http';
+import * as url from 'node:url';
 import { RelayPlane } from './relay.js';
 import { inferTaskType, getInferenceConfidence } from './routing/inference.js';
 import type { Provider, TaskType } from './types.js';
+
+/** Package version */
+const VERSION = '0.1.7';
+
+/** Recent runs buffer for /runs endpoint */
+interface RecentRun {
+  runId: string;
+  timestamp: string;
+  model: string;
+  taskType: TaskType;
+  confidence: number;
+  mode: string;
+  durationMs: number;
+  promptPreview: string;
+}
+
+const recentRuns: RecentRun[] = [];
+const MAX_RECENT_RUNS = 100;
+
+/** Model distribution tracking */
+const modelCounts: Record<string, number> = {};
+
+/** Server start time for uptime */
+let serverStartTime: number = 0;
 
 /**
  * Provider endpoint configuration
@@ -1164,7 +1189,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   const server = http.createServer(async (req, res) => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
     if (req.method === 'OPTIONS') {
@@ -1173,24 +1198,107 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
-    // Only handle POST to /v1/chat/completions
-    if (req.method !== 'POST' || !req.url?.includes('/chat/completions')) {
-      // Return model list for /v1/models
-      if (req.method === 'GET' && req.url?.includes('/models')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            object: 'list',
-            data: [
-              { id: 'relayplane:auto', object: 'model', owned_by: 'relayplane' },
-              { id: 'relayplane:cost', object: 'model', owned_by: 'relayplane' },
-              { id: 'relayplane:quality', object: 'model', owned_by: 'relayplane' },
-            ],
-          })
-        );
-        return;
+    const parsedUrl = url.parse(req.url || '', true);
+    const pathname = parsedUrl.pathname || '';
+
+    // =========================================================================
+    // GET /health - Server health and version info
+    // =========================================================================
+    if (req.method === 'GET' && pathname === '/health') {
+      const uptimeMs = Date.now() - serverStartTime;
+      const uptimeSecs = Math.floor(uptimeMs / 1000);
+      const hours = Math.floor(uptimeSecs / 3600);
+      const mins = Math.floor((uptimeSecs % 3600) / 60);
+      const secs = uptimeSecs % 60;
+
+      // Check which providers have API keys
+      const providers: Record<string, boolean> = {};
+      for (const [name, config] of Object.entries(DEFAULT_ENDPOINTS)) {
+        providers[name] = !!process.env[config.apiKeyEnv];
       }
 
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        version: VERSION,
+        uptime: `${hours}h ${mins}m ${secs}s`,
+        uptimeMs,
+        providers,
+        totalRuns: recentRuns.length > 0 ? Object.values(modelCounts).reduce((a, b) => a + b, 0) : 0,
+      }));
+      return;
+    }
+
+    // =========================================================================
+    // GET /stats - Aggregated statistics
+    // =========================================================================
+    if (req.method === 'GET' && pathname === '/stats') {
+      const stats = relay.stats();
+      const savings = relay.savingsReport(30);
+
+      // Calculate model distribution from our tracking
+      const totalRuns = Object.values(modelCounts).reduce((a, b) => a + b, 0);
+      const modelDistribution: Record<string, { count: number; percentage: string }> = {};
+      
+      for (const [model, count] of Object.entries(modelCounts)) {
+        modelDistribution[model] = {
+          count,
+          percentage: totalRuns > 0 ? ((count / totalRuns) * 100).toFixed(1) + '%' : '0%',
+        };
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        totalRuns,
+        savings: {
+          estimatedSavingsPercent: savings.savingsPercent.toFixed(1) + '%',
+          actualCostUsd: savings.actualCost.toFixed(4),
+          baselineCostUsd: savings.baselineCost.toFixed(4),
+          savedUsd: savings.savings.toFixed(4),
+        },
+        modelDistribution,
+        byTaskType: stats.byTaskType,
+        period: stats.period,
+      }));
+      return;
+    }
+
+    // =========================================================================
+    // GET /runs - Recent routing decisions
+    // =========================================================================
+    if (req.method === 'GET' && pathname === '/runs') {
+      const limitParam = parsedUrl.query['limit'];
+      const parsedLimit = limitParam ? parseInt(String(limitParam), 10) : 20;
+      const limit = Math.min(Number.isNaN(parsedLimit) ? 20 : parsedLimit, MAX_RECENT_RUNS);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        runs: recentRuns.slice(0, limit),
+        total: recentRuns.length,
+      }));
+      return;
+    }
+
+    // =========================================================================
+    // GET /models - Available models
+    // =========================================================================
+    if (req.method === 'GET' && pathname.includes('/models')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          object: 'list',
+          data: [
+            { id: 'relayplane:auto', object: 'model', owned_by: 'relayplane' },
+            { id: 'relayplane:cost', object: 'model', owned_by: 'relayplane' },
+            { id: 'relayplane:quality', object: 'model', owned_by: 'relayplane' },
+          ],
+        })
+      );
+      return;
+    }
+
+    // Only handle POST to /v1/chat/completions
+    if (req.method !== 'POST' || !pathname.includes('/chat/completions')) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found' }));
       return;
@@ -1347,9 +1455,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, host, () => {
+      serverStartTime = Date.now();
       console.log(`RelayPlane proxy listening on http://${host}:${port}`);
       console.log(`  Models: relayplane:auto, relayplane:cost, relayplane:quality`);
       console.log(`  Endpoint: POST /v1/chat/completions`);
+      console.log(`  Stats: GET /stats, /runs, /health`);
       console.log(`  Streaming: ✅ Enabled`);
       resolve(server);
     });
@@ -1440,6 +1550,10 @@ async function handleStreamingRequest(
   }
 
   const durationMs = Date.now() - startTime;
+  const modelKey = `${targetProvider}/${targetModel}`;
+
+  // Track model distribution
+  modelCounts[modelKey] = (modelCounts[modelKey] || 0) + 1;
 
   // Record the run (non-blocking)
   relay
@@ -1449,6 +1563,20 @@ async function handleStreamingRequest(
       model: `${targetProvider}:${targetModel}`,
     })
     .then((runResult) => {
+      // Track recent run for /runs endpoint
+      recentRuns.unshift({
+        runId: runResult.runId,
+        timestamp: new Date().toISOString(),
+        model: modelKey,
+        taskType,
+        confidence,
+        mode: routingMode,
+        durationMs,
+        promptPreview: promptText.slice(0, 100) + (promptText.length > 100 ? '...' : ''),
+      });
+      if (recentRuns.length > MAX_RECENT_RUNS) {
+        recentRuns.pop();
+      }
       log(`Completed streaming in ${durationMs}ms, runId: ${runResult.runId}`);
     })
     .catch((err) => {
@@ -1550,6 +1678,10 @@ async function handleNonStreamingRequest(
   }
 
   const durationMs = Date.now() - startTime;
+  const modelKey = `${targetProvider}/${targetModel}`;
+
+  // Track model distribution
+  modelCounts[modelKey] = (modelCounts[modelKey] || 0) + 1;
 
   // Record the run in RelayPlane
   try {
@@ -1559,10 +1691,25 @@ async function handleNonStreamingRequest(
       model: `${targetProvider}:${targetModel}`,
     });
 
+    // Track recent run for /runs endpoint
+    recentRuns.unshift({
+      runId: runResult.runId,
+      timestamp: new Date().toISOString(),
+      model: modelKey,
+      taskType,
+      confidence,
+      mode: routingMode,
+      durationMs,
+      promptPreview: promptText.slice(0, 100) + (promptText.length > 100 ? '...' : ''),
+    });
+    if (recentRuns.length > MAX_RECENT_RUNS) {
+      recentRuns.pop();
+    }
+
     // Add routing metadata to response
     responseData['_relayplane'] = {
       runId: runResult.runId,
-      routedTo: `${targetProvider}/${targetModel}`,
+      routedTo: modelKey,
       taskType,
       confidence,
       durationMs,

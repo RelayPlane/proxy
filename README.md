@@ -176,13 +176,85 @@ Options:
   -h, --help         Show help
 ```
 
+## REST API
+
+The proxy exposes endpoints for stats and monitoring:
+
+### `GET /health`
+
+Server health and version info.
+
+```bash
+curl http://localhost:3001/health
+```
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.7",
+  "uptime": "2h 15m 30s",
+  "providers": { "anthropic": true, "openai": true, "google": false },
+  "totalRuns": 142
+}
+```
+
+### `GET /stats`
+
+Aggregated statistics and cost savings.
+
+```bash
+curl http://localhost:3001/stats
+```
+
+```json
+{
+  "totalRuns": 142,
+  "savings": {
+    "estimatedSavingsPercent": "73.2%",
+    "actualCostUsd": "0.0234",
+    "baselineCostUsd": "0.0873",
+    "savedUsd": "0.0639"
+  },
+  "modelDistribution": {
+    "anthropic/claude-3-5-haiku-latest": { "count": 98, "percentage": "69.0%" },
+    "anthropic/claude-sonnet-4-20250514": { "count": 44, "percentage": "31.0%" }
+  }
+}
+```
+
+### `GET /runs`
+
+Recent routing decisions.
+
+```bash
+curl "http://localhost:3001/runs?limit=10"
+```
+
+```json
+{
+  "runs": [
+    {
+      "runId": "abc123",
+      "timestamp": "2026-02-03T13:26:03Z",
+      "model": "anthropic/claude-3-5-haiku-latest",
+      "taskType": "code_generation",
+      "confidence": 0.92,
+      "mode": "auto",
+      "durationMs": 1203,
+      "promptPreview": "Write a function that..."
+    }
+  ],
+  "total": 142
+}
+```
+
 ## Data Storage
 
 All data stored locally at `~/.relayplane/data.db` (SQLite).
 
 ```bash
 # View recent runs
-sqlite3 ~/.relayplane/data.db "SELECT * FROM runs ORDER BY timestamp DESC LIMIT 10"
+sqlite3 ~/.relayplane/data.db "SELECT * FROM runs ORDER BY created_at DESC LIMIT 10"
 
 # Check routing rules
 sqlite3 ~/.relayplane/data.db "SELECT * FROM routing_rules"
