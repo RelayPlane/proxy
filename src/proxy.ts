@@ -41,6 +41,95 @@ const MAX_RECENT_RUNS = 100;
 /** Model distribution tracking */
 const modelCounts: Record<string, number> = {};
 
+/** Token tracking per model */
+interface TokenStats {
+  inputTokens: number;
+  outputTokens: number;
+  requests: number;
+}
+const tokenStats: Record<string, TokenStats> = {};
+
+/** Pricing per 1M tokens (USD) - updated Feb 2026 */
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  // Anthropic
+  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  'claude-3-5-haiku-20241022': { input: 1.00, output: 5.00 },
+  'claude-3-5-haiku-latest': { input: 1.00, output: 5.00 },
+  'claude-3-5-sonnet-20241022': { input: 3.00, output: 15.00 },
+  'claude-sonnet-4-20250514': { input: 3.00, output: 15.00 },
+  'claude-3-opus-20240229': { input: 15.00, output: 75.00 },
+  'claude-opus-4-5-20250514': { input: 15.00, output: 75.00 },
+  // OpenAI
+  'gpt-4o': { input: 2.50, output: 10.00 },
+  'gpt-4o-mini': { input: 0.15, output: 0.60 },
+  'gpt-4-turbo': { input: 10.00, output: 30.00 },
+  // Defaults for unknown models
+  'default-cheap': { input: 1.00, output: 5.00 },
+  'default-expensive': { input: 15.00, output: 75.00 },
+};
+
+/** Track tokens for a model */
+function trackTokens(model: string, inputTokens: number, outputTokens: number): void {
+  if (!tokenStats[model]) {
+    tokenStats[model] = { inputTokens: 0, outputTokens: 0, requests: 0 };
+  }
+  tokenStats[model].inputTokens += inputTokens;
+  tokenStats[model].outputTokens += outputTokens;
+  tokenStats[model].requests += 1;
+}
+
+/** Calculate costs from token stats */
+function calculateCosts(): {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  actualCostUsd: number;
+  opusCostUsd: number;
+  savingsUsd: number;
+  savingsPercent: string;
+  byModel: Record<string, { inputTokens: number; outputTokens: number; costUsd: number }>;
+} {
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let actualCostUsd = 0;
+  const byModel: Record<string, { inputTokens: number; outputTokens: number; costUsd: number }> = {};
+
+  for (const [model, stats] of Object.entries(tokenStats)) {
+    totalInputTokens += stats.inputTokens;
+    totalOutputTokens += stats.outputTokens;
+
+    const pricing = MODEL_PRICING[model] || MODEL_PRICING['default-cheap'];
+    const cost = (stats.inputTokens / 1_000_000 * pricing.input) + 
+                 (stats.outputTokens / 1_000_000 * pricing.output);
+    actualCostUsd += cost;
+
+    byModel[model] = {
+      inputTokens: stats.inputTokens,
+      outputTokens: stats.outputTokens,
+      costUsd: parseFloat(cost.toFixed(4)),
+    };
+  }
+
+  // Calculate what it would cost if everything was Opus
+  const opusPricing = MODEL_PRICING['claude-opus-4-5-20250514'];
+  const opusCostUsd = (totalInputTokens / 1_000_000 * opusPricing.input) + 
+                       (totalOutputTokens / 1_000_000 * opusPricing.output);
+
+  const savingsUsd = opusCostUsd - actualCostUsd;
+  const savingsPercent = opusCostUsd > 0 
+    ? ((savingsUsd / opusCostUsd) * 100).toFixed(1) + '%'
+    : '0%';
+
+  return {
+    totalInputTokens,
+    totalOutputTokens,
+    actualCostUsd: parseFloat(actualCostUsd.toFixed(4)),
+    opusCostUsd: parseFloat(opusCostUsd.toFixed(4)),
+    savingsUsd: parseFloat(savingsUsd.toFixed(4)),
+    savingsPercent,
+    byModel,
+  };
+}
+
 /** Server start time for uptime */
 let serverStartTime: number = 0;
 
@@ -1035,6 +1124,15 @@ function convertAnthropicStreamEvent(
   }
 }
 
+/** Streaming usage tracking */
+interface StreamingUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/** Global to capture streaming usage (set by convertAnthropicStream) */
+let lastStreamingUsage: StreamingUsage | null = null;
+
 /**
  * Parse SSE stream from Anthropic and convert to OpenAI format
  */
@@ -1056,6 +1154,10 @@ async function* convertAnthropicStream(
     currentToolIndex: 0,
     tools: new Map(),
   };
+
+  // Track usage from stream events
+  let streamInputTokens = 0;
+  let streamOutputTokens = 0;
 
   try {
     while (true) {
@@ -1080,6 +1182,20 @@ async function* convertAnthropicStream(
           // Complete event, process it
           try {
             const parsed = JSON.parse(eventData) as Record<string, unknown>;
+            
+            // Extract usage from Anthropic stream events
+            if (eventType === 'message_start') {
+              const msg = parsed['message'] as { usage?: { input_tokens?: number } } | undefined;
+              if (msg?.usage?.input_tokens) {
+                streamInputTokens = msg.usage.input_tokens;
+              }
+            } else if (eventType === 'message_delta') {
+              const usage = parsed['usage'] as { output_tokens?: number } | undefined;
+              if (usage?.output_tokens) {
+                streamOutputTokens = usage.output_tokens;
+              }
+            }
+            
             const converted = convertAnthropicStreamEvent(eventType, parsed, messageId, model, toolState);
             if (converted) {
               yield converted;
@@ -1092,6 +1208,9 @@ async function* convertAnthropicStream(
         }
       }
     }
+    
+    // Store final usage for tracking
+    lastStreamingUsage = { inputTokens: streamInputTokens, outputTokens: streamOutputTokens };
   } finally {
     reader.releaseLock();
   }
@@ -1254,31 +1373,40 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // =========================================================================
-    // GET /stats - Aggregated statistics
+    // GET /stats - Aggregated statistics with real token-based costs
     // =========================================================================
     if (req.method === 'GET' && pathname === '/stats') {
       const stats = relay.stats();
-      const savings = relay.savingsReport(30);
+      const costs = calculateCosts();
 
       // Calculate model distribution from our tracking
       const totalRuns = Object.values(modelCounts).reduce((a, b) => a + b, 0);
-      const modelDistribution: Record<string, { count: number; percentage: string }> = {};
+      const modelDistribution: Record<string, { count: number; percentage: string; tokens?: { input: number; output: number }; costUsd?: number }> = {};
       
       for (const [model, count] of Object.entries(modelCounts)) {
+        const modelName = model.split('/')[1] || model;
+        const tokenData = costs.byModel[modelName];
         modelDistribution[model] = {
           count,
           percentage: totalRuns > 0 ? ((count / totalRuns) * 100).toFixed(1) + '%' : '0%',
+          tokens: tokenData ? { input: tokenData.inputTokens, output: tokenData.outputTokens } : undefined,
+          costUsd: tokenData?.costUsd,
         };
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         totalRuns,
-        savings: {
-          estimatedSavingsPercent: savings.savingsPercent.toFixed(1) + '%',
-          actualCostUsd: savings.actualCost.toFixed(4),
-          baselineCostUsd: savings.baselineCost.toFixed(4),
-          savedUsd: savings.savings.toFixed(4),
+        tokens: {
+          input: costs.totalInputTokens,
+          output: costs.totalOutputTokens,
+          total: costs.totalInputTokens + costs.totalOutputTokens,
+        },
+        costs: {
+          actualUsd: costs.actualCostUsd,
+          opusBaselineUsd: costs.opusCostUsd,
+          savingsUsd: costs.savingsUsd,
+          savingsPercent: costs.savingsPercent,
         },
         modelDistribution,
         byTaskType: stats.byTaskType,
@@ -1619,6 +1747,13 @@ async function handleStreamingRequest(
   // Track model distribution
   modelCounts[modelKey] = (modelCounts[modelKey] || 0) + 1;
 
+  // Track token usage from streaming (captured by convertAnthropicStream)
+  if (lastStreamingUsage && (lastStreamingUsage.inputTokens > 0 || lastStreamingUsage.outputTokens > 0)) {
+    trackTokens(targetModel, lastStreamingUsage.inputTokens, lastStreamingUsage.outputTokens);
+    log(`Tokens: ${lastStreamingUsage.inputTokens} in, ${lastStreamingUsage.outputTokens} out`);
+    lastStreamingUsage = null; // Clear for next request
+  }
+
   // Record the run (non-blocking)
   relay
     .run({
@@ -1748,6 +1883,13 @@ async function handleNonStreamingRequest(
 
   // Track model distribution
   modelCounts[modelKey] = (modelCounts[modelKey] || 0) + 1;
+
+  // Track token usage (OpenAI format: usage.prompt_tokens, usage.completion_tokens)
+  const usage = responseData['usage'] as { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  if (usage?.prompt_tokens || usage?.completion_tokens) {
+    trackTokens(targetModel, usage.prompt_tokens ?? 0, usage.completion_tokens ?? 0);
+    log(`Tokens: ${usage.prompt_tokens ?? 0} in, ${usage.completion_tokens ?? 0} out`);
+  }
 
   // Record the run in RelayPlane
   try {

@@ -2,28 +2,6 @@
 
 const PROXY_URL = 'http://127.0.0.1:3001';
 
-// Anthropic API pricing per 1M tokens (as of Feb 2024)
-const MODEL_PRICING = {
-  'anthropic/claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
-  'anthropic/claude-3-5-haiku-latest': { input: 1.00, output: 5.00 },
-  'anthropic/claude-3-5-sonnet-20241022': { input: 3.00, output: 15.00 },
-  'anthropic/claude-sonnet-4-20250514': { input: 3.00, output: 15.00 }, // Assuming similar to Sonnet 3.5
-  'anthropic/claude-3-opus-20240229': { input: 15.00, output: 75.00 },
-  'anthropic/claude-opus-4-5-20250514': { input: 15.00, output: 75.00 }, // Assuming similar to Opus 3
-};
-
-function estimateTokens(avgLatencyMs, requestCount) {
-  // Rough estimation: longer responses = more tokens
-  // This is very approximate - ideally we'd track actual token usage
-  const avgResponseTokens = Math.max(50, Math.min(500, avgLatencyMs / 10));
-  const avgInputTokens = 200; // Estimate based on conversation context
-  
-  return {
-    inputTokens: avgInputTokens * requestCount,
-    outputTokens: avgResponseTokens * requestCount
-  };
-}
-
 async function callProxy(endpoint) {
   try {
     const response = await fetch(`${PROXY_URL}${endpoint}`);
@@ -36,108 +14,68 @@ async function callProxy(endpoint) {
   }
 }
 
-function formatUptime(ms) {
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  
-  if (hours > 0) return `${hours}h ${minutes % 60}m`;
-  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
-  return `${seconds}s`;
-}
-
-function calculateCosts(modelCounts, totalRequests, avgLatencyMs) {
-  const tokenEstimate = estimateTokens(avgLatencyMs, totalRequests);
-  
-  let actualCost = 0;
-  let opusCost = 0;
-  
-  // Calculate actual cost based on models used
-  for (const [model, count] of Object.entries(modelCounts)) {
-    const pricing = MODEL_PRICING[model];
-    if (pricing) {
-      const requestRatio = count / totalRequests;
-      const inputTokens = tokenEstimate.inputTokens * requestRatio;
-      const outputTokens = tokenEstimate.outputTokens * requestRatio;
-      
-      actualCost += (inputTokens / 1000000 * pricing.input) + (outputTokens / 1000000 * pricing.output);
-    }
-  }
-  
-  // Calculate what it would cost if all requests used Opus
-  const opusPricing = MODEL_PRICING['anthropic/claude-3-opus-20240229'];
-  if (opusPricing) {
-    opusCost = (tokenEstimate.inputTokens / 1000000 * opusPricing.input) + 
-               (tokenEstimate.outputTokens / 1000000 * opusPricing.output);
-  }
-  
-  const savings = opusCost - actualCost;
-  const savingsPercent = opusCost > 0 ? ((savings / opusCost) * 100).toFixed(1) : 0;
-  
-  return {
-    actualCost: actualCost.toFixed(4),
-    opusCost: opusCost.toFixed(4),
-    savings: savings.toFixed(4),
-    savingsPercent,
-    tokenEstimate
-  };
-}
-
 function formatStats(stats) {
   const { 
-    totalRequests, 
-    successfulRequests, 
-    failedRequests, 
-    successRate, 
-    avgLatencyMs, 
-    escalations,
-    uptimeMs,
-    routingCounts,
-    modelCounts
+    totalRuns,
+    tokens,
+    costs,
+    modelDistribution,
   } = stats;
 
-  const costs = calculateCosts(modelCounts, totalRequests, avgLatencyMs);
-
   let output = `**RelayPlane Statistics**\n`;
-  output += `• **Uptime:** ${formatUptime(uptimeMs)}\n`;
-  output += `• **Requests:** ${totalRequests} total, ${successfulRequests} success, ${failedRequests} failed\n`;
-  output += `• **Success Rate:** ${successRate}\n`;
-  output += `• **Avg Latency:** ${avgLatencyMs}ms\n`;
-  output += `• **Escalations:** ${escalations}\n\n`;
+  output += `• **Requests:** ${totalRuns || 0} total\n\n`;
 
-  output += `**💰 Cost Analysis** *(estimated)*\n`;
-  output += `• **Actual Cost:** $${costs.actualCost}\n`;
-  output += `• **All-Opus Cost:** $${costs.opusCost}\n`;
-  output += `• **Savings:** $${costs.savings} (${costs.savingsPercent}%)\n`;
-  output += `• **Token Est:** ${costs.tokenEstimate.inputTokens.toLocaleString()} in, ${costs.tokenEstimate.outputTokens.toLocaleString()} out\n\n`;
-
-  if (Object.keys(routingCounts).length > 0) {
-    output += `**Routing Modes:**\n`;
-    for (const [mode, count] of Object.entries(routingCounts)) {
-      output += `• ${mode}: ${count} requests\n`;
-    }
-    output += `\n`;
+  if (tokens && (tokens.input > 0 || tokens.output > 0)) {
+    output += `**📊 Token Usage**\n`;
+    output += `• **Input:** ${(tokens.input || 0).toLocaleString()} tokens\n`;
+    output += `• **Output:** ${(tokens.output || 0).toLocaleString()} tokens\n`;
+    output += `• **Total:** ${(tokens.total || 0).toLocaleString()} tokens\n\n`;
   }
 
-  if (Object.keys(modelCounts).length > 0) {
+  if (costs && costs.actualUsd > 0) {
+    output += `**💰 Cost Analysis**\n`;
+    output += `• **Actual Cost:** $${costs.actualUsd}\n`;
+    output += `• **Opus Baseline:** $${costs.opusBaselineUsd}\n`;
+    output += `• **Savings:** $${costs.savingsUsd} (${costs.savingsPercent})\n\n`;
+  }
+
+  if (modelDistribution && Object.keys(modelDistribution).length > 0) {
     output += `**Models Used:**\n`;
-    for (const [model, count] of Object.entries(modelCounts)) {
+    for (const [model, data] of Object.entries(modelDistribution)) {
       const shortModel = model.split('/')[1]?.replace(/^claude-/, '').replace(/-\d+.*$/, '') || model;
-      output += `• ${shortModel}: ${count} requests\n`;
+      let line = `• ${shortModel}: ${data.count} reqs`;
+      if (data.tokens) {
+        line += ` (${(data.tokens.input || 0).toLocaleString()}/${(data.tokens.output || 0).toLocaleString()} tokens)`;
+      }
+      if (data.costUsd !== undefined && data.costUsd > 0) {
+        line += ` $${data.costUsd}`;
+      }
+      output += line + '\n';
     }
+  }
+
+  if (!tokens && !costs && (!modelDistribution || Object.keys(modelDistribution).length === 0)) {
+    output += `\n_No requests tracked yet. Start using the proxy to see statistics._`;
   }
 
   return output;
 }
 
 function formatStatus(status) {
-  const { enabled, mode, modelOverrides } = status;
+  const { enabled, mode, modelOverrides, uptimeMs } = status;
   
   let output = `**RelayPlane Status**\n`;
   output += `• **Enabled:** ${enabled ? '✅' : '❌'}\n`;
-  output += `• **Mode:** ${mode}\n`;
+  if (uptimeMs) {
+    const mins = Math.floor(uptimeMs / 60000);
+    const secs = Math.floor((uptimeMs % 60000) / 1000);
+    output += `• **Uptime:** ${mins}m ${secs}s\n`;
+  }
+  if (mode) {
+    output += `• **Mode:** ${mode}\n`;
+  }
 
-  if (Object.keys(modelOverrides).length > 0) {
+  if (modelOverrides && Object.keys(modelOverrides).length > 0) {
     output += `\n**Model Overrides:**\n`;
     for (const [from, to] of Object.entries(modelOverrides)) {
       output += `• ${from} → ${to}\n`;
@@ -152,10 +90,7 @@ async function switchMode(mode) {
   if (!validModes.includes(mode)) {
     return `❌ Invalid mode. Use: ${validModes.join(', ')}`;
   }
-
-  // Switch via OpenClaw model change  
-  const modelName = `relayplane/${mode}`;
-  return `Switching to **${mode}** mode.\nUse: \`/model ${modelName}\``;
+  return `Switch to **${mode}** mode:\n\`/model relayplane/${mode}\``;
 }
 
 function listModels() {
@@ -182,13 +117,13 @@ async function main() {
   try {
     switch (command) {
       case 'stats':
-        const stats = await callProxy('/control/stats');
+        const stats = await callProxy('/stats');
         console.log(formatStats(stats));
         break;
         
       case 'status':
-        const status = await callProxy('/control/status');
-        console.log(formatStatus(status));
+        const health = await callProxy('/health');
+        console.log(formatStatus(health));
         break;
         
       case 'switch':
