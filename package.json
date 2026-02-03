@@ -1,6 +1,6 @@
 {
   "name": "@relayplane/proxy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "RelayPlane Proxy - Intelligent AI model routing for cost optimization. 100% local, zero cloud dependency.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
