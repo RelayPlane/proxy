@@ -142,7 +142,7 @@ Unlike static routing rules, RelayPlane adapts to **your** usage patterns.
 |----------|--------|-----------|-------|
 | **Anthropic** | Claude 3.5 Haiku, Sonnet 4, Opus 4.5 | ✓ | ✓ |
 | **OpenAI** | GPT-4o, GPT-4o-mini, GPT-4.1, o1, o3 | ✓ | ✓ |
-| **Google** | Gemini 2.0 Flash, Gemini Pro | ✓ | ✓ |
+| **Google** | Gemini 1.5 Flash, Gemini 1.5 Pro | ✓ | ✓ |
 | **xAI** | Grok (grok-*) | ✓ | ✓ |
 | **Moonshot** | Moonshot v1 (8k, 32k, 128k) | ✓ | ✓ |
 
@@ -365,7 +365,7 @@ sqlite3 ~/.relayplane/data.db "SELECT * FROM routing_rules"
 
 **Website:** https://relayplane.com
 
-**Docs:** https://relayplane.com/integrations/openclaw
+**Integration Guide:** https://relayplane.com/integrations/openclaw
 
 **GitHub:** https://github.com/RelayPlane/proxy
 

@@ -81,7 +81,7 @@ openclaw  # or any tool
 
 - **Anthropic:** Claude 3.5 Haiku, Sonnet 4, Opus 4.5
 - **OpenAI:** GPT-4o, GPT-4o-mini, o1, o3
-- **Google:** Gemini 2.0 Flash, Gemini Pro
+- **Google:** Gemini 1.5 Flash, Gemini 1.5 Pro
 - **xAI:** Grok models
 - **Moonshot:** v1 (8k, 32k, 128k)
 
@@ -162,7 +162,7 @@ Check `ANTHROPIC_BASE_URL` is set to `http://localhost:3001`
 
 **Website:** https://relayplane.com
 
-**Docs:** https://relayplane.com/integrations/openclaw
+**Integration Guide:** https://relayplane.com/integrations/openclaw
 
 **GitHub:** https://github.com/RelayPlane/proxy
 
