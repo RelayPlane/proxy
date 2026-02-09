@@ -25,6 +25,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { RelayPlane, inferTaskType, getInferenceConfidence } from '@relayplane/core';
 import type { Provider, TaskType } from '@relayplane/core';
+import { buildModelNotFoundError } from './utils/model-suggestions.js';
 
 /**
  * Provider endpoint configuration
@@ -70,13 +71,64 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
   'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
   'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
   haiku: { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
-  sonnet: { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
-  opus: { provider: 'anthropic', model: 'claude-3-opus-20240229' },
+  sonnet: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  opus: { provider: 'anthropic', model: 'claude-opus-4-5-20250514' },
   // OpenAI models
   'gpt-4o': { provider: 'openai', model: 'gpt-4o' },
   'gpt-4o-mini': { provider: 'openai', model: 'gpt-4o-mini' },
   'gpt-4.1': { provider: 'openai', model: 'gpt-4.1' },
 };
+
+/**
+ * RelayPlane model aliases - resolve before routing
+ * These are user-friendly aliases that map to internal routing modes
+ */
+export const RELAYPLANE_ALIASES: Record<string, string> = {
+  'relayplane:auto': 'rp:balanced',
+  'rp:auto': 'rp:balanced',
+};
+
+/**
+ * Smart routing aliases - map to specific provider/model combinations
+ * These provide semantic shortcuts for common use cases
+ */
+export const SMART_ALIASES: Record<string, { provider: Provider; model: string }> = {
+  // Best quality model (current flagship)
+  'rp:best': { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  // Fast/cheap model for simple tasks
+  'rp:fast': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
+  'rp:cheap': { provider: 'openai', model: 'gpt-4o-mini' },
+  // Balanced model for general use (good quality/cost tradeoff)
+  'rp:balanced': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
+};
+
+/**
+ * Get all available model names for error suggestions
+ */
+export function getAvailableModelNames(): string[] {
+  return [
+    ...Object.keys(MODEL_MAPPING),
+    ...Object.keys(SMART_ALIASES),
+    ...Object.keys(RELAYPLANE_ALIASES),
+    // Add common model prefixes users might type
+    'relayplane:auto',
+    'relayplane:cost',
+    'relayplane:fast',
+    'relayplane:quality',
+  ];
+}
+
+/**
+ * Resolve model aliases before routing
+ * Returns the resolved model name (may be same as input if no alias found)
+ */
+export function resolveModelAlias(model: string): string {
+  // Check RELAYPLANE_ALIASES first (e.g., relayplane:auto → rp:balanced)
+  if (RELAYPLANE_ALIASES[model]) {
+    return RELAYPLANE_ALIASES[model];
+  }
+  return model;
+}
 
 /**
  * Default routing based on task type
@@ -332,18 +384,18 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     cascade: {
       enabled: true,
       models: [
-        'claude-3-haiku-20240307',
-        'claude-3-5-sonnet-20241022',
-        'claude-3-opus-20240229',
+        'claude-3-5-haiku-20241022',
+        'claude-sonnet-4-20250514',
+        'claude-opus-4-5-20250514',
       ],
       escalateOn: 'uncertainty',
       maxEscalations: 1,
     },
     complexity: {
       enabled: true,
-      simple: 'claude-3-haiku-20240307',
-      moderate: 'claude-3-5-sonnet-20241022',
-      complex: 'claude-3-opus-20240229',
+      simple: 'claude-3-5-haiku-20241022',
+      moderate: 'claude-sonnet-4-20250514',
+      complex: 'claude-opus-4-5-20250514',
     },
   },
   reliability: {
@@ -633,8 +685,15 @@ function buildAnthropicHeaders(
 
   // Auth: prefer incoming auth for passthrough, fallback to env
   if (ctx.authHeader) {
-    // Claude Code sends "Authorization: Bearer <token>" for OAuth
-    headers['Authorization'] = ctx.authHeader;
+    // Extract the token from "Bearer <token>"
+    const token = ctx.authHeader.replace(/^Bearer\s+/i, '');
+    // MAX tokens (sk-ant-oat*) use Authorization: Bearer, API keys use x-api-key
+    if (token.startsWith('sk-ant-oat')) {
+      headers['Authorization'] = ctx.authHeader;
+    } else {
+      // Regular API keys should use x-api-key header
+      headers['x-api-key'] = token;
+    }
   } else if (ctx.apiKeyHeader) {
     // Direct x-api-key header
     headers['x-api-key'] = ctx.apiKeyHeader;
@@ -1613,8 +1672,21 @@ function parsePreferredModel(
 function resolveExplicitModel(
   modelName: string
 ): { provider: Provider; model: string } | null {
-  // Check MODEL_MAPPING first (aliases)
-  if (MODEL_MAPPING[modelName]) {
+  // Resolve aliases first (e.g., relayplane:auto → rp:balanced)
+  const resolvedAlias = resolveModelAlias(modelName);
+
+  // Check SMART_ALIASES (rp:best, rp:fast, etc.)
+  if (SMART_ALIASES[resolvedAlias]) {
+    return SMART_ALIASES[resolvedAlias];
+  }
+
+  // Check MODEL_MAPPING (aliases)
+  if (MODEL_MAPPING[resolvedAlias]) {
+    return MODEL_MAPPING[resolvedAlias];
+  }
+
+  // If alias was resolved but not in mappings, try original name
+  if (resolvedAlias !== modelName && MODEL_MAPPING[modelName]) {
     return MODEL_MAPPING[modelName];
   }
 
@@ -1796,7 +1868,7 @@ function getCascadeConfig(config: RelayPlaneProxyConfigFile): CascadeConfig {
   const c = config.routing?.cascade;
   return {
     enabled: c?.enabled ?? true,
-    models: c?.models ?? ['claude-3-haiku-20240307', 'claude-3-5-sonnet-20241022', 'claude-3-opus-20240229'],
+    models: c?.models ?? ['claude-3-5-haiku-20241022', 'claude-sonnet-4-20250514', 'claude-opus-4-5-20250514'],
     escalateOn: c?.escalateOn ?? 'uncertainty',
     maxEscalations: c?.maxEscalations ?? 1,
   };
@@ -1816,7 +1888,7 @@ function getCostModel(config: RelayPlaneProxyConfigFile): string {
   return (
     config.routing?.complexity?.simple ||
     config.routing?.cascade?.models?.[0] ||
-    'claude-3-haiku-20240307'
+    'claude-3-5-haiku-20241022'
   );
 }
 
@@ -1824,7 +1896,7 @@ function getFastModel(config: RelayPlaneProxyConfigFile): string {
   return (
     config.routing?.complexity?.simple ||
     config.routing?.cascade?.models?.[0] ||
-    'claude-3-haiku-20240307'
+    'claude-3-5-haiku-20241022'
   );
 }
 
@@ -1833,7 +1905,7 @@ function getQualityModel(config: RelayPlaneProxyConfigFile): string {
     config.routing?.complexity?.complex ||
     config.routing?.cascade?.models?.[config.routing?.cascade?.models?.length ? config.routing.cascade.models.length - 1 : 0] ||
     process.env['RELAYPLANE_QUALITY_MODEL'] ||
-    'claude-3-opus-20240229'
+    'claude-sonnet-4-20250514'
   );
 }
 
@@ -2082,6 +2154,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       }
 
+      // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+      const resolvedModel = resolveModelAlias(requestedModel);
+      if (resolvedModel !== requestedModel) {
+        log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
+        requestedModel = resolvedModel;
+      }
+
       if (requestedModel && requestedModel !== originalModel) {
         requestBody['model'] = requestedModel;
       }
@@ -2100,6 +2179,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           routingMode = 'quality';
         }
         // relayplane:auto stays as 'auto'
+      } else if (requestedModel.startsWith('rp:')) {
+        // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
+        if (requestedModel === 'rp:cost' || requestedModel === 'rp:cheap') {
+          routingMode = 'cost';
+        } else if (requestedModel === 'rp:fast') {
+          routingMode = 'fast';
+        } else if (requestedModel === 'rp:quality' || requestedModel === 'rp:best') {
+          routingMode = 'quality';
+        } else {
+          // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
+          routingMode = 'passthrough';
+        }
       } else if (requestedModel === 'auto' || requestedModel === 'relayplane:auto') {
         routingMode = 'auto';
       } else if (requestedModel === 'cost') {
@@ -2164,7 +2255,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const resolved = resolveExplicitModel(requestedModel);
         if (!resolved) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Unknown model: ${requestedModel}` }));
+          res.end(JSON.stringify(buildModelNotFoundError(requestedModel, getAvailableModelNames())));
           return;
         }
         if (resolved.provider !== 'anthropic') {
@@ -2466,6 +2557,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
+    // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+    const resolvedModel = resolveModelAlias(requestedModel);
+    if (resolvedModel !== requestedModel) {
+      log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
+      requestedModel = resolvedModel;
+    }
+
     let routingMode: 'auto' | 'cost' | 'fast' | 'quality' | 'passthrough' = 'auto';
     let targetModel: string = '';
     let targetProvider: Provider = 'anthropic';
@@ -2483,6 +2581,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         routingMode = 'quality';
       }
       // relayplane:auto stays as 'auto'
+    } else if (requestedModel.startsWith('rp:')) {
+      // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
+      if (requestedModel === 'rp:cost' || requestedModel === 'rp:cheap') {
+        routingMode = 'cost';
+      } else if (requestedModel === 'rp:fast') {
+        routingMode = 'fast';
+      } else if (requestedModel === 'rp:quality' || requestedModel === 'rp:best') {
+        routingMode = 'quality';
+      } else {
+        // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
+        routingMode = 'passthrough';
+      }
     } else if (requestedModel === 'auto' || requestedModel === 'relayplane:auto') {
       routingMode = 'auto';
     } else if (requestedModel === 'cost') {
@@ -2535,13 +2645,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         log(`Pass-through mode: ${requestedModel} → ${targetProvider}/${targetModel}`);
       } else {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: bypassRouting
-              ? `RelayPlane disabled or bypassed. Use an explicit model instead of ${requestedModel}.`
-              : `Unknown model: ${requestedModel}`,
-          })
-        );
+        if (bypassRouting) {
+          const modelError = buildModelNotFoundError(requestedModel, getAvailableModelNames());
+          res.end(
+            JSON.stringify({
+              error: `RelayPlane disabled or bypassed. Use an explicit model instead of ${requestedModel}.`,
+              suggestions: modelError.suggestions,
+              hint: modelError.hint,
+            })
+          );
+        } else {
+          res.end(JSON.stringify(buildModelNotFoundError(requestedModel, getAvailableModelNames())));
+        }
         return;
       }
     } else if (!useCascade) {
