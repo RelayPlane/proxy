@@ -1,18 +1,60 @@
-# @relayplane/proxy
+# RelayPlane
 
-**Safe, intelligent AI model routing that never breaks your setup.** Sandbox architecture with circuit breakers ensures your agent keeps working even if RelayPlane has issues.
+**Stop paying for your agent's mistakes.**
 
-## Why RelayPlane?
+RelayPlane is an open source proxy that sits between your AI agents and LLM providers. It tracks every dollar, routes to the cheapest effective model, and learns from every agent on the network.
 
-AI agents burn through API credits fast — $30-300/month for most users, $1,000+ for power users. RelayPlane routes simple tasks to cheaper models automatically while keeping your setup bulletproof.
+77% cost reduction. One install. Zero risk.
 
-**Safety first:** RelayPlane runs as a sandbox layer. If anything goes wrong, the circuit breaker trips and requests flow directly to your provider. Zero downtime, zero intervention.
+```bash
+npm install -g @relayplane/proxy && relayplane init
+```
 
-## Quick Start
+## Why now
 
-### Option 1: OpenClaw Config (Recommended)
+On February 18, 2026, Anthropic banned subscription OAuth tokens in OpenClaw and similar tools. Users who were paying $200/month now face $600–2,000+ in API costs for the same usage.
 
-Add to your `openclaw.json`:
+But the cost crisis started before the ban. The real problem: **your agent uses the most expensive model for everything.** Code formatting? Opus. Reading a file? Opus. Simple questions? Opus.
+
+73% of typical agent spend is on the wrong model for the task.
+
+## Three pillars
+
+### 1. Observe — See where every dollar goes
+
+Every LLM request flows through RelayPlane. Cost per request, model used, task type, tokens consumed — all tracked automatically.
+
+### 2. Govern — Route to the cheapest model that works
+
+A policy engine classifies each task and routes it to the most cost-effective model. Simple file reads → Haiku ($0.25/MTok). Complex architecture → Opus ($15/MTok). You set the rules or use defaults.
+
+### 3. Learn — Every agent makes yours smarter
+
+Opt into the collective mesh. Anonymized routing outcomes from thousands of agents improve everyone's routing. The network gets smarter without you doing anything.
+
+## Safety first
+
+RelayPlane uses a circuit breaker architecture. If the proxy fails, all traffic automatically bypasses it and goes directly to your provider. Your agent doesn't notice.
+
+```
+CLOSED (normal) → OPEN (after 3 failures) → HALF-OPEN (probe) → CLOSED (recovered)
+```
+
+Worst case: you pay what you would have paid anyway.
+
+## Quick start
+
+### Option 1: npm (recommended)
+
+```bash
+npm install -g @relayplane/proxy
+relayplane init
+relayplane start
+```
+
+Dashboard at `http://localhost:4100`. See your costs within the first hour.
+
+### Option 2: OpenClaw config
 
 ```json
 {
@@ -22,60 +64,22 @@ Add to your `openclaw.json`:
 }
 ```
 
-That's it. OpenClaw handles starting and managing the proxy automatically.
-
-### Option 2: ClawHub Skill
+### Option 3: ClawHub skill
 
 ```bash
 clawhub install relayplane
 ```
 
-Then use `/relayplane` commands:
-- `/relayplane stats` — See your usage and savings
-- `/relayplane proxy start` — Start the proxy
-- `/relayplane doctor` — Diagnose issues
+## How routing works
 
-### Option 3: Standalone
-
-```bash
-npm install -g @relayplane/proxy
-relayplane-proxy
-```
-
-The proxy starts on `http://localhost:4100` by default.
-
-## Architecture
-
-```
-Your Agent → RelayPlane Proxy → Right Model
-                  ↓
-         ┌─────────────────┐
-         │  Middleware      │  Analyzes task type
-         │  Circuit Breaker │  Auto-bypasses on failure
-         │  Health Monitor  │  Continuous liveness checks
-         │  Stats Tracker   │  Real-time cost monitoring
-         └─────────────────┘
-```
-
-### Sandbox Safety Model
-
-RelayPlane is designed to **never break your setup**:
-
-1. **Circuit Breaker** — If the proxy encounters errors, it automatically opens the circuit and passes requests directly to your provider. No manual intervention needed.
-2. **Health Monitoring** — Continuous health checks detect issues before they affect your workflow.
-3. **Graceful Degradation** — Even if RelayPlane is completely down, your agent works normally.
-
-### Routing Logic
-
-- Quick tool calls → Haiku ($0.25/MTok)
-- Code review → Sonnet ($3/MTok)
-- Complex reasoning → Opus ($15/MTok)
-
-Your prompts never leave your machine. Only anonymous usage stats are collected.
+| Task type | Before | After | Savings |
+|-----------|--------|-------|---------|
+| File reads, edits | Opus ($15/MTok) | Haiku ($0.25/MTok) | 98% |
+| Code generation | Opus ($15/MTok) | Sonnet ($3/MTok) | 80% |
+| Complex architecture | Opus ($15/MTok) | Opus ($15/MTok) | 0% |
+| Retried failures | Wasted spend | Eliminated | 100% |
 
 ## Programmatic API
-
-Use RelayPlane components directly in your own tooling:
 
 ```typescript
 import {
@@ -85,99 +89,44 @@ import {
   loadRelayConfig,
 } from '@relayplane/proxy';
 
-// Load config from openclaw.json or defaults
 const config = loadRelayConfig();
-
-// Circuit breaker with automatic recovery
-const breaker = new CircuitBreaker({
-  failureThreshold: 3,
-  resetTimeoutMs: 30000,
-});
-
-// Middleware for request routing
+const breaker = new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 30000 });
 const middleware = new RelayPlaneMiddleware({ config, circuitBreaker: breaker });
-
-// Health monitoring
-const health = new HealthMonitor({ port: 4100 });
 ```
 
-### Managed Launcher
-
-For process lifecycle management:
-
-```typescript
-import { RelayPlaneLauncher } from '@relayplane/proxy';
-
-const launcher = new RelayPlaneLauncher({ port: 4100 });
-await launcher.start();   // Starts proxy, waits for healthy
-await launcher.stop();    // Graceful shutdown
-```
-
-## CLI Commands
+## CLI
 
 ```bash
-relayplane-proxy                    # Start proxy (default port 4100)
-relayplane-proxy --port 8080        # Custom port
-relayplane-proxy stats              # View usage statistics
-relayplane-proxy config             # Show configuration
-relayplane-proxy telemetry off      # Disable telemetry
-relayplane-proxy telemetry status   # Check telemetry setting
-relayplane-proxy --audit            # See telemetry before sending
-relayplane-proxy --offline          # No external calls except LLM APIs
+relayplane start                    # Start proxy (port 4100)
+relayplane stats                    # View usage and savings
+relayplane config                   # Show configuration
+relayplane doctor                   # Diagnose issues
+relayplane telemetry off            # Disable telemetry
 ```
 
-## Features
+## Privacy
 
-- **Sandbox Architecture** — Never breaks your existing setup
-- **Circuit Breaker** — Automatic failover on errors
-- **Health Monitoring** — Continuous liveness and readiness checks
-- **Smart Routing** — Automatic model selection based on task complexity
-- **Cost Tracking** — Real-time spend monitoring across all providers
-- **Multi-Provider** — Anthropic, OpenAI, Gemini, xAI, OpenRouter
-- **Privacy First** — Prompts stay local, only metadata is collected
-- **Offline Mode** — Run fully local with `--offline`
+Your prompts never leave your machine. Only anonymized metadata is shared (if you opt in):
 
-## Telemetry
+- Task type, token count, model used, success/fail
+- **Never:** prompts, responses, code, file paths, anything identifying
 
-Anonymous telemetry helps improve routing decisions. Here's exactly what's collected:
+Free tier: nothing leaves your machine. Everything runs locally.
 
-```json
-{
-  "device_id": "anon_8f3a...",
-  "task_type": "code_review",
-  "model": "claude-sonnet-4",
-  "tokens_in": 1847,
-  "tokens_out": 423,
-  "latency_ms": 2341,
-  "success": true,
-  "cost_usd": 0.02
-}
-```
+## Pricing
 
-**Never collected:** prompts, responses, file paths, anything identifying.
-
-**Opt out anytime:**
-```bash
-relayplane-proxy telemetry off
-```
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `GEMINI_API_KEY` | Google Gemini API key |
-| `XAI_API_KEY` | xAI/Grok API key |
-| `RELAYPLANE_API_KEY` | Optional — enables cloud dashboard |
+| Tier | Price | What you get |
+|------|-------|-------------|
+| **Free** | $0 forever | Full proxy, dashboard, smart routing, policy engine |
+| **Contributor** | $0 forever | Share anonymized data, get mesh-enhanced routing |
+| **Pro** | $25/mo | Analytics, alerts, team features, private mesh |
 
 ## Links
 
+- **Website:** [relayplane.com](https://relayplane.com)
 - **Docs:** [relayplane.com/docs](https://relayplane.com/docs)
-- **Dashboard:** [relayplane.com/dashboard](https://relayplane.com/dashboard)
-- **ClawHub Skill:** [clawhub.com/skills/relayplane](https://clawhub.com/skills/relayplane)
-- **OpenClaw:** [openclaw.ai](https://openclaw.ai)
+- **ClawHub:** [clawhub.com/skills/relayplane](https://clawhub.com/skills/relayplane)
 
 ## License
 
-MIT
+MIT — free forever, self-host, fork, do whatever you want.
