@@ -118,7 +118,7 @@ export function inferTaskType(
  * Pricing as of 2024 (USD per 1M tokens)
  */
 const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  // Anthropic
+  // Anthropic — versioned IDs
   'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0 },
@@ -127,13 +127,29 @@ const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
   'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
   'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  // Anthropic — -latest aliases (resolve to same tier)
+  'claude-opus-4-latest': { input: 15.0, output: 75.0 },
+  'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
+  'claude-3-5-sonnet-latest': { input: 3.0, output: 15.0 },
+  'claude-3-5-haiku-latest': { input: 0.8, output: 4.0 },
+  'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
+  // Anthropic — short aliases used in proxy MODEL_MAPPING
+  'claude-3-5-sonnet': { input: 3.0, output: 15.0 },
+  'claude-3-5-haiku': { input: 0.8, output: 4.0 },
   
   // OpenAI
   'gpt-4o': { input: 2.5, output: 10.0 },
   'gpt-4o-mini': { input: 0.15, output: 0.60 },
+  'gpt-4.1': { input: 2.0, output: 8.0 },
   'gpt-4-turbo': { input: 10.0, output: 30.0 },
   'gpt-4': { input: 30.0, output: 60.0 },
   'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
+
+  // Google
+  'gemini-1.5-pro': { input: 1.25, output: 5.0 },
+  'gemini-1.5-flash': { input: 0.075, output: 0.30 },
+  'gemini-2.0-flash': { input: 0.10, output: 0.40 },
+  'gemini-2.5-pro': { input: 1.25, output: 10.0 },
   
   // Default for unknown models
   'default': { input: 1.0, output: 3.0 },

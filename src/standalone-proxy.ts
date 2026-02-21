@@ -2570,46 +2570,82 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const limit = parseInt(params.get('limit') || '50', 10);
         const offset = parseInt(params.get('offset') || '0', 10);
         const sorted = [...requestHistory].reverse();
-        const runs = sorted.slice(offset, offset + limit).map(r => ({
-          id: r.id,
-          workflow_name: r.mode,
-          status: r.success ? 'success' : 'error',
-          started_at: r.timestamp,
-          model: r.targetModel,
-          routed_to: `${r.provider}/${r.targetModel}`,
-          taskType: r.taskType || 'general',
-          complexity: r.complexity || 'simple',
-          costUsd: r.costUsd,
-          latencyMs: r.latencyMs,
-          tokensIn: r.tokensIn,
-          tokensOut: r.tokensOut,
-          savings: 0,
-          original_model: r.originalModel,
-        }));
+        const runs = sorted.slice(offset, offset + limit).map(r => {
+          const origCost = estimateCost(r.originalModel, r.tokensIn, r.tokensOut);
+          const perRunSavings = Math.max(0, origCost - r.costUsd);
+          return {
+            id: r.id,
+            workflow_name: r.mode,
+            mode: r.mode,
+            status: r.success ? 'success' : 'error',
+            success: r.success,
+            started_at: r.timestamp,
+            timestamp: r.timestamp,          // used by the run detail view
+            model: r.targetModel,
+            provider: r.provider,            // used by the run detail view
+            routed_to: `${r.provider}/${r.targetModel}`,
+            original_model: r.originalModel,
+            taskType: r.taskType || 'general',
+            complexity: r.complexity || 'simple',
+            costUsd: r.costUsd,
+            latencyMs: r.latencyMs,
+            tokensIn: r.tokensIn,
+            tokensOut: r.tokensOut,
+            savings: Math.round(perRunSavings * 10000) / 10000,
+            escalated: r.escalated,
+          };
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ runs, pagination: { total: requestHistory.length } }));
         return;
       }
 
       if (req.method === 'GET' && telemetryPath === 'savings') {
-        // Calculate savings: difference between cost if all requests used opus vs actual cost
-        const opusCostPer1kIn = 0.015;
-        const opusCostPer1kOut = 0.075;
-        let potentialCost = 0;
-        let actualCost = 0;
+        // Savings = cost(original requested model) - cost(actual routed-to model)
+        // If no routing happened (same model) → savings = 0
+        // Uses actual token counts from the response, so zeroed tokens produce zero savings.
+        let totalOriginalCost = 0;
+        let totalActualCost = 0;
+        let totalSavedAmount = 0;
+        const byDayMap = new Map<string, { savedAmount: number; originalCost: number; actualCost: number }>();
+
         for (const r of requestHistory) {
-          potentialCost += (r.tokensIn / 1000) * opusCostPer1kIn + (r.tokensOut / 1000) * opusCostPer1kOut;
-          actualCost += r.costUsd;
+          const origCost = estimateCost(r.originalModel, r.tokensIn, r.tokensOut);
+          const actualCost = r.costUsd;
+          const saved = Math.max(0, origCost - actualCost);
+
+          totalOriginalCost += origCost;
+          totalActualCost += actualCost;
+          totalSavedAmount += saved;
+
+          const date = r.timestamp.slice(0, 10);
+          const day = byDayMap.get(date) || { savedAmount: 0, originalCost: 0, actualCost: 0 };
+          day.savedAmount += saved;
+          day.originalCost += origCost;
+          day.actualCost += actualCost;
+          byDayMap.set(date, day);
         }
-        const saved = potentialCost - actualCost;
+
+        const byDay = Array.from(byDayMap.entries())
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([date, v]) => ({
+            date,
+            savedAmount: Math.round(v.savedAmount * 10000) / 10000,
+            originalCost: Math.round(v.originalCost * 10000) / 10000,
+            actualCost: Math.round(v.actualCost * 10000) / 10000,
+          }));
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          total: potentialCost,
-          savings: Math.max(0, saved),
-          savedAmount: Math.max(0, saved),
-          potentialSavings: potentialCost,
-          percentage: potentialCost > 0 ? Math.round((saved / potentialCost) * 100) : 0,
-          byDay: [],
+          total: Math.round(totalOriginalCost * 10000) / 10000,
+          actualCost: Math.round(totalActualCost * 10000) / 10000,
+          savings: Math.round(totalSavedAmount * 10000) / 10000,
+          savedAmount: Math.round(totalSavedAmount * 10000) / 10000,
+          potentialSavings: Math.round(totalOriginalCost * 10000) / 10000,
+          percentage: totalOriginalCost > 0
+            ? Math.round((totalSavedAmount / totalOriginalCost) * 100)
+            : 0,
+          byDay,
         }));
         return;
       }
@@ -2764,7 +2800,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       let confidence = 0;
       let complexity: Complexity = 'simple';
 
-      if (routingMode !== 'passthrough' || recordTelemetry) {
+      // Always classify — needed for taskType display, telemetry, and routing decisions
+      // even in passthrough mode we want accurate task type data
+      if (messages.length > 0) {
         promptText = extractMessageText(messages);
         taskType = inferTaskType(promptText);
         confidence = getInferenceConfidence(promptText, taskType);
@@ -3015,6 +3053,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           taskType, complexity
         );
 
+        // Always extract and persist token counts — this is what the telemetry endpoints read
+        // nativeResponseData holds response JSON for non-streaming, or { usage: { input_tokens, output_tokens } }
+        // synthesised from SSE events for streaming
+        const nativeUsageData = (nativeResponseData as any)?.usage;
+        const nativeTokIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
+        const nativeTokOut = nativeUsageData?.output_tokens ?? nativeUsageData?.completion_tokens ?? 0;
+        updateLastHistoryEntry(
+          nativeTokIn,
+          nativeTokOut,
+          estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut),
+        );
+
         if (recordTelemetry) {
           relay
             .run({
@@ -3023,10 +3073,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               model: `${targetProvider}:${targetModel || requestedModel}`,
             })
             .catch(() => {});
-          const usage = (nativeResponseData as any)?.usage;
-          const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
-          const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-          sendCloudTelemetry(taskType, targetModel || requestedModel, tokensIn, tokensOut, durationMs, true, undefined, originalModel ?? undefined);
+          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined);
         }
       } catch (err) {
         const durationMs = Date.now() - startTime;
@@ -3220,7 +3267,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     let confidence = 0;
     let complexity: Complexity = 'simple';
 
-    if (routingMode !== 'passthrough' || recordTelemetry) {
+    // Always classify — taskType is needed for display, routing decisions, and telemetry
+    if (request.messages && request.messages.length > 0) {
       promptText = extractPromptText(request.messages);
       taskType = inferTaskType(promptText);
       confidence = getInferenceConfidence(promptText, taskType);
