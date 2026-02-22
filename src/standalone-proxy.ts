@@ -2312,13 +2312,13 @@ async function load(){
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
-    $('totalReq').textContent=health.requests??0;
+    const total=stats.summary?.totalEvents||0;
+    $('totalReq').textContent=total;
     $('totalCost').textContent='$'+fmt(stats.summary?.totalCostUsd??0,4);
     $('savings').textContent=(sav.percentage??0)+'%';
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
-    const total=stats.summary?.totalEvents||1;
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
+      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(total>0?m.count/total*100:0,1)+'%</td></tr>'
     ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
