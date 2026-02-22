@@ -48,6 +48,31 @@ A minimal config file:
 
 All configuration is optional — sensible defaults are applied for every field. The proxy merges your config with its defaults via deep merge, so you only need to specify what you want to change.
 
+## Architecture (Current)
+
+```text
+Client (Claude Code / Aider / Cursor)
+        |
+        |  OpenAI/Anthropic-compatible request
+        v
++-----------------------------------------------+
+| RelayPlane Proxy (local)                       |
+|-----------------------------------------------|
+| 1) Parse request                               |
+| 2) Infer task/complexity (pre-request)         |
+| 3) Select route/model                          |
+|    - explicit model / passthrough             |
+|    - relayplane:auto/cost/fast/quality        |
+|    - configured complexity/cascade rules       |
+| 4) Forward request to provider                 |
+| 5) Return provider response                    |
+| 6) (Optional) record telemetry metadata        |
++-----------------------------------------------+
+        |
+        v
+Provider APIs (Anthropic/OpenAI/Gemini/xAI/Moonshot/...)
+```
+
 ## How It Works
 
 RelayPlane is a local HTTP proxy. You point your agent at `localhost:4801` by setting `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`. The proxy:
