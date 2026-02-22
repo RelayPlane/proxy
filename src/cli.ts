@@ -948,11 +948,8 @@ async function main(): Promise<void> {
     
     console.log('');
     console.log('  To use, point your agent at the proxy:');
-    console.log('    ANTHROPIC_BASE_URL=http://localhost:4801 your-agent');
-    console.log('    OPENAI_BASE_URL=http://localhost:4801/v1 your-agent');
-    console.log('');
-    console.log('  Or use the helper script:');
-    console.log('    use-relayplane your-agent');
+    console.log(`    ANTHROPIC_BASE_URL=http://localhost:${port} your-agent`);
+    console.log(`    OPENAI_BASE_URL=http://localhost:${port} your-agent`);
     console.log('');
 
     // Non-blocking update check (fires after startup, doesn't delay anything)
