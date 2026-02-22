@@ -11,8 +11,8 @@
  * Commands:
  *   (default)              Start the proxy server
  *   status                 Show proxy status (circuit state, stats, process info)
- *   enable                 Enable RelayPlane in openclaw.json
- *   disable                Disable RelayPlane in openclaw.json
+ *   enable                 Enable RelayPlane proxy routing
+ *   disable                Disable RelayPlane proxy routing (passthrough mode)
  *   telemetry [on|off|status]  Manage telemetry settings
  *   stats                  Show usage statistics
  *   config                 Show configuration
@@ -380,8 +380,8 @@ Commands:
   logout                 Clear stored credentials
   status                 Show proxy status, plan, and cloud sync
   upgrade                Open pricing page in browser
-  enable                 Enable RelayPlane in openclaw.json
-  disable                Disable RelayPlane in openclaw.json
+  enable                 Enable RelayPlane proxy routing
+  disable                Disable RelayPlane proxy routing (passthrough mode)
   telemetry [on|off|status]  Manage telemetry settings
   stats                  Show usage statistics
   config                 Show configuration
@@ -416,8 +416,9 @@ Example:
   # Disable telemetry completely
   npx @relayplane/proxy telemetry off
 
-  # Add to openclaw.json:
-  # { "relayplane": { "enabled": true } }
+  # Point your agent at the proxy:
+  # ANTHROPIC_BASE_URL=http://localhost:4801 your-agent
+  # OPENAI_BASE_URL=http://localhost:4801/v1 your-agent
 
 Learn more: https://relayplane.com/docs
 `);
@@ -919,10 +920,12 @@ async function main(): Promise<void> {
     await startProxy({ port, host, verbose });
     
     console.log('');
-    console.log('  To use, add to your openclaw.json:');
-    console.log('    { "relayplane": { "enabled": true } }');
+    console.log('  To use, point your agent at the proxy:');
+    console.log('    ANTHROPIC_BASE_URL=http://localhost:4801 your-agent');
+    console.log('    OPENAI_BASE_URL=http://localhost:4801/v1 your-agent');
     console.log('');
-    console.log('  Then run your agent (OpenClaw, Cursor, Aider, etc.)');
+    console.log('  Or use the helper script:');
+    console.log('    use-relayplane your-agent');
     console.log('');
 
     // Non-blocking update check (fires after startup, doesn't delay anything)

@@ -1,8 +1,8 @@
 /**
  * RelayPlane L2/L3 Proxy Server
  *
- * An LLM Gateway proxy that intelligently routes requests
- * to the optimal model using @relayplane/core.
+ * An LLM Gateway proxy that routes requests
+ * to configurable models using @relayplane/core.
  *
  * Supports:
  * - OpenAI-compatible API (/v1/chat/completions)

@@ -67,7 +67,7 @@ function createDefaultConfig(): ProxyConfig {
   const now = new Date().toISOString();
   return {
     device_id: generateDeviceId(),
-    telemetry_enabled: true, // On by default, opt-out available
+    telemetry_enabled: false, // Off by default, opt-in with `relayplane telemetry on`
     first_run_complete: false,
     config_version: CONFIG_VERSION,
     created_at: now,
@@ -97,7 +97,7 @@ export function loadConfig(): ProxyConfig {
       config.device_id = generateDeviceId();
     }
     if (config.telemetry_enabled === undefined) {
-      config.telemetry_enabled = true;
+      config.telemetry_enabled = false;
     }
     if (!config.config_version) {
       config.config_version = CONFIG_VERSION;

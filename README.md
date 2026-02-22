@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
 
-An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and routes tasks to the right model — all running locally.
+An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and offers configurable task-aware routing — all running locally.
 
 ## Quick Start
 
@@ -14,7 +14,7 @@ relayplane start
 # Dashboard at http://localhost:4100
 ```
 
-Works with any agent framework that talks to OpenAI or Anthropic APIs. Point your client at `http://localhost:4100` and the proxy handles the rest.
+Works with any agent framework that talks to OpenAI or Anthropic APIs. Point your client at `http://localhost:4801` (set `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`) and the proxy handles the rest.
 
 ## Supported Providers
 
@@ -47,6 +47,18 @@ A minimal config file:
 ```
 
 All configuration is optional — sensible defaults are applied for every field. The proxy merges your config with its defaults via deep merge, so you only need to specify what you want to change.
+
+## How It Works
+
+RelayPlane is a local HTTP proxy. You point your agent at `localhost:4801` by setting `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`. The proxy:
+
+1. **Intercepts** your LLM API requests
+2. **Classifies** the task using heuristics (token count, prompt patterns, keyword matching — no LLM calls)
+3. **Routes** to the configured model based on classification and your routing rules (or passes through to the original model by default)
+4. **Forwards** the request directly to the LLM provider (your prompts go straight to the provider, not through RelayPlane servers)
+5. **Records** token counts, latency, and cost locally for your dashboard
+
+**Default behavior is passthrough** — requests go to whatever model your agent requested. Routing (cascade, complexity-based) is configurable and must be explicitly enabled.
 
 ## Complexity-Based Routing
 
@@ -216,29 +228,31 @@ export ANTHROPIC_API_KEY="sk-ant-api03-..."
 
 ## Telemetry
 
-The proxy collects anonymized telemetry to improve routing decisions. Here's exactly what's collected:
+**Telemetry is disabled by default.** No data is sent to RelayPlane servers unless you explicitly opt in.
 
-- **device_id** — Random anonymous ID (no PII)
-- **task_type** — Inferred from token patterns, NOT from prompt content
+Enable with:
+```bash
+relayplane telemetry on
+```
+
+When enabled, the proxy sends anonymized metadata to `api.relayplane.com`:
+
+- **device_id** — Random anonymous hash (no PII)
+- **task_type** — Heuristic classification label (e.g., "code_generation", "summarization")
 - **model** — Which model was used
 - **tokens_in/out** — Token counts
 - **latency_ms** — Response time
 - **cost_usd** — Estimated cost
 
-**Never collected:** prompts, responses, file paths, or anything that could identify you or your project.
-
-### Disabling telemetry
-
-```bash
-# Via environment variable
-RELAYPLANE_TELEMETRY=0 relayplane start
-
-# Or in config — telemetry can be disabled programmatically via the config module
-```
+**Never collected:** prompts, responses, file paths, or anything that could identify you or your project. Your prompts go directly to LLM providers, never through RelayPlane servers.
 
 ### Audit mode
 
 Audit mode buffers telemetry events in memory so you can inspect exactly what would be sent before it goes anywhere. Useful for compliance review.
+
+```bash
+relayplane start --audit
+```
 
 ### Offline mode
 
@@ -275,7 +289,7 @@ If the proxy ever fails, all traffic automatically bypasses it — your agent ta
 
 ## Your Keys Stay Yours
 
-RelayPlane requires your own provider API keys. We never see your prompts, keys, or data. All execution is local.
+RelayPlane requires your own provider API keys. Your prompts go directly to LLM providers — never through RelayPlane servers. All proxy execution is local. Telemetry (anonymous metadata only) is opt-in.
 
 ## License
 
