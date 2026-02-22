@@ -2029,7 +2029,11 @@ function resolveExplicitModel(
   }
 
   // OpenRouter/DeepSeek/Groq models
-  if (modelName.startsWith('openrouter/') || modelName.startsWith('deepseek-') || modelName.startsWith('groq-')) {
+  if (modelName.startsWith('openrouter/')) {
+    // Strip the "openrouter/" prefix — OpenRouter expects just "google/gemini-2.5-pro" not "openrouter/google/gemini-2.5-pro"
+    return { provider: 'openrouter', model: modelName.slice('openrouter/'.length) };
+  }
+  if (modelName.startsWith('deepseek-') || modelName.startsWith('groq-')) {
     return { provider: 'openrouter', model: modelName };
   }
 
