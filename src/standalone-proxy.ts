@@ -23,10 +23,12 @@ import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { RelayPlane, inferTaskType, getInferenceConfidence } from '@relayplane/core';
 import type { Provider, TaskType } from '@relayplane/core';
 import { buildModelNotFoundError } from './utils/model-suggestions.js';
 import { recordTelemetry as recordCloudTelemetry, inferTaskType as inferTelemetryTaskType, estimateCost } from './telemetry.js';
+import { initPgBackend, isPgActive, recordHistoryPg, updateHistoryPg, getHistoryPg, getStatsPg, getHistoryCountPg, closePg } from './telemetry-pg.js';
 import { StatsCollector } from './stats.js';
 const PROXY_VERSION: string = (() => {
   try {
@@ -39,6 +41,10 @@ const PROXY_VERSION: string = (() => {
 
 /** Shared stats collector instance for the proxy server */
 export const proxyStatsCollector = new StatsCollector();
+
+/** Per-request context (consumer identity) threaded via AsyncLocalStorage */
+interface ConsumerContext { consumer: string; }
+const requestContext = new AsyncLocalStorage<ConsumerContext>();
 
 /**
  * Provider endpoint configuration
@@ -156,6 +162,7 @@ function sendCloudTelemetry(
 ): void {
   try {
     const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut);
+    const consumer = requestContext.getStore()?.consumer;
     recordCloudTelemetry({
       task_type: taskType,
       model,
@@ -165,6 +172,7 @@ function sendCloudTelemetry(
       success,
       cost_usd: cost,
       requested_model: requestedModel,
+      consumer,
     });
   } catch {
     // Telemetry should never break the proxy
@@ -416,6 +424,7 @@ const globalStats: RequestStats = {
 /** Rolling request history for telemetry endpoints (max 10000 entries) */
 interface RequestHistoryEntry {
   id: string;
+  consumer: string;
   originalModel: string;
   targetModel: string;
   provider: string;
@@ -455,6 +464,11 @@ function pruneOldEntries(): void {
 }
 
 function loadHistoryFromDisk(): void {
+  // When pg is active, skip JSONL loading — pg is the source of truth
+  if (isPgActive()) {
+    console.log('[RelayPlane] Using PostgreSQL backend — skipping JSONL history load');
+    return;
+  }
   try {
     if (!fs.existsSync(HISTORY_FILE)) return;
     const content = fs.readFileSync(HISTORY_FILE, 'utf-8');
@@ -523,6 +537,27 @@ function scheduleHistoryFlush(): void {
 }
 
 function bufferHistoryEntry(entry: RequestHistoryEntry): void {
+  // When pg is active, write there instead of JSONL
+  if (isPgActive()) {
+    recordHistoryPg({
+      requestId: entry.id,
+      consumer: entry.consumer,
+      originalModel: entry.originalModel,
+      targetModel: entry.targetModel,
+      provider: entry.provider,
+      latencyMs: entry.latencyMs,
+      success: entry.success,
+      mode: entry.mode,
+      escalated: entry.escalated,
+      tokensIn: entry.tokensIn,
+      tokensOut: entry.tokensOut,
+      costUsd: entry.costUsd,
+      taskType: entry.taskType || 'general',
+      complexity: entry.complexity || 'simple',
+      timestamp: entry.timestamp,
+    });
+    return;
+  }
   historyWriteBuffer.push(entry);
   historyRequestsSinceLastPrune++;
   if (historyWriteBuffer.length >= 20) {
@@ -586,8 +621,10 @@ function logRequest(
   });
 
   // Record to request history for telemetry endpoints
+  const consumer = requestContext.getStore()?.consumer || 'unknown';
   const entry: RequestHistoryEntry = {
     id: `req-${++requestIdCounter}`,
+    consumer,
     originalModel,
     targetModel,
     provider,
@@ -611,6 +648,17 @@ function logRequest(
 
 /** Update the most recent history entry with token/cost info */
 function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number): void {
+  if (isPgActive()) {
+    // Update the most recent entry in pg by request_id
+    if (requestHistory.length > 0) {
+      const last = requestHistory[requestHistory.length - 1]!;
+      last.tokensIn = tokensIn;
+      last.tokensOut = tokensOut;
+      last.costUsd = costUsd;
+      updateHistoryPg(last.id, tokensIn, tokensOut, costUsd);
+    }
+    return;
+  }
   if (requestHistory.length > 0) {
     const last = requestHistory[requestHistory.length - 1]!;
     last.tokensIn = tokensIn;
@@ -2371,12 +2419,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     if (verbose) console.log(`[relayplane] ${msg}`);
   };
 
-  // Load persistent history from disk
+  // Initialize PostgreSQL backend if configured
+  await initPgBackend();
+
+  // Load persistent history from disk (skipped when pg is active)
   loadHistoryFromDisk();
 
   // Flush history on shutdown
   const handleShutdown = () => {
     shutdownHistory();
+    closePg().catch(() => {});
     process.exit(0);
   };
   process.on('SIGINT', handleShutdown);
@@ -2429,7 +2481,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, x-api-key, anthropic-beta, anthropic-version, X-RelayPlane-Bypass, X-RelayPlane-Model'
+      'Content-Type, Authorization, x-api-key, anthropic-beta, anthropic-version, X-RelayPlane-Bypass, X-RelayPlane-Model, X-RelayPlane-Consumer'
     );
 
     if (req.method === 'OPTIONS') {
@@ -2555,9 +2607,34 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       if (req.method === 'GET' && telemetryPath === 'stats') {
         const days = parseInt(params.get('days') || '7', 10);
+
+        // When pg is active, query the database directly
+        if (isPgActive()) {
+          try {
+            const pgStats = await getStatsPg(days);
+            const result = {
+              summary: {
+                totalCostUsd: pgStats.totalCostUsd,
+                totalEvents: pgStats.totalEvents,
+                avgLatencyMs: pgStats.avgLatencyMs,
+                successRate: pgStats.successRate,
+              },
+              byModel: pgStats.byModel.map(m => ({ model: m.model, count: m.count, costUsd: m.costUsd, savings: 0 })),
+              byConsumer: pgStats.byConsumer,
+              dailyCosts: [],
+            };
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+          } catch {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Database query failed' }));
+          }
+          return;
+        }
+
         const cutoff = Date.now() - days * 86400000;
         const recent = requestHistory.filter(r => new Date(r.timestamp).getTime() >= cutoff);
-        
+
         // Model breakdown
         const modelMap = new Map<string, { count: number; cost: number }>();
         for (const r of recent) {
@@ -2567,7 +2644,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           cur.cost += r.costUsd;
           modelMap.set(key, cur);
         }
-        
+
         // Daily stats
         const dailyMap = new Map<string, { requests: number; cost: number }>();
         for (const r of recent) {
@@ -2580,7 +2657,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
         const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
         const totalLatency = recent.reduce((s, r) => s + r.latencyMs, 0);
-        
+
         const result = {
           summary: {
             totalCostUsd: totalCost,
@@ -2599,12 +2676,54 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (req.method === 'GET' && telemetryPath === 'runs') {
         const limit = parseInt(params.get('limit') || '50', 10);
         const offset = parseInt(params.get('offset') || '0', 10);
+
+        // When pg is active, query the database directly
+        if (isPgActive()) {
+          try {
+            const pgRuns = await getHistoryPg(limit, offset);
+            const pgTotal = await getHistoryCountPg();
+            const runs = pgRuns.map(r => {
+              const origCost = estimateCost('claude-opus-4-20250514', r.tokensIn, r.tokensOut);
+              const perRunSavings = Math.max(0, origCost - r.costUsd);
+              return {
+                id: r.requestId,
+                consumer: r.consumer,
+                workflow_name: r.mode,
+                mode: r.mode,
+                status: r.success ? 'success' : 'error',
+                success: r.success,
+                started_at: r.timestamp,
+                timestamp: r.timestamp,
+                model: r.targetModel,
+                provider: r.provider,
+                routed_to: `${r.provider}/${r.targetModel}`,
+                original_model: r.originalModel,
+                taskType: r.taskType || 'general',
+                complexity: r.complexity || 'simple',
+                costUsd: r.costUsd,
+                latencyMs: r.latencyMs,
+                tokensIn: r.tokensIn,
+                tokensOut: r.tokensOut,
+                savings: Math.round(perRunSavings * 10000) / 10000,
+                escalated: r.escalated,
+              };
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ runs, pagination: { total: pgTotal } }));
+          } catch {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Database query failed' }));
+          }
+          return;
+        }
+
         const sorted = [...requestHistory].reverse();
         const runs = sorted.slice(offset, offset + limit).map(r => {
           const origCost = estimateCost('claude-opus-4-20250514', r.tokensIn, r.tokensOut);
           const perRunSavings = Math.max(0, origCost - r.costUsd);
           return {
             id: r.id,
+            consumer: r.consumer,
             workflow_name: r.mode,
             mode: r.mode,
             status: r.success ? 'success' : 'error',
@@ -2737,6 +2856,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       res.end(getDashboardHTML());
       return;
     }
+
+    // Extract consumer identity from request header
+    const consumer = getHeaderValue(req, 'x-relayplane-consumer') || 'unknown';
+
+    // Run the rest of the handler within consumer context
+    return requestContext.run({ consumer }, async () => {
 
     // Extract auth context from incoming request
     const ctx = extractRequestContext(req);
@@ -3596,6 +3721,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         );
       }
     }
+    }); // end requestContext.run()
   });
 
   return new Promise((resolve, reject) => {

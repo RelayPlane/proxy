@@ -46,9 +46,11 @@
     "@relayplane/explainability": "^0.1.0",
     "@relayplane/ledger": "^0.1.0",
     "@relayplane/policy-engine": "^0.1.0",
-    "@relayplane/routing-engine": "^0.1.0"
+    "@relayplane/routing-engine": "^0.1.0",
+    "pg": "^8.13.0"
   },
   "devDependencies": {
+    "@types/pg": "^8.11.0",
     "typescript": "^5.3.3",
     "vitest": "^1.1.0"
   },

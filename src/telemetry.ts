@@ -23,6 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDeviceId, isTelemetryEnabled, getConfigDir } from './config.js';
+import { isPgActive, recordHistoryPg } from './telemetry-pg.js';
 
 /**
  * Telemetry event schema (matches PITCH-v2.md)
@@ -30,33 +31,36 @@ import { getDeviceId, isTelemetryEnabled, getConfigDir } from './config.js';
 export interface TelemetryEvent {
   /** Anonymous device ID */
   device_id: string;
-  
+
   /** Inferred task type (from token patterns, NOT prompt content) */
   task_type: string;
-  
+
   /** Model used */
   model: string;
-  
+
   /** Input tokens */
   tokens_in: number;
-  
+
   /** Output tokens */
   tokens_out: number;
-  
+
   /** Request latency in milliseconds */
   latency_ms: number;
-  
+
   /** Whether request succeeded */
   success: boolean;
-  
+
   /** Estimated cost in USD */
   cost_usd: number;
-  
+
   /** Timestamp */
   timestamp: string;
 
   /** Original requested model (before routing) */
   requested_model?: string;
+
+  /** Consumer identifier (from X-RelayPlane-Consumer header) */
+  consumer?: string;
 }
 
 /**
@@ -205,44 +209,66 @@ export function clearAuditBuffer(): void {
 }
 
 /**
- * Record a telemetry event
+ * Record a telemetry event.
+ *
+ * When the pg backend is active (RELAYPLANE_TELEMETRY_DB is set), it records
+ * regardless of the telemetry toggle and skips the JSONL write. Cloud upload
+ * still proceeds independently when telemetry is enabled.
  */
 export function recordTelemetry(event: Omit<TelemetryEvent, 'device_id' | 'timestamp'>): void {
-  if (!isTelemetryEnabled() && !auditMode) {
-    return; // Telemetry disabled and not in audit mode
-  }
-  
   const fullEvent: TelemetryEvent = {
     ...event,
     device_id: getDeviceId(),
     timestamp: new Date().toISOString(),
   };
-  
+
+  // pg backend: always record if configured (bypasses telemetry toggle)
+  const pgActive = isPgActive();
+  if (pgActive) {
+    recordHistoryPg({
+      requestId: `tel-${Date.now()}`,
+      consumer: event.consumer || 'unknown',
+      originalModel: event.requested_model || event.model,
+      targetModel: event.model,
+      provider: 'unknown',
+      latencyMs: Math.round(event.latency_ms),
+      success: event.success,
+      mode: 'telemetry',
+      escalated: false,
+      tokensIn: event.tokens_in,
+      tokensOut: event.tokens_out,
+      costUsd: event.cost_usd,
+      taskType: event.task_type,
+      complexity: 'simple',
+      timestamp: fullEvent.timestamp,
+    });
+  }
+
   if (auditMode) {
-    // In audit mode, buffer events and print them
     auditBuffer.push(fullEvent);
     console.log('\n📊 [TELEMETRY AUDIT] The following data would be collected:');
     console.log(JSON.stringify(fullEvent, null, 2));
     console.log('');
     return;
   }
-  
-  if (!isTelemetryEnabled()) {
+
+  if (!isTelemetryEnabled() && !auditMode) {
     return;
   }
-  
-  // Store locally (append to JSONL file)
-  try {
-    const configDir = getConfigDir();
-    if (!fs.existsSync(configDir)) {
-      fs.mkdirSync(configDir, { recursive: true });
+
+  // JSONL: only write if pg is NOT active
+  if (!pgActive) {
+    try {
+      const configDir = getConfigDir();
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      fs.appendFileSync(TELEMETRY_FILE, JSON.stringify(fullEvent) + '\n');
+    } catch (err) {
+      // Silently fail - telemetry should never break the proxy
     }
-    
-    fs.appendFileSync(TELEMETRY_FILE, JSON.stringify(fullEvent) + '\n');
-  } catch (err) {
-    // Silently fail - telemetry should never break the proxy
   }
-  
+
   // Queue for cloud upload (if not offline)
   queueForUpload(fullEvent);
 }
