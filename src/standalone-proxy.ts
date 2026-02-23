@@ -107,7 +107,8 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
   'claude-sonnet-4': { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
   'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
   'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
-  haiku: { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
+  'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5-20250514' },
+  haiku: { provider: 'anthropic', model: 'claude-haiku-4-5-20250514' },
   sonnet: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
   opus: { provider: 'anthropic', model: 'claude-opus-4-20250514' },
   // OpenAI models
@@ -2399,6 +2400,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   // Initialize RelayPlane
   const relay = new RelayPlane({ dbPath: config.dbPath });
 
+  // Startup migration: clear default routing rules so complexity config takes priority
+  const clearedCount = relay.routing.clearDefaultRules();
+  if (clearedCount > 0) {
+    log(`Cleared ${clearedCount} default routing rules (complexity config takes priority)`);
+  }
+
   const server = http.createServer(async (req, res) => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -2898,14 +2905,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         } else if (routingMode === 'quality') {
           selectedModel = getQualityModel(proxyConfig);
         } else {
-          const rule = relay.routing.get(taskType);
-          const parsedRule = rule?.preferredModel ? parsePreferredModel(rule.preferredModel) : null;
-          if (parsedRule?.provider === 'anthropic') {
-            selectedModel = parsedRule.model;
-          } else if (proxyConfig.routing?.complexity?.enabled) {
+          // Complexity-based routing takes priority when enabled
+          if (proxyConfig.routing?.complexity?.enabled) {
             const complexityModel = proxyConfig.routing?.complexity?.[complexity];
             selectedModel = complexityModel ?? null;
-          } else {
+            log(`Complexity routing: ${complexity} → ${selectedModel}`);
+          }
+          // Fall back to learned routing rules (non-default only)
+          if (!selectedModel) {
+            const rule = relay.routing.get(taskType);
+            const parsedRule = rule?.preferredModel ? parsePreferredModel(rule.preferredModel) : null;
+            if (parsedRule?.provider === 'anthropic' && rule?.source !== 'default') {
+              selectedModel = parsedRule.model;
+            }
+          }
+          // Final fallback to DEFAULT_ROUTING
+          if (!selectedModel) {
             selectedModel = DEFAULT_ROUTING[taskType].model;
           }
         }
@@ -3359,22 +3374,27 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       } else if (routingMode === 'quality') {
         selectedModel = getQualityModel(proxyConfig);
       } else {
-        const rule = relay.routing.get(taskType);
-        if (rule && rule.preferredModel) {
-          const parsedRule = parsePreferredModel(rule.preferredModel);
-          if (parsedRule) {
-            targetProvider = parsedRule.provider;
-            targetModel = parsedRule.model;
-            log(`Using learned rule: ${rule.preferredModel}`);
+        // Complexity-based routing takes priority when enabled
+        if (proxyConfig.routing?.complexity?.enabled) {
+          const complexityModel = proxyConfig.routing?.complexity?.[complexity];
+          selectedModel = complexityModel ?? null;
+          log(`Complexity routing: ${complexity} → ${selectedModel}`);
+        }
+        // Fall back to learned routing rules (non-default only)
+        if (!selectedModel && !targetModel) {
+          const rule = relay.routing.get(taskType);
+          if (rule && rule.preferredModel && rule.source !== 'default') {
+            const parsedRule = parsePreferredModel(rule.preferredModel);
+            if (parsedRule) {
+              targetProvider = parsedRule.provider;
+              targetModel = parsedRule.model;
+              log(`Using learned rule: ${rule.preferredModel}`);
+            }
           }
         }
-        if (!targetModel) {
-          if (proxyConfig.routing?.complexity?.enabled) {
-            const complexityModel = proxyConfig.routing?.complexity?.[complexity];
-            selectedModel = complexityModel ?? null;
-          } else {
-            selectedModel = DEFAULT_ROUTING[taskType].model;
-          }
+        // Final fallback
+        if (!selectedModel && !targetModel) {
+          selectedModel = DEFAULT_ROUTING[taskType].model;
         }
       }
 
