@@ -829,13 +829,30 @@ export function classifyComplexity(messages: Array<{ content?: unknown }>): Comp
   
   let score = 0;
   
+  // Code indicators
   if (/```/.test(text) || /function |class |const |let |import /.test(text)) score += 2;
-  if (/analyze|compare|evaluate|assess|review|audit/.test(text)) score += 1;
+  // Analytical tasks
+  if (/analyze|compare|evaluate|assess|review|audit/.test(text)) score += 2;
+  // Math/logic
   if (/calculate|compute|solve|equation|prove|derive/.test(text)) score += 2;
-  if (/first.*then|step \d|1\).*2\)|phase \d/.test(text)) score += 1;
-  if (tokens > 2000) score += 1;
-  if (tokens > 5000) score += 1;
-  if (/write a (story|essay|article|report)|create a|design a|build a/.test(text)) score += 1;
+  // Multi-step reasoning
+  if (/first.*then|step \d|1\).*2\)|phase \d/.test(text)) score += 2;
+  // Architecture/design (inherently complex)
+  if (/architect|infrastructure|distributed|microservice|system design|scalab/i.test(text)) score += 3;
+  // Creative/generative with substance
+  if (/write a (story|essay|article|report)|create a|design a|build a/.test(text)) score += 2;
+  // Implementation requests
+  if (/implement|refactor|debug|optimize|migrate/.test(text)) score += 2;
+  // Planning/strategy
+  if (/strategy|roadmap|plan for|how (would|should|can) (we|i|you)/.test(text)) score += 1;
+  // Token-based scaling (large context = likely complex)
+  if (tokens > 500) score += 1;
+  if (tokens > 2000) score += 2;
+  if (tokens > 5000) score += 2;
+  // Multiple concepts/requirements
+  const andCount = (text.match(/\band\b/g) || []).length;
+  if (andCount >= 3) score += 1;
+  if (andCount >= 5) score += 1;
   
   if (score >= 4) return 'complex';
   if (score >= 2) return 'moderate';
@@ -2809,15 +2826,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
         // relayplane:auto stays as 'auto'
       } else if (requestedModel.startsWith('rp:')) {
-        // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
         if (requestedModel === 'rp:cost' || requestedModel === 'rp:cheap') {
           routingMode = 'cost';
         } else if (requestedModel === 'rp:fast') {
           routingMode = 'fast';
         } else if (requestedModel === 'rp:quality' || requestedModel === 'rp:best') {
           routingMode = 'quality';
+        } else if (requestedModel === 'rp:balanced') {
+          // rp:balanced uses complexity-based routing (auto mode)
+          routingMode = 'auto';
         } else {
-          // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
           routingMode = 'passthrough';
         }
       } else if (requestedModel === 'auto' || requestedModel === 'relayplane:auto') {
@@ -3287,15 +3305,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
       // relayplane:auto stays as 'auto'
     } else if (requestedModel.startsWith('rp:')) {
-      // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
       if (requestedModel === 'rp:cost' || requestedModel === 'rp:cheap') {
         routingMode = 'cost';
       } else if (requestedModel === 'rp:fast') {
         routingMode = 'fast';
       } else if (requestedModel === 'rp:quality' || requestedModel === 'rp:best') {
         routingMode = 'quality';
+      } else if (requestedModel === 'rp:balanced') {
+        // rp:balanced uses complexity-based routing (auto mode)
+        routingMode = 'auto';
       } else {
-        // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
         routingMode = 'passthrough';
       }
     } else if (requestedModel === 'auto' || requestedModel === 'relayplane:auto') {
