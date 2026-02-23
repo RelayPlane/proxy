@@ -175,7 +175,12 @@ async function handleLoginCommand(): Promise<void> {
       process.exit(1);
     }
 
-    const { deviceCode, userCode, verificationUrl, pollIntervalSec, expiresIn } = await startRes.json() as any;
+    const { deviceCode, userCode, verificationUrl: rawVerificationUrl, pollIntervalSec, expiresIn } = await startRes.json() as any;
+
+    // Override old dashboard URL if the API returns it
+    const verificationUrl = rawVerificationUrl?.includes('app.relayplane.com')
+      ? rawVerificationUrl.replace('app.relayplane.com', 'relayplane.com')
+      : rawVerificationUrl;
 
     console.log(`  Open this URL in your browser:`);
     console.log('');
