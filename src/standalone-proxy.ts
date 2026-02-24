@@ -2376,7 +2376,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
-  <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
+  <div class="card"><div class="label">Savings (vs Opus)</div><div class="value green" id="savings">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
 </div>
 <div class="section"><h2>Auth & Routing</h2>
