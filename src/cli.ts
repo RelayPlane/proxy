@@ -721,6 +721,13 @@ async function handleAutostartCommand(args: string[]): Promise<void> {
       binPath = process.argv[0] ?? 'relayplane';
     }
 
+    // Capture API keys from current environment for systemd
+    const envKeys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY', 'MOONSHOT_API_KEY'];
+    const envLines = envKeys
+      .filter(k => process.env[k])
+      .map(k => `Environment=${k}=${process.env[k]}`)
+      .join('\n');
+
     const serviceContent = `[Unit]
 Description=RelayPlane Proxy - Intelligent AI Model Routing
 After=network.target
@@ -734,6 +741,7 @@ ExecStart=${binPath}
 Restart=always
 RestartSec=3
 Environment=HOME=/root
+${envLines}
 
 [Install]
 WantedBy=multi-user.target
