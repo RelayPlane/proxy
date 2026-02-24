@@ -249,7 +249,7 @@ interface ComplexityConfig {
 }
 
 interface RoutingConfig {
-  mode: 'standard' | 'cascade';
+  mode: 'standard' | 'cascade' | 'auto' | 'passthrough';
   cascade: CascadeConfig;
   complexity: ComplexityConfig;
 }
@@ -827,8 +827,13 @@ function extractMessageText(messages: Array<{ content?: unknown }>): string {
     .join(' ');
 }
 
-export function classifyComplexity(messages: Array<{ content?: unknown }>): Complexity {
-  const text = extractMessageText(messages).toLowerCase();
+export function classifyComplexity(messages: Array<{ role?: string; content?: unknown }>): Complexity {
+  // Only classify based on the last user message, not system prompts or conversation history.
+  // System prompts (AGENTS.md, SOUL.md, etc.) are always huge for agent workloads and would
+  // cause everything to be classified as "complex".
+  const userMessages = messages.filter((m) => m.role === 'user');
+  const lastUserMessage = userMessages.length > 0 ? [userMessages[userMessages.length - 1]] : messages;
+  const text = extractMessageText(lastUserMessage).toLowerCase();
   const tokens = Math.ceil(text.length / 4);
   
   let score = 0;
@@ -902,15 +907,23 @@ function getAuthForModel(
 function buildAnthropicHeadersWithAuth(
   ctx: RequestContext,
   apiKey?: string,
-  isMaxToken?: boolean
+  isMaxToken?: boolean,
+  isRerouted?: boolean
 ): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
 
-  // Auth: prefer incoming auth for passthrough
-  if (ctx.authHeader) {
+  // Detect if incoming auth is OAuth
+  const incomingIsOAuth = ctx.apiKeyHeader?.startsWith('sk-ant-oat') || ctx.authHeader?.includes('sk-ant-oat');
+  const apiKeyIsRegular = apiKey && apiKey.startsWith('sk-ant-api');
+
+  // When rerouted (auto mode changed the model) and incoming is OAuth,
+  // prefer the regular API key — OAuth doesn't work for all models (e.g. Haiku)
+  if (isRerouted && incomingIsOAuth && apiKeyIsRegular) {
+    headers['x-api-key'] = apiKey;
+  } else if (ctx.authHeader) {
     headers['Authorization'] = ctx.authHeader;
   } else if (ctx.apiKeyHeader) {
     headers['x-api-key'] = ctx.apiKeyHeader;
@@ -1025,9 +1038,10 @@ async function forwardNativeAnthropicRequest(
   body: Record<string, unknown>,
   ctx: RequestContext,
   envApiKey?: string,
-  isMaxToken?: boolean
+  isMaxToken?: boolean,
+  isRerouted?: boolean
 ): Promise<Response> {
-  const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken);
+  const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -2346,12 +2360,21 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 @media(max-width:768px){.col-tt,.col-cx{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
 </style></head><body>
-<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
+<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
   <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
+</div>
+<div class="section"><h2>Auth & Routing</h2>
+<div id="routingDetails" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px">
+  <div class="prov-item"><span class="dot" id="authDot"></span> <strong>Auth:</strong>&nbsp;<span id="authInfo">—</span></div>
+  <div class="prov-item"><strong>Routing:</strong>&nbsp;<span id="routingMode">—</span></div>
+  <div class="prov-item"><strong>Simple→</strong>&nbsp;<span id="routeSimple">—</span></div>
+  <div class="prov-item"><strong>Moderate→</strong>&nbsp;<span id="routeModerate">—</span></div>
+  <div class="prov-item"><strong>Complex→</strong>&nbsp;<span id="routeComplex">—</span></div>
+</div>
 </div>
 <div class="section"><h2>Model Breakdown</h2>
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
@@ -2373,6 +2396,39 @@ async function load(){
       fetch('/v1/telemetry/health').then(r=>r.json())
     ]);
     $('ver').textContent='v'+health.version;
+    const authDot=$('authDot'),authInfo=$('authInfo');
+    if(health.auth){
+      if(health.auth.anthropicApiKey){authDot.className='dot up';authInfo.textContent='API key ('+health.auth.anthropicApiKeyPrefix+')';}
+      else{authDot.className='dot warn';authInfo.textContent='OAuth only (no API key)';}
+    }
+    if(health.routing){
+      const mode=health.routing.mode||'passthrough';
+      $('routingMode').textContent=mode;
+      const routingSection=document.getElementById('routingDetails');
+      const hasApiKey=health.auth&&health.auth.anthropicApiKey;
+      if(mode==='passthrough'){
+        if(routingSection)routingSection.innerHTML='<div class="prov-item">Routing: passthrough → model from incoming requests</div>';
+      }else{
+        if(health.routing.complexity){
+          const cx=health.routing.complexity;
+          const authLabel=function(model){
+            if(hasApiKey)return '<span style="color:#34d399">● API key</span>';
+            const isHaiku=model&&model.toLowerCase().includes('haiku');
+            if(isHaiku)return '<span style="color:#ef4444">⚠️ OAuth - may fail</span>';
+            return '<span style="color:#fbbf24">● OAuth</span>';
+          };
+          $('routeSimple').innerHTML=(cx.simple||'—')+' <small>'+authLabel(cx.simple)+'</small>';
+          $('routeModerate').innerHTML=(cx.moderate||'—')+' <small>'+authLabel(cx.moderate)+'</small>';
+          $('routeComplex').innerHTML=(cx.complex||'—')+' <small>'+authLabel(cx.complex)+'</small>';
+          if(!hasApiKey&&cx.simple&&cx.simple.toLowerCase().includes('haiku')){
+            const warn=document.createElement('div');
+            warn.className='prov-item';warn.style.borderColor='#ef4444';warn.style.color='#ef4444';
+            warn.innerHTML='⚠️ Haiku requires ANTHROPIC_API_KEY — OAuth not supported';
+            if(routingSection)routingSection.appendChild(warn);
+          }
+        }
+      }
+    }
     $('uptime').textContent=dur(health.uptime);
     const total=stats.summary?.totalEvents||0;
     $('totalReq').textContent=total;
@@ -2395,6 +2451,88 @@ async function load(){
   }catch(e){console.error(e)}
 }
 load();setInterval(load,5000);
+</script></body></html>`;
+}
+
+function getConfigDashboardHTML(): string {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Config</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1200px;margin:0 auto}
+a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
+.header .meta{font-size:.8rem;color:#64748b}
+.section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
+.card{background:#111318;border:1px solid #1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
+.card .label{font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.card .value{font-size:1.75rem;font-weight:700}
+.green{color:#34d399}.yellow{color:#fbbf24}.red{color:#ef4444}
+.badge{display:inline-block;padding:4px 12px;border-radius:6px;font-size:.8rem;font-weight:500}
+.badge.ok{background:#052e1633;color:#34d399}.badge.warn{background:#2d2a0a;color:#fbbf24}.badge.off{background:#1e293b;color:#64748b}
+.config-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:24px}
+.config-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #1e293b}
+.config-row:last-child{border-bottom:none}
+.config-key{color:#94a3b8;font-size:.85rem}.config-val{font-weight:600;font-size:.9rem}
+.model-pill{display:inline-block;background:#1e293b;padding:4px 10px;border-radius:6px;font-size:.8rem;margin:2px}
+pre.raw{background:#111318;border:1px solid #1e293b;border-radius:8px;padding:16px;overflow-x:auto;font-size:.8rem;color:#94a3b8;max-height:400px;overflow-y:auto}
+</style></head><body>
+<div class="header"><div><h1>⚡ RelayPlane Config</h1></div><div class="meta"><a href="/dashboard">← Dashboard</a> · read-only view of ~/.relayplane/config.json</div></div>
+<div id="content"><p style="color:#64748b">Loading config...</p></div>
+<script>
+async function load(){
+  try{
+    const cfg=await fetch('/v1/config').then(r=>r.json());
+    const r=cfg.routing||{};const c=r.cascade||{};const rel=cfg.reliability||{};const mesh=cfg.mesh||{};
+    const mode=r.mode||'auto';
+    const modeColor=mode==='auto'?'green':mode==='cascade'?'yellow':'';
+    const cx=r.complexity||{};
+    const cascadeEnabled=c.enabled!==false&&(c.models||[]).length>0;
+    const meshEnabled=mesh.enabled===true;
+
+    let html='<div class="config-grid">';
+    html+='<div class="card"><div class="label">Routing Mode</div><div class="value '+modeColor+'">'+mode+'</div></div>';
+    html+='<div class="card"><div class="label">Cascade</div><div class="value">'+(cascadeEnabled?'<span class="green">Enabled</span>':'<span style="color:#64748b">Disabled</span>')+'</div></div>';
+    html+='<div class="card"><div class="label">Mesh</div><div class="value">'+(meshEnabled?'<span class="green">Enabled</span>':'<span style="color:#64748b">Disabled</span>')+'</div></div>';
+    html+='</div>';
+
+    // Complexity model mapping
+    html+='<div class="section"><h2>Complexity Model Mapping</h2><div class="card">';
+    if(cx.simple||cx.moderate||cx.complex){
+      html+='<div class="config-row"><span class="config-key">Simple →</span><span class="config-val"><span class="model-pill">'+(cx.simple||'default')+'</span></span></div>';
+      html+='<div class="config-row"><span class="config-key">Moderate →</span><span class="config-val"><span class="model-pill">'+(cx.moderate||'default')+'</span></span></div>';
+      html+='<div class="config-row"><span class="config-key">Complex →</span><span class="config-val"><span class="model-pill">'+(cx.complex||'default')+'</span></span></div>';
+      html+='<div class="config-row"><span class="config-key">Enabled</span><span class="config-val">'+(cx.enabled!==false?'<span class="badge ok">Yes</span>':'<span class="badge off">No</span>')+'</span></div>';
+    }else{html+='<p style="color:#64748b">No complexity mapping configured</p>';}
+    html+='</div></div>';
+
+    // Cascade settings
+    html+='<div class="section"><h2>Cascade Settings</h2><div class="card">';
+    if(cascadeEnabled){
+      html+='<div class="config-row"><span class="config-key">Models</span><span class="config-val">'+(c.models||[]).map(function(m){return '<span class="model-pill">'+m+'</span>'}).join(' → ')+'</span></div>';
+      html+='<div class="config-row"><span class="config-key">Escalate On</span><span class="config-val">'+(c.escalateOn||'uncertainty')+'</span></div>';
+      if(c.maxEscalations)html+='<div class="config-row"><span class="config-key">Max Escalations</span><span class="config-val">'+c.maxEscalations+'</span></div>';
+    }else{html+='<p style="color:#64748b">Cascade not configured</p>';}
+    html+='</div></div>';
+
+    // Reliability
+    html+='<div class="section"><h2>Reliability Settings</h2><div class="card">';
+    const cool=rel.cooldown||{};
+    html+='<div class="config-row"><span class="config-key">Cooldown Duration</span><span class="config-val">'+(cool.durationMs||(cool.duration??'default'))+'</span></div>';
+    html+='<div class="config-row"><span class="config-key">Max Failures</span><span class="config-val">'+(cool.maxFailures||'default')+'</span></div>';
+    html+='</div></div>';
+
+    // Mesh
+    html+='<div class="section"><h2>Mesh Settings</h2><div class="card">';
+    html+='<div class="config-row"><span class="config-key">Enabled</span><span class="config-val">'+(meshEnabled?'<span class="badge ok">Yes</span>':'<span class="badge off">No</span>')+'</span></div>';
+    if(mesh.peers)html+='<div class="config-row"><span class="config-key">Peers</span><span class="config-val">'+(mesh.peers||[]).map(function(p){return '<span class="model-pill">'+p+'</span>'}).join(' ')+'</span></div>';
+    html+='</div></div>';
+
+    // Raw JSON
+    html+='<div class="section"><h2>Raw Config</h2><pre class="raw">'+JSON.stringify(cfg,null,2)+'</pre></div>';
+
+    document.getElementById('content').innerHTML=html;
+  }catch(e){document.getElementById('content').innerHTML='<p style="color:#ef4444">Error loading config: '+e.message+'</p>';}
+}
+load();
 </script></body></html>`;
 }
 
@@ -2424,6 +2562,62 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const configPath = getProxyConfigPath();
   let proxyConfig = await loadProxyConfig(configPath, log);
+
+  // Auto-config on startup: detect available auth and set optimal routing
+  const configExists = await fs.promises.access(configPath).then(() => true).catch(() => false);
+  if (!configExists || proxyConfig.routing?.mode === 'auto') {
+    const envAnthropicKey = process.env['ANTHROPIC_API_KEY'];
+    const hasRegularApiKey = !!envAnthropicKey && envAnthropicKey.startsWith('sk-ant-api');
+
+    if (hasRegularApiKey) {
+      // Full 3-tier routing with API key
+      log('Auto-config: ANTHROPIC_API_KEY detected — enabling 3-tier routing (haiku/sonnet/opus)');
+      if (!configExists) {
+        const autoConfig: RelayPlaneProxyConfigFile = {
+          enabled: true,
+          modelOverrides: {},
+          routing: {
+            mode: 'auto',
+            cascade: { enabled: false, models: [], escalateOn: 'uncertainty', maxEscalations: 1 },
+            complexity: {
+              enabled: true,
+              simple: 'claude-haiku-4-5',
+              moderate: 'claude-sonnet-4-6',
+              complex: 'claude-opus-4-6',
+            },
+          },
+          reliability: proxyConfig.reliability,
+        };
+        await saveProxyConfig(configPath, autoConfig);
+        proxyConfig = await loadProxyConfig(configPath, log);
+        log('Auto-config: wrote config to ' + configPath);
+      }
+    } else {
+      // No regular API key — OAuth only, skip Haiku
+      console.warn('[relayplane] ⚠️  No ANTHROPIC_API_KEY set — Haiku routing disabled (OAuth not supported). Set ANTHROPIC_API_KEY to enable 3-tier routing.');
+      if (!configExists) {
+        const autoConfig: RelayPlaneProxyConfigFile = {
+          enabled: true,
+          modelOverrides: {},
+          routing: {
+            mode: 'auto',
+            cascade: { enabled: false, models: [], escalateOn: 'uncertainty', maxEscalations: 1 },
+            complexity: {
+              enabled: true,
+              simple: 'claude-sonnet-4-6',
+              moderate: 'claude-sonnet-4-6',
+              complex: 'claude-opus-4-6',
+            },
+          },
+          reliability: proxyConfig.reliability,
+        };
+        await saveProxyConfig(configPath, autoConfig);
+        proxyConfig = await loadProxyConfig(configPath, log);
+        log('Auto-config: wrote OAuth-safe config to ' + configPath + ' (no Haiku)');
+      }
+    }
+  }
+
   const cooldownManager = new CooldownManager(getCooldownConfig(proxyConfig));
 
   let configWatcher: fs.FSWatcher | null = null;
@@ -2496,6 +2690,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
       const uptimeMs = Date.now() - globalStats.startedAt;
       res.writeHead(200, { 'Content-Type': 'application/json' });
+      const anthropicEnvKeySet = !!process.env['ANTHROPIC_API_KEY'];
+      const anthropicEnvKeyPrefix = anthropicEnvKeySet ? process.env['ANTHROPIC_API_KEY']!.slice(0, 12) + '...' : null;
+      const routingMode = proxyConfig.routing?.mode || 'passthrough';
+      const complexityConfig = proxyConfig.routing?.complexity;
       res.end(JSON.stringify({
         status: 'ok',
         version: PROXY_VERSION,
@@ -2505,6 +2703,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         successRate: globalStats.totalRequests > 0
           ? parseFloat(((globalStats.successfulRequests / globalStats.totalRequests) * 100).toFixed(1))
           : null,
+        auth: {
+          anthropicApiKey: anthropicEnvKeySet,
+          anthropicApiKeyPrefix: anthropicEnvKeyPrefix,
+          note: anthropicEnvKeySet ? 'API key available for models that don\'t support OAuth' : 'No API key — OAuth passthrough only',
+        },
+        routing: {
+          mode: routingMode,
+          complexity: complexityConfig,
+        },
         stats: {
           totalRequests: globalStats.totalRequests,
           successfulRequests: globalStats.successfulRequests,
@@ -2782,6 +2989,24 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/dashboard/config') {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(getConfigDashboardHTML());
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/v1/config') {
+      try {
+        const raw = await fs.promises.readFile(getProxyConfigPath(), 'utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(raw);
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({}));
+      }
+      return;
+    }
+
     // Extract auth context from incoming request
     const ctx = extractRequestContext(req);
     const anthropicEnvKey = process.env['ANTHROPIC_API_KEY'];
@@ -2797,8 +3022,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     } else if (anthropicAuthMode === 'passthrough') {
       useAnthropicEnvKey = undefined; // Only use incoming auth
     } else {
-      // 'auto': Use incoming auth if present, fallback to env
-      useAnthropicEnvKey = (ctx.authHeader || ctx.apiKeyHeader) ? undefined : anthropicEnvKey;
+      // 'auto': Always keep env key available — needed for OAuth→API key fallback on rerouted requests
+      useAnthropicEnvKey = anthropicEnvKey;
     }
 
     // === Native Anthropic /v1/messages endpoint (for Claude Code) ===
@@ -2892,6 +3117,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         routingMode = 'quality';
       } else {
         routingMode = 'passthrough';
+      }
+
+      // KEY: When routing.mode is "auto", ALWAYS classify and route based on complexity,
+      // even when the user sends a specific model like "claude-opus-4-6".
+      // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
+      if (routingMode === 'passthrough' && proxyConfig.routing?.mode === 'auto') {
+        routingMode = 'auto';
+        log(`Config routing.mode=auto: overriding passthrough → auto for model ${requestedModel}`);
       }
 
       const isStreaming = requestBody['stream'] === true;
@@ -3037,7 +3270,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (modelAuth.isMax) {
                 log(`Using MAX token for ${resolved.model}`);
               }
-              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax);
+              const isCascadeRerouted = resolved.model !== originalModel;
+              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
                 if (proxyConfig.reliability?.cooldowns?.enabled) {
@@ -3068,11 +3302,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (modelAuth.isMax) {
             log(`Using MAX token for ${finalModel}`);
           }
+          // isRerouted: true when auto-routing changed the model from what the user requested
+          const isRerouted = routingMode !== 'passthrough' && finalModel !== originalModel;
+          if (isRerouted) {
+            log(`Rerouted: ${originalModel} → ${finalModel} (auth fallback enabled)`);
+          }
           const providerResponse = await forwardNativeAnthropicRequest(
             { ...requestBody, model: finalModel },
             ctx,
             modelAuth.apiKey,
-            modelAuth.isMax
+            modelAuth.isMax,
+            isRerouted
           );
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
@@ -3383,6 +3623,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       routingMode = 'quality';
     } else {
       routingMode = 'passthrough';
+    }
+
+    // KEY: When routing.mode is "auto", ALWAYS classify and route based on complexity,
+    // even when the user sends a specific model like "claude-opus-4-6".
+    // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
+    if (routingMode === 'passthrough' && proxyConfig.routing?.mode === 'auto') {
+      routingMode = 'auto';
+      log(`Config routing.mode=auto: overriding passthrough → auto for model ${requestedModel}`);
     }
 
     log(`Received request for model: ${requestedModel} (mode: ${routingMode}, stream: ${isStreaming})`);
