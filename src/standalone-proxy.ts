@@ -2636,6 +2636,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }, 50);
   };
 
+  let credentialsWatcher: fs.FSWatcher | null = null;
+  const credentialsPath = path.join(path.dirname(configPath), 'credentials.json');
+
   const startConfigWatcher = () => {
     if (configWatcher) return;
     try {
@@ -2646,7 +2649,42 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   };
 
+  const startCredentialsWatcher = () => {
+    if (credentialsWatcher) return;
+    try {
+      // Watch credentials.json so login triggers a reload without proxy restart
+      if (fs.existsSync(credentialsPath)) {
+        credentialsWatcher = fs.watch(credentialsPath, () => {
+          log('Credentials changed — reloading config');
+          scheduleConfigReload();
+        });
+      } else {
+        // Watch the directory for credentials.json creation
+        const dir = path.dirname(credentialsPath);
+        const dirWatcher = fs.watch(dir, (_, filename) => {
+          if (filename === 'credentials.json') {
+            log('Credentials file created — reloading config');
+            scheduleConfigReload();
+            // Now watch the file directly
+            dirWatcher.close();
+            try {
+              credentialsWatcher = fs.watch(credentialsPath, () => {
+                log('Credentials changed — reloading config');
+                scheduleConfigReload();
+              });
+            } catch {}
+          }
+        });
+        credentialsWatcher = dirWatcher;
+      }
+    } catch (err) {
+      const error = err as NodeJS.ErrnoException;
+      log(`Credentials watch error: ${error.message}`);
+    }
+  };
+
   startConfigWatcher();
+  startCredentialsWatcher();
 
   // Initialize RelayPlane
   const relay = new RelayPlane({ dbPath: config.dbPath });

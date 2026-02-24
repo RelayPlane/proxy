@@ -182,24 +182,71 @@ async function handleLoginCommand(): Promise<void> {
       ? rawVerificationUrl.replace('app.relayplane.com', 'relayplane.com')
       : rawVerificationUrl;
 
-    console.log(`  Open this URL in your browser:`);
-    console.log('');
-    console.log(`    ${verificationUrl}`);
-    console.log('');
-    console.log(`  And enter this code:`);
+    console.log(`  Your one-time code:`);
     console.log('');
     console.log(`    📋 ${userCode}`);
     console.log('');
-    console.log(`  Waiting for approval (expires in ${Math.floor(expiresIn / 60)} minutes)...`);
 
-    // Try to open browser automatically
-    try {
-      const { exec: execCmd } = await import('child_process');
-      const openCmd = process.platform === 'darwin' ? 'open' 
-        : process.platform === 'win32' ? 'start' 
-        : 'xdg-open';
-      execCmd(`${openCmd} "${verificationUrl}"`);
-    } catch {}
+    // Try to auto-open the browser, fall back to "press Enter" prompt
+    let browserOpened = false;
+    const tryOpenBrowser = () => {
+      try {
+        const { execSync } = require('child_process');
+        const openCmd = process.platform === 'darwin' ? 'open' 
+          : process.platform === 'win32' ? 'start' 
+          : 'xdg-open';
+        execSync(`${openCmd} "${verificationUrl}" 2>/dev/null`, { stdio: 'ignore', timeout: 3000 });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    // Check if we have a display / can open a browser
+    const hasDisplay = process.platform === 'darwin' || process.platform === 'win32' || !!process.env.DISPLAY || !!process.env.WAYLAND_DISPLAY;
+
+    if (hasDisplay) {
+      browserOpened = tryOpenBrowser();
+    }
+
+    if (browserOpened) {
+      console.log(`  ✅ Browser opened to: ${verificationUrl}`);
+      console.log(`     Paste the code above and approve.`);
+    } else if (process.stdin.isTTY) {
+      // Interactive terminal — let user press Enter to try opening, or copy manually
+      console.log(`  Press Enter to open ${verificationUrl}`);
+      console.log(`  (or open it manually and paste the code above)`);
+      console.log('');
+
+      // Wait for Enter (non-blocking — start polling in parallel)
+      const waitForEnter = new Promise<void>((resolve) => {
+        const onData = () => {
+          process.stdin.removeListener('data', onData);
+          if (process.stdin.isRaw === false || !process.stdin.setRawMode) {
+            // Normal line mode — Enter was pressed
+          }
+          tryOpenBrowser();
+          resolve();
+        };
+        process.stdin.once('data', onData);
+        // Auto-resolve after 30s so we don't block forever
+        setTimeout(() => {
+          process.stdin.removeListener('data', onData);
+          resolve();
+        }, 30000);
+      });
+
+      // Don't await — let polling start immediately
+      waitForEnter.catch(() => {});
+    } else {
+      // Non-interactive (piped, CI, agent) — just show the URL
+      console.log(`  Open this URL in your browser:`);
+      console.log(`    ${verificationUrl}`);
+      console.log(`  Then enter the code above.`);
+    }
+
+    console.log('');
+    console.log(`  Waiting for approval (expires in ${Math.floor(expiresIn / 60)} minutes)...`);
 
     // Poll for approval
     const deadline = Date.now() + expiresIn * 1000;
@@ -230,7 +277,14 @@ async function handleLoginCommand(): Promise<void> {
         if (pollData.teamName) console.log(`     Team: ${pollData.teamName}`);
         console.log(`     Plan: ${pollData.plan || 'free'}`);
         console.log('');
-        console.log('  ☁️  Cloud sync will activate on next proxy start.');
+        // Signal running proxy to pick up new credentials
+        const proxyRunning = await fetch('http://127.0.0.1:4100/health', { signal: AbortSignal.timeout(1000) })
+          .then(r => r.ok).catch(() => false);
+        if (proxyRunning) {
+          console.log('  ☁️  Cloud sync activated (proxy detected and notified).');
+        } else {
+          console.log('  ☁️  Cloud sync will activate on next proxy start.');
+        }
         console.log('');
         return;
       }
