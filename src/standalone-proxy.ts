@@ -103,14 +103,14 @@ export const DEFAULT_ENDPOINTS: Record<string, ProviderEndpoint> = {
  */
 export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }> = {
   // Anthropic models (using correct API model IDs)
-  'claude-opus-4-5': { provider: 'anthropic', model: 'claude-opus-4-20250514' },
-  'claude-sonnet-4': { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
-  'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022' },
-  'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
-  'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5-20250514' },
-  haiku: { provider: 'anthropic', model: 'claude-haiku-4-5-20250514' },
-  sonnet: { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
-  opus: { provider: 'anthropic', model: 'claude-opus-4-20250514' },
+  'claude-opus-4-5': { provider: 'anthropic', model: 'claude-opus-4-6' },
+  'claude-sonnet-4': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-latest' },
+  'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-haiku-4-5' },
+  'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5' },
+  haiku: { provider: 'anthropic', model: 'claude-haiku-4-5' },
+  sonnet: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  opus: { provider: 'anthropic', model: 'claude-opus-4-6' },
   // OpenAI models
   'gpt-4o': { provider: 'openai', model: 'gpt-4o' },
   'gpt-4o-mini': { provider: 'openai', model: 'gpt-4o-mini' },
@@ -153,12 +153,10 @@ function sendCloudTelemetry(
   success: boolean,
   costUsd?: number,
   requestedModel?: string,
-  cacheCreationTokens?: number,
-  cacheReadTokens?: number,
 ): void {
   try {
-    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut, cacheCreationTokens, cacheReadTokens);
-    const event: Parameters<typeof recordCloudTelemetry>[0] = {
+    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut);
+    recordCloudTelemetry({
       task_type: taskType,
       model,
       tokens_in: tokensIn,
@@ -167,10 +165,7 @@ function sendCloudTelemetry(
       success,
       cost_usd: cost,
       requested_model: requestedModel,
-    };
-    if (cacheCreationTokens) event.cache_creation_tokens = cacheCreationTokens;
-    if (cacheReadTokens) event.cache_read_tokens = cacheReadTokens;
-    recordCloudTelemetry(event);
+    });
   } catch {
     // Telemetry should never break the proxy
   }
@@ -636,18 +631,18 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     cascade: {
       enabled: true,
       models: [
-        'claude-3-5-haiku-20241022',
-        'claude-sonnet-4-20250514',
-        'claude-opus-4-20250514',
+        'claude-haiku-4-5',
+        'claude-sonnet-4-6',
+        'claude-opus-4-6',
       ],
       escalateOn: 'uncertainty',
       maxEscalations: 1,
     },
     complexity: {
       enabled: true,
-      simple: 'claude-3-5-haiku-20241022',
-      moderate: 'claude-sonnet-4-20250514',
-      complex: 'claude-opus-4-20250514',
+      simple: 'claude-haiku-4-5',
+      moderate: 'claude-sonnet-4-6',
+      complex: 'claude-opus-4-6',
     },
   },
   reliability: {
@@ -912,26 +907,28 @@ function getAuthForModel(
 function buildAnthropicHeadersWithAuth(
   ctx: RequestContext,
   apiKey?: string,
-  isMaxToken?: boolean,
-  isRerouted?: boolean
+  isMaxToken?: boolean
 ): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
 
-  // Detect if incoming auth is OAuth
-  const incomingIsOAuth = ctx.apiKeyHeader?.startsWith('sk-ant-oat') || ctx.authHeader?.includes('sk-ant-oat');
-  const apiKeyIsRegular = apiKey && apiKey.startsWith('sk-ant-api');
-
-  // When rerouted (auto mode changed the model) and incoming is OAuth,
-  // prefer the regular API key — OAuth doesn't work for all models (e.g. Haiku)
-  if (isRerouted && incomingIsOAuth && apiKeyIsRegular) {
+  // Auth: prefer incoming auth for passthrough, but OAuth doesn't work for all models (e.g. Haiku)
+  // When we have a regular API key AND incoming auth is OAuth, prefer the API key for rerouted requests
+  // because OAuth may not be supported on the target model. The API key works for ALL models.
+  const incomingIsOAuth = !!(ctx.apiKeyHeader?.startsWith('sk-ant-oat') || ctx.authHeader?.includes('sk-ant-oat'));
+  if (incomingIsOAuth && apiKey && !apiKey.startsWith('sk-ant-oat')) {
     headers['x-api-key'] = apiKey;
   } else if (ctx.authHeader) {
     headers['Authorization'] = ctx.authHeader;
   } else if (ctx.apiKeyHeader) {
-    headers['x-api-key'] = ctx.apiKeyHeader;
+    // MAX/OAuth tokens (sk-ant-oat*) must use Authorization: Bearer, not x-api-key
+    if (ctx.apiKeyHeader.startsWith('sk-ant-oat')) {
+      headers['Authorization'] = `Bearer ${ctx.apiKeyHeader}`;
+    } else {
+      headers['x-api-key'] = ctx.apiKeyHeader;
+    }
   } else if (apiKey) {
     // MAX tokens (OAuth) use Authorization: Bearer, API keys use x-api-key
     if (isMaxToken || apiKey.startsWith('sk-ant-oat')) {
@@ -1043,10 +1040,9 @@ async function forwardNativeAnthropicRequest(
   body: Record<string, unknown>,
   ctx: RequestContext,
   envApiKey?: string,
-  isMaxToken?: boolean,
-  isRerouted?: boolean
+  isMaxToken?: boolean
 ): Promise<Response> {
-  const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
+  const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken);
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -1715,7 +1711,7 @@ interface AnthropicResponse {
   id?: string;
   model?: string;
   content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
-  usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
+  usage?: { input_tokens?: number; output_tokens?: number };
   stop_reason?: string;
 }
 
@@ -1770,11 +1766,9 @@ function convertAnthropicResponse(anthropicData: AnthropicResponse): Record<stri
       },
     ],
     usage: {
-      prompt_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.cache_creation_input_tokens ?? 0) + (anthropicData.usage?.cache_read_input_tokens ?? 0),
+      prompt_tokens: anthropicData.usage?.input_tokens ?? 0,
       completion_tokens: anthropicData.usage?.output_tokens ?? 0,
-      total_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.cache_creation_input_tokens ?? 0) + (anthropicData.usage?.cache_read_input_tokens ?? 0) + (anthropicData.usage?.output_tokens ?? 0),
-      cache_creation_input_tokens: anthropicData.usage?.cache_creation_input_tokens ?? 0,
-      cache_read_input_tokens: anthropicData.usage?.cache_read_input_tokens ?? 0,
+      total_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.output_tokens ?? 0),
     },
   };
 }
@@ -1813,16 +1807,11 @@ function convertAnthropicStreamEvent(
       const msg = eventData['message'] as Record<string, unknown> | undefined;
       baseChunk.id = (msg?.['id'] as string) || messageId;
       choice.delta = { role: 'assistant', content: '' };
-      // Pass through input token count from message_start (including cache tokens)
+      // Pass through input token count from message_start
       const msgUsage = msg?.['usage'] as Record<string, unknown> | undefined;
       if (msgUsage) {
-        const cacheCreation = (msgUsage['cache_creation_input_tokens'] as number) ?? 0;
-        const cacheRead = (msgUsage['cache_read_input_tokens'] as number) ?? 0;
-        const inputTokens = (msgUsage['input_tokens'] as number) ?? 0;
         (baseChunk as Record<string, unknown>)['usage'] = {
-          prompt_tokens: inputTokens + cacheCreation + cacheRead,
-          cache_creation_input_tokens: cacheCreation,
-          cache_read_input_tokens: cacheRead,
+          prompt_tokens: msgUsage['input_tokens'] ?? 0,
         };
       }
       return `data: ${JSON.stringify(baseChunk)}\n\n`;
@@ -2265,7 +2254,7 @@ function getCascadeConfig(config: RelayPlaneProxyConfigFile): CascadeConfig {
   const c = config.routing?.cascade;
   return {
     enabled: c?.enabled ?? true,
-    models: c?.models ?? ['claude-3-5-haiku-20241022', 'claude-sonnet-4-20250514', 'claude-opus-4-20250514'],
+    models: c?.models ?? ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'],
     escalateOn: c?.escalateOn ?? 'uncertainty',
     maxEscalations: c?.maxEscalations ?? 1,
   };
@@ -2285,7 +2274,7 @@ function getCostModel(config: RelayPlaneProxyConfigFile): string {
   return (
     config.routing?.complexity?.simple ||
     config.routing?.cascade?.models?.[0] ||
-    'claude-3-5-haiku-20241022'
+    'claude-haiku-4-5'
   );
 }
 
@@ -2293,7 +2282,7 @@ function getFastModel(config: RelayPlaneProxyConfigFile): string {
   return (
     config.routing?.complexity?.simple ||
     config.routing?.cascade?.models?.[0] ||
-    'claude-3-5-haiku-20241022'
+    'claude-haiku-4-5'
   );
 }
 
@@ -2302,7 +2291,7 @@ function getQualityModel(config: RelayPlaneProxyConfigFile): string {
     config.routing?.complexity?.complex ||
     config.routing?.cascade?.models?.[config.routing?.cascade?.models?.length ? config.routing.cascade.models.length - 1 : 0] ||
     process.env['RELAYPLANE_QUALITY_MODEL'] ||
-    'claude-sonnet-4-20250514'
+    'claude-sonnet-4-6'
   );
 }
 
@@ -2376,17 +2365,8 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
-  <div class="card"><div class="label">Savings (vs Opus)</div><div class="value green" id="savings">—</div></div>
+  <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
-</div>
-<div class="section"><h2>Auth & Routing</h2>
-<div id="routingDetails" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px">
-  <div class="prov-item"><span class="dot" id="authDot"></span> <strong>Auth:</strong>&nbsp;<span id="authInfo">—</span></div>
-  <div class="prov-item"><strong>Routing:</strong>&nbsp;<span id="routingMode">—</span></div>
-  <div class="prov-item"><strong>Simple→</strong>&nbsp;<span id="routeSimple">—</span></div>
-  <div class="prov-item"><strong>Moderate→</strong>&nbsp;<span id="routeModerate">—</span></div>
-  <div class="prov-item"><strong>Complex→</strong>&nbsp;<span id="routeComplex">—</span></div>
-</div>
 </div>
 <div class="section"><h2>Model Breakdown</h2>
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
@@ -2408,39 +2388,6 @@ async function load(){
       fetch('/v1/telemetry/health').then(r=>r.json())
     ]);
     $('ver').textContent='v'+health.version;
-    const authDot=$('authDot'),authInfo=$('authInfo');
-    if(health.auth){
-      if(health.auth.anthropicApiKey){authDot.className='dot up';authInfo.textContent='API key ('+health.auth.anthropicApiKeyPrefix+')';}
-      else{authDot.className='dot warn';authInfo.textContent='OAuth only (no API key)';}
-    }
-    if(health.routing){
-      const mode=health.routing.mode||'passthrough';
-      $('routingMode').textContent=mode;
-      const routingSection=document.getElementById('routingDetails');
-      const hasApiKey=health.auth&&health.auth.anthropicApiKey;
-      if(mode==='passthrough'){
-        if(routingSection)routingSection.innerHTML='<div class="prov-item">Routing: passthrough → model from incoming requests</div>';
-      }else{
-        if(health.routing.complexity){
-          const cx=health.routing.complexity;
-          const authLabel=function(model){
-            if(hasApiKey)return '<span style="color:#34d399">● API key</span>';
-            const isHaiku=model&&model.toLowerCase().includes('haiku');
-            if(isHaiku)return '<span style="color:#ef4444">⚠️ OAuth - may fail</span>';
-            return '<span style="color:#fbbf24">● OAuth</span>';
-          };
-          $('routeSimple').innerHTML=(cx.simple||'—')+' <small>'+authLabel(cx.simple)+'</small>';
-          $('routeModerate').innerHTML=(cx.moderate||'—')+' <small>'+authLabel(cx.moderate)+'</small>';
-          $('routeComplex').innerHTML=(cx.complex||'—')+' <small>'+authLabel(cx.complex)+'</small>';
-          if(!hasApiKey&&cx.simple&&cx.simple.toLowerCase().includes('haiku')){
-            const warn=document.createElement('div');
-            warn.className='prov-item';warn.style.borderColor='#ef4444';warn.style.color='#ef4444';
-            warn.innerHTML='⚠️ Haiku requires ANTHROPIC_API_KEY — OAuth not supported';
-            if(routingSection)routingSection.appendChild(warn);
-          }
-        }
-      }
-    }
     $('uptime').textContent=dur(health.uptime);
     const total=stats.summary?.totalEvents||0;
     $('totalReq').textContent=total;
@@ -2574,62 +2521,6 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const configPath = getProxyConfigPath();
   let proxyConfig = await loadProxyConfig(configPath, log);
-
-  // Auto-config on startup: detect available auth and set optimal routing
-  const configExists = await fs.promises.access(configPath).then(() => true).catch(() => false);
-  if (!configExists || proxyConfig.routing?.mode === 'auto') {
-    const envAnthropicKey = process.env['ANTHROPIC_API_KEY'];
-    const hasRegularApiKey = !!envAnthropicKey && envAnthropicKey.startsWith('sk-ant-api');
-
-    if (hasRegularApiKey) {
-      // Full 3-tier routing with API key
-      log('Auto-config: ANTHROPIC_API_KEY detected — enabling 3-tier routing (haiku/sonnet/opus)');
-      if (!configExists) {
-        const autoConfig: RelayPlaneProxyConfigFile = {
-          enabled: true,
-          modelOverrides: {},
-          routing: {
-            mode: 'auto',
-            cascade: { enabled: false, models: [], escalateOn: 'uncertainty', maxEscalations: 1 },
-            complexity: {
-              enabled: true,
-              simple: 'claude-haiku-4-5',
-              moderate: 'claude-sonnet-4-6',
-              complex: 'claude-opus-4-6',
-            },
-          },
-          reliability: proxyConfig.reliability,
-        };
-        await saveProxyConfig(configPath, autoConfig);
-        proxyConfig = await loadProxyConfig(configPath, log);
-        log('Auto-config: wrote config to ' + configPath);
-      }
-    } else {
-      // No regular API key — OAuth only, skip Haiku
-      console.warn('[relayplane] ⚠️  No ANTHROPIC_API_KEY set — Haiku routing disabled (OAuth not supported). Set ANTHROPIC_API_KEY to enable 3-tier routing.');
-      if (!configExists) {
-        const autoConfig: RelayPlaneProxyConfigFile = {
-          enabled: true,
-          modelOverrides: {},
-          routing: {
-            mode: 'auto',
-            cascade: { enabled: false, models: [], escalateOn: 'uncertainty', maxEscalations: 1 },
-            complexity: {
-              enabled: true,
-              simple: 'claude-sonnet-4-6',
-              moderate: 'claude-sonnet-4-6',
-              complex: 'claude-opus-4-6',
-            },
-          },
-          reliability: proxyConfig.reliability,
-        };
-        await saveProxyConfig(configPath, autoConfig);
-        proxyConfig = await loadProxyConfig(configPath, log);
-        log('Auto-config: wrote OAuth-safe config to ' + configPath + ' (no Haiku)');
-      }
-    }
-  }
-
   const cooldownManager = new CooldownManager(getCooldownConfig(proxyConfig));
 
   let configWatcher: fs.FSWatcher | null = null;
@@ -2648,9 +2539,6 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }, 50);
   };
 
-  let credentialsWatcher: fs.FSWatcher | null = null;
-  const credentialsPath = path.join(path.dirname(configPath), 'credentials.json');
-
   const startConfigWatcher = () => {
     if (configWatcher) return;
     try {
@@ -2661,42 +2549,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   };
 
-  const startCredentialsWatcher = () => {
-    if (credentialsWatcher) return;
-    try {
-      // Watch credentials.json so login triggers a reload without proxy restart
-      if (fs.existsSync(credentialsPath)) {
-        credentialsWatcher = fs.watch(credentialsPath, () => {
-          log('Credentials changed — reloading config');
-          scheduleConfigReload();
-        });
-      } else {
-        // Watch the directory for credentials.json creation
-        const dir = path.dirname(credentialsPath);
-        const dirWatcher = fs.watch(dir, (_, filename) => {
-          if (filename === 'credentials.json') {
-            log('Credentials file created — reloading config');
-            scheduleConfigReload();
-            // Now watch the file directly
-            dirWatcher.close();
-            try {
-              credentialsWatcher = fs.watch(credentialsPath, () => {
-                log('Credentials changed — reloading config');
-                scheduleConfigReload();
-              });
-            } catch {}
-          }
-        });
-        credentialsWatcher = dirWatcher;
-      }
-    } catch (err) {
-      const error = err as NodeJS.ErrnoException;
-      log(`Credentials watch error: ${error.message}`);
-    }
-  };
-
   startConfigWatcher();
-  startCredentialsWatcher();
 
   // Initialize RelayPlane
   const relay = new RelayPlane({ dbPath: config.dbPath });
@@ -2740,10 +2593,6 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
       const uptimeMs = Date.now() - globalStats.startedAt;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      const anthropicEnvKeySet = !!process.env['ANTHROPIC_API_KEY'];
-      const anthropicEnvKeyPrefix = anthropicEnvKeySet ? process.env['ANTHROPIC_API_KEY']!.slice(0, 12) + '...' : null;
-      const routingMode = proxyConfig.routing?.mode || 'passthrough';
-      const complexityConfig = proxyConfig.routing?.complexity;
       res.end(JSON.stringify({
         status: 'ok',
         version: PROXY_VERSION,
@@ -2753,15 +2602,6 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         successRate: globalStats.totalRequests > 0
           ? parseFloat(((globalStats.successfulRequests / globalStats.totalRequests) * 100).toFixed(1))
           : null,
-        auth: {
-          anthropicApiKey: anthropicEnvKeySet,
-          anthropicApiKeyPrefix: anthropicEnvKeyPrefix,
-          note: anthropicEnvKeySet ? 'API key available for models that don\'t support OAuth' : 'No API key — OAuth passthrough only',
-        },
-        routing: {
-          mode: routingMode,
-          complexity: complexityConfig,
-        },
         stats: {
           totalRequests: globalStats.totalRequests,
           successfulRequests: globalStats.successfulRequests,
@@ -2902,7 +2742,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const offset = parseInt(params.get('offset') || '0', 10);
         const sorted = [...requestHistory].reverse();
         const runs = sorted.slice(offset, offset + limit).map(r => {
-          const origCost = estimateCost('claude-opus-4-20250514', r.tokensIn, r.tokensOut);
+          const origCost = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut);
           const perRunSavings = Math.max(0, origCost - r.costUsd);
           return {
             id: r.id,
@@ -2934,7 +2774,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (req.method === 'GET' && telemetryPath === 'savings') {
         // Savings = cost if everything ran on Opus - actual cost
         // Always compare against Opus as the baseline
-        const OPUS_BASELINE = 'claude-opus-4-20250514';
+        const OPUS_BASELINE = 'claude-opus-4-6';
         let totalOriginalCost = 0;
         let totalActualCost = 0;
         let totalSavedAmount = 0;
@@ -3072,7 +2912,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     } else if (anthropicAuthMode === 'passthrough') {
       useAnthropicEnvKey = undefined; // Only use incoming auth
     } else {
-      // 'auto': Always keep env key available — needed for OAuth→API key fallback on rerouted requests
+      // 'auto': Use incoming auth if present, fallback to env
+      // ALWAYS keep env key available — OAuth (sk-ant-oat) doesn't work for all models (e.g. Haiku)
       useAnthropicEnvKey = anthropicEnvKey;
     }
 
@@ -3320,8 +3161,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (modelAuth.isMax) {
                 log(`Using MAX token for ${resolved.model}`);
               }
-              const isCascadeRerouted = resolved.model !== originalModel;
-              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
+              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax);
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
                 if (proxyConfig.reliability?.cooldowns?.enabled) {
@@ -3352,17 +3192,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (modelAuth.isMax) {
             log(`Using MAX token for ${finalModel}`);
           }
-          // isRerouted: true when auto-routing changed the model from what the user requested
-          const isRerouted = routingMode !== 'passthrough' && finalModel !== originalModel;
-          if (isRerouted) {
-            log(`Rerouted: ${originalModel} → ${finalModel} (auth fallback enabled)`);
-          }
           const providerResponse = await forwardNativeAnthropicRequest(
             { ...requestBody, model: finalModel },
             ctx,
             modelAuth.apiKey,
-            modelAuth.isMax,
-            isRerouted
+            modelAuth.isMax
           );
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
@@ -3401,8 +3235,6 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const reader = providerResponse.body?.getReader();
             let streamTokensIn = 0;
             let streamTokensOut = 0;
-            let streamCacheCreation = 0;
-            let streamCacheRead = 0;
             if (reader) {
               const decoder = new TextDecoder();
               let sseBuffer = '';
@@ -3424,12 +3256,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                         if (evt.type === 'message_delta' && evt.usage) {
                           streamTokensOut = evt.usage.output_tokens ?? streamTokensOut;
                         }
-                        // Anthropic: message_start has usage.input_tokens + cache token fields
+                        // Anthropic: message_start has usage.input_tokens
                         if (evt.type === 'message_start' && evt.message?.usage) {
-                          const u = evt.message.usage;
-                          streamCacheCreation = u.cache_creation_input_tokens ?? 0;
-                          streamCacheRead = u.cache_read_input_tokens ?? 0;
-                          streamTokensIn = (u.input_tokens ?? 0) + streamCacheCreation + streamCacheRead;
+                          streamTokensIn = evt.message.usage.input_tokens ?? streamTokensIn;
                         }
                         // OpenAI format: choices with usage
                         if (evt.usage) {
@@ -3447,7 +3276,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               }
             }
             // Store streaming token counts so telemetry can use them
-            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead } } as Record<string, unknown>;
+            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut } } as Record<string, unknown>;
             res.end();
           } else {
             nativeResponseData = await providerResponse.json() as Record<string, unknown>;
@@ -3476,15 +3305,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         // nativeResponseData holds response JSON for non-streaming, or { usage: { input_tokens, output_tokens } }
         // synthesised from SSE events for streaming
         const nativeUsageData = (nativeResponseData as any)?.usage;
-        const nativeCacheCreation = nativeUsageData?.cache_creation_input_tokens ?? 0;
-        const nativeCacheRead = nativeUsageData?.cache_read_input_tokens ?? 0;
-        const nativeRawIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
-        const nativeTokIn = nativeRawIn + nativeCacheCreation + nativeCacheRead;
+        const nativeTokIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
         const nativeTokOut = nativeUsageData?.output_tokens ?? nativeUsageData?.completion_tokens ?? 0;
         updateLastHistoryEntry(
           nativeTokIn,
           nativeTokOut,
-          estimateCost(targetModel || requestedModel, nativeRawIn, nativeTokOut, nativeCacheCreation, nativeCacheRead),
+          estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut),
         );
 
         if (recordTelemetry) {
@@ -3495,7 +3321,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               model: `${targetProvider}:${targetModel || requestedModel}`,
             })
             .catch(() => {});
-          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined, nativeCacheCreation, nativeCacheRead);
+          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined);
         }
       } catch (err) {
         const durationMs = Date.now() - startTime;
@@ -3895,12 +3721,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             taskType, complexity
           );
           const cascadeUsage = (responseData as any)?.usage;
-          const cascadeCacheCreation = cascadeUsage?.cache_creation_input_tokens ?? 0;
-          const cascadeCacheRead = cascadeUsage?.cache_read_input_tokens ?? 0;
-          const cascadeRawIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
-          const cascadeTokensIn = cascadeRawIn + cascadeCacheCreation + cascadeCacheRead;
+          const cascadeTokensIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
           const cascadeTokensOut = cascadeUsage?.output_tokens ?? cascadeUsage?.completion_tokens ?? 0;
-          const cascadeCost = estimateCost(cascadeResult.model, cascadeRawIn, cascadeTokensOut, cascadeCacheCreation, cascadeCacheRead);
+          const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut);
           updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel);
 
           if (recordTelemetry) {
@@ -3923,7 +3746,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             } catch (err) {
               log(`Failed to record run: ${err}`);
             }
-            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined, cascadeCacheCreation, cascadeCacheRead);
+            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
           }
 
           const chatCascadeRpHeaders = buildRelayPlaneResponseHeaders(
@@ -4121,8 +3944,6 @@ async function handleStreamingRequest(
   // Track token usage from streaming events
   let streamTokensIn = 0;
   let streamTokensOut = 0;
-  let streamCacheCreation = 0;
-  let streamCacheRead = 0;
 
   try {
     // Stream the response based on provider format
@@ -4140,8 +3961,6 @@ async function handleStreamingRequest(
                 if (evt.usage) {
                   streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
                   streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
-                  streamCacheCreation = evt.usage.cache_creation_input_tokens ?? streamCacheCreation;
-                  streamCacheRead = evt.usage.cache_read_input_tokens ?? streamCacheRead;
                 }
               }
             }
@@ -4206,9 +4025,7 @@ async function handleStreamingRequest(
     taskType, complexity
   );
   // Update token/cost info on the history entry
-  // For cost calculation with cache breakdown, pass raw input (total minus cache) separately
-  const streamRawIn = streamCacheCreation || streamCacheRead ? streamTokensIn - streamCacheCreation - streamCacheRead : streamTokensIn;
-  const streamCost = estimateCost(targetModel, streamRawIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
+  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut);
   updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost);
 
   if (recordTelemetry) {
@@ -4225,7 +4042,7 @@ async function handleStreamingRequest(
       .catch((err) => {
         log(`Failed to record run: ${err}`);
       });
-    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined, streamCacheCreation || undefined, streamCacheRead || undefined);
+    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined);
   }
 
   res.end();
@@ -4299,12 +4116,9 @@ async function handleNonStreamingRequest(
   logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
   // Update token/cost info
   const usage = (responseData as any)?.usage;
-  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
-  const cacheRead = usage?.cache_read_input_tokens ?? 0;
-  const rawIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
-  const tokensIn = rawIn + cacheCreation + cacheRead;
+  const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
   const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-  const cost = estimateCost(targetModel, rawIn, tokensOut, cacheCreation || undefined, cacheRead || undefined);
+  const cost = estimateCost(targetModel, tokensIn, tokensOut);
   updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel);
 
   if (recordTelemetry) {
@@ -4331,13 +4145,10 @@ async function handleNonStreamingRequest(
       log(`Failed to record run: ${err}`);
     }
     // Extract token counts from response if available (Anthropic/OpenAI format)
-    const usage2 = (responseData as any)?.usage;
-    const cc2 = usage2?.cache_creation_input_tokens ?? 0;
-    const cr2 = usage2?.cache_read_input_tokens ?? 0;
-    const rawIn2 = usage2?.input_tokens ?? usage2?.prompt_tokens ?? 0;
-    const tokensIn2 = rawIn2 + cc2 + cr2;
-    const tokensOut2 = usage2?.output_tokens ?? usage2?.completion_tokens ?? 0;
-    sendCloudTelemetry(taskType, targetModel, tokensIn2, tokensOut2, durationMs, true, undefined, undefined, cc2 || undefined, cr2 || undefined);
+    const usage = (responseData as any)?.usage;
+    const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
+    const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
+    sendCloudTelemetry(taskType, targetModel, tokensIn, tokensOut, durationMs, true);
   }
 
   // Send response with RelayPlane routing headers
