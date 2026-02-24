@@ -377,6 +377,12 @@ async function handleCloudStatusCommand(): Promise<void> {
   } catch {}
 
   console.log(`  Proxy:       ${proxyReachable ? '🟢 Running' : '🔴 Stopped'}`);
+
+  // Autostart status
+  const rpConfig = loadRelayplaneConfig();
+  if (rpConfig.autostart) {
+    console.log(`  Autostart:   ✅ Enabled`);
+  }
   
   // Auth status
   if (creds?.apiKey) {
@@ -444,6 +450,7 @@ Commands:
   telemetry [on|off|status]  Manage telemetry settings
   stats                  Show usage statistics
   config                 Show configuration
+  autostart [on|off|status]  Manage autostart on boot (systemd)
   mesh [status|sync|tips|contribute]  Mesh learning layer management
 
 Options:
@@ -651,6 +658,156 @@ function handleConfigCommand(args: string[]): void {
   console.log(`  Created:     ${config.created_at}`);
   console.log('');
   console.log('  To set API key: relayplane-proxy config set-key <your-key>');
+  console.log('');
+}
+
+// ============================================
+// AUTOSTART COMMAND
+// ============================================
+
+const RELAYPLANE_CONFIG_PATH = join(homedir(), '.relayplane', 'config.json');
+const SERVICE_NAME = 'relayplane-proxy';
+const SERVICE_PATH = `/etc/systemd/system/${SERVICE_NAME}.service`;
+
+function loadRelayplaneConfig(): Record<string, any> {
+  try {
+    if (existsSync(RELAYPLANE_CONFIG_PATH)) {
+      return JSON.parse(readFileSync(RELAYPLANE_CONFIG_PATH, 'utf8'));
+    }
+  } catch {}
+  return {};
+}
+
+function saveRelayplaneConfig(config: Record<string, any>): void {
+  const dir = dirname(RELAYPLANE_CONFIG_PATH);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(RELAYPLANE_CONFIG_PATH, JSON.stringify(config, null, 2) + '\n');
+}
+
+function hasSystemd(): boolean {
+  try {
+    const { execSync } = require('child_process');
+    execSync('which systemctl', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isRoot(): boolean {
+  return process.getuid?.() === 0;
+}
+
+async function handleAutostartCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? 'status';
+
+  if (process.platform !== 'linux' || !hasSystemd()) {
+    console.log('  ⚠️  Autostart is only supported on Linux with systemd.');
+    return;
+  }
+
+  if (sub === 'on') {
+    if (!isRoot()) {
+      console.log('  ⚠️  Autostart requires root. Try: sudo relayplane autostart on');
+      return;
+    }
+
+    const { execSync } = require('child_process');
+    // Detect binary path
+    let binPath: string;
+    try {
+      binPath = execSync('which relayplane', { encoding: 'utf8' }).trim();
+    } catch {
+      binPath = process.argv[0] ?? 'relayplane';
+    }
+
+    const serviceContent = `[Unit]
+Description=RelayPlane Proxy - Intelligent AI Model Routing
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+ExecStart=${binPath}
+Restart=always
+RestartSec=3
+Environment=HOME=/root
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+    writeFileSync(SERVICE_PATH, serviceContent);
+    execSync('systemctl daemon-reload && systemctl enable relayplane-proxy && systemctl start relayplane-proxy', { stdio: 'inherit' });
+
+    // Save preference
+    const config = loadRelayplaneConfig();
+    config.autostart = true;
+    saveRelayplaneConfig(config);
+
+    console.log('  ✅ Autostart enabled. RelayPlane will start on boot and restart on crash.');
+    return;
+  }
+
+  if (sub === 'off') {
+    if (!isRoot()) {
+      console.log('  ⚠️  Autostart requires root. Try: sudo relayplane autostart off');
+      return;
+    }
+
+    const { execSync } = require('child_process');
+    try {
+      execSync('systemctl stop relayplane-proxy && systemctl disable relayplane-proxy', { stdio: 'inherit' });
+    } catch {
+      // Service may not exist
+    }
+
+    // Remove service file if it exists
+    try {
+      if (existsSync(SERVICE_PATH)) {
+        const { unlinkSync } = require('fs');
+        unlinkSync(SERVICE_PATH);
+        execSync('systemctl daemon-reload', { stdio: 'inherit' });
+      }
+    } catch {}
+
+    // Save preference
+    const config = loadRelayplaneConfig();
+    config.autostart = false;
+    saveRelayplaneConfig(config);
+
+    console.log('  ✅ Autostart disabled.');
+    return;
+  }
+
+  // status (default)
+  const { execSync } = require('child_process');
+  let isEnabled = false;
+  let isActive = false;
+
+  try {
+    const enabled = execSync(`systemctl is-enabled ${SERVICE_NAME} 2>/dev/null`, { encoding: 'utf8' }).trim();
+    isEnabled = enabled === 'enabled';
+  } catch {}
+
+  try {
+    const active = execSync(`systemctl is-active ${SERVICE_NAME} 2>/dev/null`, { encoding: 'utf8' }).trim();
+    isActive = active === 'active';
+  } catch {}
+
+  console.log('');
+  console.log('  🔄 Autostart Status');
+  console.log('  ═══════════════════');
+  console.log(`  Service:  ${isEnabled ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log(`  Running:  ${isActive ? '🟢 Active' : '🔴 Inactive'}`);
+  console.log('');
+  if (!isEnabled) {
+    console.log('  To enable:  sudo relayplane autostart on');
+  } else {
+    console.log('  To disable: sudo relayplane autostart off');
+  }
   console.log('');
 }
 
@@ -887,6 +1044,11 @@ async function main(): Promise<void> {
 
   if (command === 'status') {
     await handleCloudStatusCommand();
+    process.exit(0);
+  }
+
+  if (command === 'autostart') {
+    await handleAutostartCommand(args.slice(1));
     process.exit(0);
   }
 
