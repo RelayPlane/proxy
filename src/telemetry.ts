@@ -371,7 +371,7 @@ export function getTelemetryPath(): string {
 // CLOUD TELEMETRY UPLOAD
 // ============================================
 
-const BRAIN_API_URL = process.env.RELAYPLANE_API_URL || 'https://api.relayplane.com';
+const MESH_API_URL = process.env.RELAYPLANE_API_URL || 'https://api.relayplane.com';
 const UPLOAD_BATCH_SIZE = 50;
 const FLUSH_DELAY_MS = 5000; // 5 second debounce
 
@@ -411,8 +411,8 @@ export async function flushTelemetryToCloud(): Promise<void> {
   
   // Use anonymous endpoint for free tier, authenticated for Pro
   const endpoint = apiKey 
-    ? `${BRAIN_API_URL}/v1/telemetry`
-    : `${BRAIN_API_URL}/v1/telemetry/anonymous`;
+    ? `${MESH_API_URL}/v1/telemetry`
+    : `${MESH_API_URL}/v1/telemetry/anonymous`;
   
   // Anonymous uploads have smaller batch limit (100 vs 1000)
   const batchSize = apiKey ? UPLOAD_BATCH_SIZE : Math.min(UPLOAD_BATCH_SIZE, 100);

@@ -5,6 +5,13 @@
 
 An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and offers configurable task-aware routing — all running locally.
 
+**Key features:**
+- 📊 Per-request cost tracking across 11+ providers
+- 💰 **Cache-aware cost tracking** — accurately tracks Anthropic prompt caching with cache read savings, creation costs, and true per-request costs including cached tokens
+- 🔀 Configurable task-aware routing (complexity-based, cascade, model overrides)
+- 🛡️ Circuit breaker architecture — if the proxy fails, your agent doesn't notice
+- 📈 Local dashboard with cost breakdown, savings analysis, and provider health
+
 ## Quick Start
 
 ```bash

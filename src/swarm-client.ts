@@ -12,13 +12,13 @@ import * as path from 'path';
 import { getConfigDir } from './config.js';
 import { inferTaskType, isOfflineMode } from './telemetry.js';
 
-const BRAIN_API_URL = process.env.RELAYPLANE_API_URL || 'https://api.relayplane.com';
-const BRAIN_TIMEOUT_MS = 5000; // 5 second timeout for Brain calls
+const MESH_API_URL = process.env.RELAYPLANE_API_URL || 'https://api.relayplane.com';
+const MESH_TIMEOUT_MS = 5000; // 5 second timeout for Mesh calls
 
 /**
  * Route request to Swarm API
  */
-export interface BrainRouteRequest {
+export interface MeshRouteRequest {
   taskType: string;
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
@@ -33,7 +33,7 @@ export interface BrainRouteRequest {
 /**
  * Route response from Swarm API
  */
-export interface BrainRouteResponse {
+export interface MeshRouteResponse {
   success: boolean;
   recommendedModel: string;
   confidence: number;
@@ -58,9 +58,9 @@ export interface BrainRouteResponse {
 }
 
 /**
- * Check if user has Brain access (Pro API key)
+ * Check if user has Mesh access (Pro API key)
  */
-export function hasBrainAccess(): boolean {
+export function hasMeshAccess(): boolean {
   if (isOfflineMode()) return false;
   
   const apiKey = getApiKey();
@@ -113,12 +113,12 @@ export function setApiKey(apiKey: string): void {
 /**
  * Get routing recommendation from Swarm API
  * 
- * Falls back to static routing if Brain is unavailable.
+ * Falls back to static routing if Mesh is unavailable.
  */
 export async function getRouteRecommendation(
-  request: BrainRouteRequest
-): Promise<BrainRouteResponse | null> {
-  if (!hasBrainAccess()) {
+  request: MeshRouteRequest
+): Promise<MeshRouteResponse | null> {
+  if (!hasMeshAccess()) {
     return null;
   }
   
@@ -127,9 +127,9 @@ export async function getRouteRecommendation(
   
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), BRAIN_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), MESH_TIMEOUT_MS);
     
-    const response = await fetch(`${BRAIN_API_URL}/v1/route`, {
+    const response = await fetch(`${MESH_API_URL}/v1/route`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -142,18 +142,18 @@ export async function getRouteRecommendation(
     clearTimeout(timeout);
     
     if (!response.ok) {
-      // Brain unavailable - fall back to static
-      console.warn(`[Brain] Route request failed: ${response.status}`);
+      // Mesh unavailable - fall back to static
+      console.warn(`[Mesh] Route request failed: ${response.status}`);
       return null;
     }
     
-    const result = await response.json() as BrainRouteResponse;
+    const result = await response.json() as MeshRouteResponse;
     return result;
   } catch (err) {
     if (err instanceof Error && err.name === 'AbortError') {
-      console.warn('[Brain] Route request timed out');
+      console.warn('[Mesh] Route request timed out');
     } else {
-      console.warn('[Brain] Route request failed:', err);
+      console.warn('[Mesh] Route request failed:', err);
     }
     return null;
   }
@@ -164,18 +164,18 @@ export async function getRouteRecommendation(
  * 
  * Analyzes the request and calls Swarm API to get the optimal model.
  */
-export async function getBrainRouting(
+export async function getMeshRouting(
   inputTokens: number,
   outputTokens: number,
   currentModel: string,
   hasTools: boolean = false,
   hasVision: boolean = false
-): Promise<{ model: string; reason: string; isBrain: boolean }> {
+): Promise<{ model: string; reason: string; isMesh: boolean }> {
   // Infer task type
   const taskType = inferTaskType(inputTokens, outputTokens, currentModel, hasTools);
   
   // Try Swarm API
-  const brainResponse = await getRouteRecommendation({
+  const meshResponse = await getRouteRecommendation({
     taskType,
     estimatedInputTokens: inputTokens,
     estimatedOutputTokens: outputTokens,
@@ -184,19 +184,19 @@ export async function getBrainRouting(
     currentModel,
   });
   
-  if (brainResponse && brainResponse.success) {
+  if (meshResponse && meshResponse.success) {
     return {
-      model: brainResponse.recommendedModel,
-      reason: brainResponse.explanation.reason,
-      isBrain: true,
+      model: meshResponse.recommendedModel,
+      reason: meshResponse.explanation.reason,
+      isMesh: true,
     };
   }
   
   // Fall back to static routing
   return {
     model: currentModel,
-    reason: 'Static routing (Brain unavailable)',
-    isBrain: false,
+    reason: 'Static routing (Mesh unavailable)',
+    isMesh: false,
   };
 }
 
@@ -210,7 +210,7 @@ export async function getProviderStatus(): Promise<Array<{
   latencyP99Ms: number;
   successRate: number;
 }> | null> {
-  if (!hasBrainAccess()) {
+  if (!hasMeshAccess()) {
     return null;
   }
   
@@ -218,7 +218,7 @@ export async function getProviderStatus(): Promise<Array<{
   if (!apiKey) return null;
   
   try {
-    const response = await fetch(`${BRAIN_API_URL}/v1/status`, {
+    const response = await fetch(`${MESH_API_URL}/v1/status`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
       },
