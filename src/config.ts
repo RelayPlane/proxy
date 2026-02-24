@@ -181,6 +181,17 @@ export function getDeviceId(): string {
  */
 export function setApiKey(key: string): void {
   updateConfig({ api_key: key });
+  
+  // Also update credentials.json so the proxy uses the same key everywhere
+  const credPath = path.join(CONFIG_DIR, 'credentials.json');
+  try {
+    let creds: Record<string, any> = {};
+    if (fs.existsSync(credPath)) {
+      creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
+    }
+    creds.apiKey = key;
+    fs.writeFileSync(credPath, JSON.stringify(creds, null, 2));
+  } catch {}
 }
 
 /**
