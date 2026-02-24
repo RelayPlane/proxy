@@ -153,10 +153,12 @@ function sendCloudTelemetry(
   success: boolean,
   costUsd?: number,
   requestedModel?: string,
+  cacheCreationTokens?: number,
+  cacheReadTokens?: number,
 ): void {
   try {
-    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut);
-    recordCloudTelemetry({
+    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut, cacheCreationTokens, cacheReadTokens);
+    const event: Parameters<typeof recordCloudTelemetry>[0] = {
       task_type: taskType,
       model,
       tokens_in: tokensIn,
@@ -165,7 +167,10 @@ function sendCloudTelemetry(
       success,
       cost_usd: cost,
       requested_model: requestedModel,
-    });
+    };
+    if (cacheCreationTokens) event.cache_creation_tokens = cacheCreationTokens;
+    if (cacheReadTokens) event.cache_read_tokens = cacheReadTokens;
+    recordCloudTelemetry(event);
   } catch {
     // Telemetry should never break the proxy
   }
@@ -1710,7 +1715,7 @@ interface AnthropicResponse {
   id?: string;
   model?: string;
   content?: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
   stop_reason?: string;
 }
 
@@ -1765,9 +1770,11 @@ function convertAnthropicResponse(anthropicData: AnthropicResponse): Record<stri
       },
     ],
     usage: {
-      prompt_tokens: anthropicData.usage?.input_tokens ?? 0,
+      prompt_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.cache_creation_input_tokens ?? 0) + (anthropicData.usage?.cache_read_input_tokens ?? 0),
       completion_tokens: anthropicData.usage?.output_tokens ?? 0,
-      total_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.output_tokens ?? 0),
+      total_tokens: (anthropicData.usage?.input_tokens ?? 0) + (anthropicData.usage?.cache_creation_input_tokens ?? 0) + (anthropicData.usage?.cache_read_input_tokens ?? 0) + (anthropicData.usage?.output_tokens ?? 0),
+      cache_creation_input_tokens: anthropicData.usage?.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: anthropicData.usage?.cache_read_input_tokens ?? 0,
     },
   };
 }
@@ -1806,11 +1813,16 @@ function convertAnthropicStreamEvent(
       const msg = eventData['message'] as Record<string, unknown> | undefined;
       baseChunk.id = (msg?.['id'] as string) || messageId;
       choice.delta = { role: 'assistant', content: '' };
-      // Pass through input token count from message_start
+      // Pass through input token count from message_start (including cache tokens)
       const msgUsage = msg?.['usage'] as Record<string, unknown> | undefined;
       if (msgUsage) {
+        const cacheCreation = (msgUsage['cache_creation_input_tokens'] as number) ?? 0;
+        const cacheRead = (msgUsage['cache_read_input_tokens'] as number) ?? 0;
+        const inputTokens = (msgUsage['input_tokens'] as number) ?? 0;
         (baseChunk as Record<string, unknown>)['usage'] = {
-          prompt_tokens: msgUsage['input_tokens'] ?? 0,
+          prompt_tokens: inputTokens + cacheCreation + cacheRead,
+          cache_creation_input_tokens: cacheCreation,
+          cache_read_input_tokens: cacheRead,
         };
       }
       return `data: ${JSON.stringify(baseChunk)}\n\n`;
@@ -3389,6 +3401,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const reader = providerResponse.body?.getReader();
             let streamTokensIn = 0;
             let streamTokensOut = 0;
+            let streamCacheCreation = 0;
+            let streamCacheRead = 0;
             if (reader) {
               const decoder = new TextDecoder();
               let sseBuffer = '';
@@ -3410,9 +3424,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                         if (evt.type === 'message_delta' && evt.usage) {
                           streamTokensOut = evt.usage.output_tokens ?? streamTokensOut;
                         }
-                        // Anthropic: message_start has usage.input_tokens
+                        // Anthropic: message_start has usage.input_tokens + cache token fields
                         if (evt.type === 'message_start' && evt.message?.usage) {
-                          streamTokensIn = evt.message.usage.input_tokens ?? streamTokensIn;
+                          const u = evt.message.usage;
+                          streamCacheCreation = u.cache_creation_input_tokens ?? 0;
+                          streamCacheRead = u.cache_read_input_tokens ?? 0;
+                          streamTokensIn = (u.input_tokens ?? 0) + streamCacheCreation + streamCacheRead;
                         }
                         // OpenAI format: choices with usage
                         if (evt.usage) {
@@ -3430,7 +3447,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               }
             }
             // Store streaming token counts so telemetry can use them
-            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut } } as Record<string, unknown>;
+            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead } } as Record<string, unknown>;
             res.end();
           } else {
             nativeResponseData = await providerResponse.json() as Record<string, unknown>;
@@ -3459,12 +3476,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         // nativeResponseData holds response JSON for non-streaming, or { usage: { input_tokens, output_tokens } }
         // synthesised from SSE events for streaming
         const nativeUsageData = (nativeResponseData as any)?.usage;
-        const nativeTokIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
+        const nativeCacheCreation = nativeUsageData?.cache_creation_input_tokens ?? 0;
+        const nativeCacheRead = nativeUsageData?.cache_read_input_tokens ?? 0;
+        const nativeRawIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
+        const nativeTokIn = nativeRawIn + nativeCacheCreation + nativeCacheRead;
         const nativeTokOut = nativeUsageData?.output_tokens ?? nativeUsageData?.completion_tokens ?? 0;
         updateLastHistoryEntry(
           nativeTokIn,
           nativeTokOut,
-          estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut),
+          estimateCost(targetModel || requestedModel, nativeRawIn, nativeTokOut, nativeCacheCreation, nativeCacheRead),
         );
 
         if (recordTelemetry) {
@@ -3475,7 +3495,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               model: `${targetProvider}:${targetModel || requestedModel}`,
             })
             .catch(() => {});
-          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined);
+          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined, nativeCacheCreation, nativeCacheRead);
         }
       } catch (err) {
         const durationMs = Date.now() - startTime;
@@ -3875,9 +3895,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             taskType, complexity
           );
           const cascadeUsage = (responseData as any)?.usage;
-          const cascadeTokensIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
+          const cascadeCacheCreation = cascadeUsage?.cache_creation_input_tokens ?? 0;
+          const cascadeCacheRead = cascadeUsage?.cache_read_input_tokens ?? 0;
+          const cascadeRawIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
+          const cascadeTokensIn = cascadeRawIn + cascadeCacheCreation + cascadeCacheRead;
           const cascadeTokensOut = cascadeUsage?.output_tokens ?? cascadeUsage?.completion_tokens ?? 0;
-          const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut);
+          const cascadeCost = estimateCost(cascadeResult.model, cascadeRawIn, cascadeTokensOut, cascadeCacheCreation, cascadeCacheRead);
           updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel);
 
           if (recordTelemetry) {
@@ -3900,7 +3923,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             } catch (err) {
               log(`Failed to record run: ${err}`);
             }
-            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
+            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined, cascadeCacheCreation, cascadeCacheRead);
           }
 
           const chatCascadeRpHeaders = buildRelayPlaneResponseHeaders(
@@ -4098,6 +4121,8 @@ async function handleStreamingRequest(
   // Track token usage from streaming events
   let streamTokensIn = 0;
   let streamTokensOut = 0;
+  let streamCacheCreation = 0;
+  let streamCacheRead = 0;
 
   try {
     // Stream the response based on provider format
@@ -4115,6 +4140,8 @@ async function handleStreamingRequest(
                 if (evt.usage) {
                   streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
                   streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+                  streamCacheCreation = evt.usage.cache_creation_input_tokens ?? streamCacheCreation;
+                  streamCacheRead = evt.usage.cache_read_input_tokens ?? streamCacheRead;
                 }
               }
             }
@@ -4179,7 +4206,9 @@ async function handleStreamingRequest(
     taskType, complexity
   );
   // Update token/cost info on the history entry
-  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut);
+  // For cost calculation with cache breakdown, pass raw input (total minus cache) separately
+  const streamRawIn = streamCacheCreation || streamCacheRead ? streamTokensIn - streamCacheCreation - streamCacheRead : streamTokensIn;
+  const streamCost = estimateCost(targetModel, streamRawIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
   updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost);
 
   if (recordTelemetry) {
@@ -4196,7 +4225,7 @@ async function handleStreamingRequest(
       .catch((err) => {
         log(`Failed to record run: ${err}`);
       });
-    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined);
+    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined, streamCacheCreation || undefined, streamCacheRead || undefined);
   }
 
   res.end();
@@ -4270,9 +4299,12 @@ async function handleNonStreamingRequest(
   logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
   // Update token/cost info
   const usage = (responseData as any)?.usage;
-  const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
+  const cacheCreation = usage?.cache_creation_input_tokens ?? 0;
+  const cacheRead = usage?.cache_read_input_tokens ?? 0;
+  const rawIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
+  const tokensIn = rawIn + cacheCreation + cacheRead;
   const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-  const cost = estimateCost(targetModel, tokensIn, tokensOut);
+  const cost = estimateCost(targetModel, rawIn, tokensOut, cacheCreation || undefined, cacheRead || undefined);
   updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel);
 
   if (recordTelemetry) {
@@ -4299,10 +4331,13 @@ async function handleNonStreamingRequest(
       log(`Failed to record run: ${err}`);
     }
     // Extract token counts from response if available (Anthropic/OpenAI format)
-    const usage = (responseData as any)?.usage;
-    const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
-    const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-    sendCloudTelemetry(taskType, targetModel, tokensIn, tokensOut, durationMs, true);
+    const usage2 = (responseData as any)?.usage;
+    const cc2 = usage2?.cache_creation_input_tokens ?? 0;
+    const cr2 = usage2?.cache_read_input_tokens ?? 0;
+    const rawIn2 = usage2?.input_tokens ?? usage2?.prompt_tokens ?? 0;
+    const tokensIn2 = rawIn2 + cc2 + cr2;
+    const tokensOut2 = usage2?.output_tokens ?? usage2?.completion_tokens ?? 0;
+    sendCloudTelemetry(taskType, targetModel, tokensIn2, tokensOut2, durationMs, true, undefined, undefined, cc2 || undefined, cr2 || undefined);
   }
 
   // Send response with RelayPlane routing headers

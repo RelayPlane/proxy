@@ -57,6 +57,12 @@ export interface TelemetryEvent {
 
   /** Original requested model (before routing) */
   requested_model?: string;
+
+  /** Anthropic prompt caching: tokens used to create new cache entries */
+  cache_creation_tokens?: number;
+
+  /** Anthropic prompt caching: tokens read from cache */
+  cache_read_tokens?: number;
 }
 
 /**
@@ -155,10 +161,20 @@ const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   'default': { input: 1.0, output: 3.0 },
 };
 
-export function estimateCost(model: string, inputTokens: number, outputTokens: number): number {
+export function estimateCost(model: string, inputTokens: number, outputTokens: number, cacheCreationTokens?: number, cacheReadTokens?: number): number {
   const pricing = MODEL_PRICING[model] || MODEL_PRICING['default'];
-  const inputCost = (inputTokens / 1_000_000) * pricing.input;
   const outputCost = (outputTokens / 1_000_000) * pricing.output;
+
+  if (cacheCreationTokens || cacheReadTokens) {
+    // With cache breakdown: inputTokens is only the non-cached portion
+    const regularInputCost = (inputTokens / 1_000_000) * pricing.input;
+    const cacheCreationCost = ((cacheCreationTokens ?? 0) / 1_000_000) * pricing.input * 1.25;
+    const cacheReadCost = ((cacheReadTokens ?? 0) / 1_000_000) * pricing.input * 0.1;
+    return regularInputCost + cacheCreationCost + cacheReadCost + outputCost;
+  }
+
+  // No cache breakdown — backward compatible
+  const inputCost = (inputTokens / 1_000_000) * pricing.input;
   return inputCost + outputCost; // Full precision — rounding happens at display time
 }
 
