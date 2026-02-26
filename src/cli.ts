@@ -1365,9 +1365,9 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Parse server options
-  let port = 4100;
-  let host = '127.0.0.1';
+  // Parse server options (env vars provide defaults, CLI flags override)
+  let port = parseInt(process.env.RELAYPLANE_PROXY_PORT ?? '4100', 10);
+  let host = process.env.RELAYPLANE_PROXY_HOST ?? '127.0.0.1';
   let verbose = false;
   let audit = false;
   let offline = false;
