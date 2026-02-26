@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as path from 'node:path';
 
@@ -28,6 +29,12 @@ function httpGet(url: string): Promise<{ status: number; body: string }> {
   });
 }
 
+function findTsxBin(): string {
+  const local = path.resolve(__dirname, '../node_modules/.bin/tsx');
+  if (fs.existsSync(local)) return local;
+  return 'tsx';
+}
+
 describe('Launcher', () => {
   let child: ChildProcess | null = null;
 
@@ -43,7 +50,7 @@ describe('Launcher', () => {
     // Find the launcher - use tsx to run .ts directly
     const launcherPath = path.resolve(__dirname, '../src/launcher.ts');
 
-    child = spawn('npx', ['tsx', launcherPath], {
+    child = spawn(findTsxBin(), [launcherPath], {
       env: { ...process.env, RELAYPLANE_PROXY_PORT: String(port) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -61,7 +68,7 @@ describe('Launcher', () => {
     const port = 14100 + Math.floor(Math.random() * 1000);
     const launcherPath = path.resolve(__dirname, '../src/launcher.ts');
 
-    child = spawn('npx', ['tsx', launcherPath], {
+    child = spawn(findTsxBin(), [launcherPath], {
       env: { ...process.env, RELAYPLANE_PROXY_PORT: String(port) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

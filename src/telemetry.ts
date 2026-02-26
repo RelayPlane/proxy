@@ -166,10 +166,13 @@ export function estimateCost(model: string, inputTokens: number, outputTokens: n
   const outputCost = (outputTokens / 1_000_000) * pricing.output;
 
   if (cacheCreationTokens || cacheReadTokens) {
-    // With cache breakdown: inputTokens is only the non-cached portion
-    const regularInputCost = (inputTokens / 1_000_000) * pricing.input;
-    const cacheCreationCost = ((cacheCreationTokens ?? 0) / 1_000_000) * pricing.input * 1.25;
-    const cacheReadCost = ((cacheReadTokens ?? 0) / 1_000_000) * pricing.input * 0.1;
+    // Anthropic: input_tokens includes cache tokens, so subtract them for the base portion
+    const creation = cacheCreationTokens ?? 0;
+    const read = cacheReadTokens ?? 0;
+    const baseInput = Math.max(0, inputTokens - creation - read);
+    const regularInputCost = (baseInput / 1_000_000) * pricing.input;
+    const cacheCreationCost = (creation / 1_000_000) * pricing.input * 1.25;
+    const cacheReadCost = (read / 1_000_000) * pricing.input * 0.1;
     return regularInputCost + cacheCreationCost + cacheReadCost + outputCost;
   }
 
@@ -300,7 +303,7 @@ export function getTelemetryStats(): {
   
   // Default baseline model: what you'd be paying without RelayPlane
   // Baseline = most recently used task-appropriate model
-  const BASELINE_MODEL = 'claude-3-5-haiku-20241022'; // Safe default, Haiku
+  const BASELINE_MODEL = 'claude-opus-4-20250514'; // What you'd pay without routing
   
   const byModel: Record<string, { count: number; cost: number; baselineCost: number }> = {};
   const byTaskType: Record<string, { count: number; cost: number }> = {};

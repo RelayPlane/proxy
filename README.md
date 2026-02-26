@@ -11,6 +11,15 @@ An open-source LLM proxy that sits between your AI agents and providers. Tracks 
 - 🔀 Configurable task-aware routing (complexity-based, cascade, model overrides)
 - 🛡️ Circuit breaker architecture — if the proxy fails, your agent doesn't notice
 - 📈 Local dashboard with cost breakdown, savings analysis, and provider health
+- 💵 **Budget enforcement** — daily/hourly/per-request spend limits with block, warn, downgrade, or alert actions
+- 🔍 **Anomaly detection** — catches runaway agent loops, cost spikes, and token explosions in real time
+- 🔔 **Cost alerts** — threshold alerts at configurable percentages, webhook delivery, alert history
+- ⬇️ **Auto-downgrade** — automatically switches to cheaper models when budget thresholds are hit
+- 📦 **Aggressive cache** — exact-match and aggressive response caching with gzipped disk persistence
+- 🧠 **Osmosis mesh** — opt-in collective learning layer that shares anonymized routing signals across users
+- 🔧 **systemd/launchd service** — `relayplane service install` for always-on operation with auto-restart
+- 🏥 **Health watchdog** — `/health` endpoint with uptime tracking and active probing
+- 🛡️ **Config resilience** — atomic writes, automatic backup/restore, credential separation
 
 ## Quick Start
 
@@ -55,29 +64,38 @@ A minimal config file:
 
 All configuration is optional — sensible defaults are applied for every field. The proxy merges your config with its defaults via deep merge, so you only need to specify what you want to change.
 
-## Architecture (Current)
+## Architecture
 
 ```text
 Client (Claude Code / Aider / Cursor)
         |
         |  OpenAI/Anthropic-compatible request
         v
-+-----------------------------------------------+
-| RelayPlane Proxy (local)                       |
-|-----------------------------------------------|
-| 1) Parse request                               |
-| 2) Infer task/complexity (pre-request)         |
-| 3) Select route/model                          |
-|    - explicit model / passthrough             |
-|    - relayplane:auto/cost/fast/quality        |
-|    - configured complexity/cascade rules       |
-| 4) Forward request to provider                 |
-| 5) Return provider response                    |
-| 6) (Optional) record telemetry metadata        |
-+-----------------------------------------------+
++-------------------------------------------------------+
+| RelayPlane Proxy (local)                               |
+|-------------------------------------------------------|
+| 1) Parse request                                       |
+| 2) Cache check (exact or aggressive mode)              |
+|    └─ HIT → return cached response (skip provider)    |
+| 3) Budget check (daily/hourly/per-request limits)      |
+|    └─ BREACH → block / warn / downgrade / alert       |
+| 4) Anomaly detection (velocity, cost spike, loops)     |
+|    └─ DETECTED → alert + optional block               |
+| 5) Auto-downgrade (if budget threshold exceeded)       |
+|    └─ Rewrite model to cheaper alternative             |
+| 6) Infer task/complexity (pre-request)                 |
+| 7) Select route/model                                  |
+|    - explicit model / passthrough                     |
+|    - relayplane:auto/cost/fast/quality                |
+|    - configured complexity/cascade rules               |
+| 8) Forward request to provider                         |
+| 9) Return provider response + cache it                 |
+| 10) Record telemetry + update budget tracking          |
+| 11) Mesh sync (push anonymized routing signals)        |
++-------------------------------------------------------+
         |
         v
-Provider APIs (Anthropic/OpenAI/Gemini/xAI/Moonshot/...)
+Provider APIs (Anthropic/OpenAI/Gemini/xAI/...)
 ```
 
 ## How It Works
@@ -315,9 +333,227 @@ The dashboard is powered by JSON endpoints you can use directly:
 | `GET /v1/telemetry/savings` | Cost savings from smart routing |
 | `GET /v1/telemetry/health` | Provider health and cooldown status |
 
+## Budget Enforcement
+
+Set spending limits to prevent runaway costs. The budget manager tracks spend in rolling daily and hourly windows using SQLite with an in-memory cache for <5ms hot-path checks.
+
+```json
+{
+  "budget": {
+    "enabled": true,
+    "dailyUsd": 50,
+    "hourlyUsd": 10,
+    "perRequestUsd": 2,
+    "onBreach": "downgrade",
+    "downgradeTo": "claude-sonnet-4-6",
+    "alertThresholds": [50, 80, 95]
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable budget enforcement |
+| `dailyUsd` | `50` | Daily spend limit |
+| `hourlyUsd` | `10` | Hourly spend limit |
+| `perRequestUsd` | `2` | Max cost for a single request |
+| `onBreach` | `"downgrade"` | Action: `block`, `warn`, `downgrade`, or `alert` |
+| `downgradeTo` | `"claude-sonnet-4-6"` | Model to use when downgrading |
+| `alertThresholds` | `[50, 80, 95]` | Fire alerts at these % of daily limit |
+
+```bash
+relayplane budget status          # See current spend vs limits
+relayplane budget set --daily 25  # Change daily limit
+relayplane budget set --hourly 5  # Change hourly limit
+relayplane budget reset           # Reset spend counters
+```
+
+## Anomaly Detection
+
+Catches runaway agent loops and cost spikes using a sliding window over the last 100 requests.
+
+```json
+{
+  "anomaly": {
+    "enabled": true,
+    "velocityThreshold": 50,
+    "tokenExplosionUsd": 5.0,
+    "repetitionThreshold": 20,
+    "windowMs": 300000
+  }
+}
+```
+
+**Detection types:**
+
+| Type | Triggers when... |
+|------|-------------------|
+| `velocity_spike` | Request rate exceeds threshold in 5-minute window |
+| `cost_acceleration` | Spend rate is doubling every minute |
+| `repetition` | Same model + similar token count >20 times in 5 min |
+| `token_explosion` | Single request estimated cost exceeds $5 |
+
+## Cost Alerts
+
+Get notified when spending crosses thresholds. Alerts are deduplicated per window and stored in SQLite for history.
+
+```json
+{
+  "alerts": {
+    "enabled": true,
+    "webhookUrl": "https://hooks.slack.com/...",
+    "cooldownMs": 300000,
+    "maxHistory": 500
+  }
+}
+```
+
+Alert types: `threshold` (budget %), `anomaly` (detection triggers), `breach` (limit exceeded). Severity levels: `info`, `warning`, `critical`.
+
+```bash
+relayplane alerts list            # Show recent alerts
+relayplane alerts counts          # Count by type (threshold/anomaly/breach)
+```
+
+## Auto-Downgrade
+
+When budget hits a configurable threshold (default 80%), the proxy automatically rewrites expensive models to cheaper alternatives. Adds `X-RelayPlane-Downgraded` headers so your agent knows.
+
+```json
+{
+  "downgrade": {
+    "enabled": true,
+    "thresholdPercent": 80,
+    "mapping": {
+      "claude-opus-4-6": "claude-sonnet-4-6",
+      "gpt-4o": "gpt-4o-mini",
+      "gemini-2.5-pro": "gemini-2.0-flash"
+    }
+  }
+}
+```
+
+Built-in mappings cover all major Anthropic, OpenAI, and Google models. Override with your own.
+
+## Response Cache
+
+Caches LLM responses to avoid duplicate API calls. SHA-256 hash of the canonical request → cached response with gzipped disk persistence.
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "mode": "exact",
+    "maxSizeMb": 100,
+    "defaultTtlSeconds": 3600,
+    "onlyWhenDeterministic": true
+  }
+}
+```
+
+| Mode | Behavior |
+|------|----------|
+| `exact` | Cache only identical requests (default) |
+| `aggressive` | Broader matching with shorter TTL (30 min default) |
+
+Only caches deterministic requests (temperature=0) by default. Skips responses with tool calls.
+
+```bash
+relayplane cache status   # Entries, size, hit rate, saved cost
+relayplane cache stats    # Detailed breakdown by model and task type
+relayplane cache clear    # Wipe the cache
+relayplane cache on/off   # Toggle caching
+```
+
+## Osmosis Mesh
+
+Opt-in collective learning layer. Share anonymized routing signals (model, task type, tokens, cost — never prompts) and benefit from the network's routing intelligence.
+
+```json
+{
+  "mesh": {
+    "enabled": true,
+    "endpoint": "https://osmosis-mesh-dev.fly.dev",
+    "sync_interval_ms": 60000,
+    "contribute": true
+  }
+}
+```
+
+Auto-enabled for authenticated users. Contribution is opt-in — set `contribute: false` to consume signals without sharing.
+
+```bash
+relayplane mesh status              # Atoms local/synced, last sync, endpoint
+relayplane mesh on/off              # Enable/disable mesh
+relayplane mesh sync                # Force sync now
+relayplane mesh contribute on/off   # Toggle contribution
+```
+
+## System Service
+
+Install RelayPlane as a system service for always-on operation with auto-restart on crash.
+
+```bash
+# Linux (systemd)
+sudo relayplane service install     # Install + enable + start
+sudo relayplane service uninstall   # Stop + disable + remove
+relayplane service status           # Check service state
+
+# macOS (launchd)
+relayplane service install          # Install as LaunchAgent
+relayplane service uninstall        # Remove LaunchAgent
+relayplane service status           # Check loaded state
+```
+
+The service unit includes `WatchdogSec=30` (systemd) and `KeepAlive` (launchd) for automatic health monitoring and restart. API keys from your current environment are captured into the service definition.
+
+## Config Resilience
+
+Configuration is protected against corruption:
+
+- **Atomic writes** — config is written to a `.tmp` file then renamed (no partial writes)
+- **Automatic backup** — `config.json.bak` is updated before every save
+- **Auto-restore** — if `config.json` is corrupt/missing, the proxy restores from backup
+- **Credential separation** — API keys live in `credentials.json`, surviving config resets
+
 ## Circuit Breaker
 
 If the proxy ever fails, all traffic automatically bypasses it — your agent talks directly to the provider. When RelayPlane recovers, traffic resumes. No manual intervention needed.
+
+## CLI Reference
+
+```
+relayplane [command] [options]
+```
+
+| Command | Description |
+|---------|-------------|
+| `(default)` / `start` | Start the proxy server |
+| `init` | Initialize config and show setup instructions |
+| `status` | Show proxy status, plan, and cloud sync info |
+| `login` | Log in to RelayPlane (device OAuth flow) |
+| `logout` | Clear stored credentials |
+| `upgrade` | Open pricing page |
+| `enable` / `disable` | Toggle proxy routing in OpenClaw config |
+| `telemetry on\|off\|status` | Manage telemetry |
+| `stats` | Show usage statistics and savings |
+| `config [set-key <key>]` | Show or update configuration |
+| `budget status\|set\|reset` | Manage spend limits |
+| `alerts list\|counts` | View cost alert history |
+| `cache status\|stats\|clear\|on\|off` | Manage response cache |
+| `mesh status\|on\|off\|sync\|contribute` | Manage Osmosis mesh |
+| `service install\|uninstall\|status` | System service management |
+| `autostart on\|off\|status` | Legacy autostart (systemd) |
+
+**Server options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port <n>` | `4100` | Port to listen on |
+| `--host <s>` | `127.0.0.1` | Host to bind to |
+| `--offline` | — | No network calls except LLM endpoints |
+| `--audit` | — | Show telemetry payloads before sending |
+| `-v, --verbose` | — | Verbose logging |
 
 ## Your Keys Stay Yours
 

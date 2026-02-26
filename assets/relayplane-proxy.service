@@ -1,0 +1,20 @@
+[Unit]
+Description=RelayPlane Proxy - Intelligent AI Model Routing
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+User=root
+ExecStart=/usr/bin/relayplane
+Restart=always
+RestartSec=5
+WatchdogSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/root
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

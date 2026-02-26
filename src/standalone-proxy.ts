@@ -24,10 +24,30 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { RelayPlane, inferTaskType, getInferenceConfidence } from '@relayplane/core';
-import type { Provider, TaskType } from '@relayplane/core';
+
+// __dirname is available natively in CJS
+import type { Provider as CoreProvider, TaskType } from '@relayplane/core';
+
+type Provider = CoreProvider
+  | 'openrouter'
+  | 'deepseek'
+  | 'groq'
+  | 'mistral'
+  | 'together'
+  | 'fireworks'
+  | 'perplexity';
 import { buildModelNotFoundError } from './utils/model-suggestions.js';
-import { recordTelemetry as recordCloudTelemetry, inferTaskType as inferTelemetryTaskType, estimateCost } from './telemetry.js';
+import { recordTelemetry as recordCloudTelemetry, inferTaskType as inferTelemetryTaskType, estimateCost, queueForUpload } from './telemetry.js';
+import { loadConfig as loadUserConfig, hasValidCredentials, getMeshConfig, getDeviceId, isTelemetryEnabled } from './config.js';
+import { initMeshLayer, type MeshHandle } from './mesh/index.js';
+import { getResponseCache, computeCacheKey, computeAggressiveCacheKey, isDeterministic, responseHasToolCalls, type CacheConfig } from './response-cache.js';
 import { StatsCollector } from './stats.js';
+import { checkLimit } from './rate-limiter.js';
+import { getBudgetManager, type BudgetConfig } from './budget.js';
+import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
+import { getAlertManager, type AlertsConfig } from './alerts.js';
+import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
+import { getVersionStatus } from './utils/version-status.js';
 const PROXY_VERSION: string = (() => {
   try {
     const pkgPath = path.join(__dirname, '..', 'package.json');
@@ -37,8 +57,62 @@ const PROXY_VERSION: string = (() => {
   }
 })();
 
+let latestProxyVersionCache: { value: string | null; checkedAt: number } = { value: null, checkedAt: 0 };
+const LATEST_PROXY_VERSION_TTL_MS = 30 * 60 * 1000;
+
+async function getLatestProxyVersion(): Promise<string | null> {
+  const now = Date.now();
+  if (now - latestProxyVersionCache.checkedAt < LATEST_PROXY_VERSION_TTL_MS) {
+    return latestProxyVersionCache.value;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch('https://registry.npmjs.org/@relayplane/proxy/latest', {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      latestProxyVersionCache = { value: null, checkedAt: now };
+      return null;
+    }
+
+    const data = await res.json() as { version?: string };
+    const latest = data.version ?? null;
+    latestProxyVersionCache = { value: latest, checkedAt: now };
+    return latest;
+  } catch {
+    latestProxyVersionCache = { value: null, checkedAt: now };
+    return null;
+  }
+}
+
 /** Shared stats collector instance for the proxy server */
 export const proxyStatsCollector = new StatsCollector();
+
+/** Shared mesh handle — set during startProxy() */
+let _meshHandle: MeshHandle | null = null;
+
+/** Capture a request into the mesh (fire-and-forget, never blocks) */
+function meshCapture(
+  model: string, provider: string, taskType: string,
+  tokensIn: number, tokensOut: number, costUsd: number,
+  latencyMs: number, success: boolean, errorType?: string,
+): void {
+  if (!_meshHandle) return;
+  try {
+    _meshHandle.captureRequest({
+      model, provider, task_type: taskType,
+      input_tokens: tokensIn, output_tokens: tokensOut,
+      cost_usd: costUsd, latency_ms: latencyMs,
+      success, error_type: errorType,
+      timestamp: new Date().toISOString(),
+    });
+  } catch {}
+}
 
 /**
  * Provider endpoint configuration
@@ -153,10 +227,12 @@ function sendCloudTelemetry(
   success: boolean,
   costUsd?: number,
   requestedModel?: string,
+  cacheCreationTokens?: number,
+  cacheReadTokens?: number,
 ): void {
   try {
-    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut);
-    recordCloudTelemetry({
+    const cost = costUsd ?? estimateCost(model, tokensIn, tokensOut, cacheCreationTokens, cacheReadTokens);
+    const event = {
       task_type: taskType,
       model,
       tokens_in: tokensIn,
@@ -165,7 +241,21 @@ function sendCloudTelemetry(
       success,
       cost_usd: cost,
       requested_model: requestedModel,
-    });
+      cache_creation_tokens: cacheCreationTokens,
+      cache_read_tokens: cacheReadTokens,
+    };
+    // Record locally (writes to telemetry.jsonl + queues upload if telemetry_enabled)
+    recordCloudTelemetry(event);
+    // Ensure cloud upload even if local telemetry_enabled is false
+    // recordCloudTelemetry skips queueForUpload when telemetry is disabled,
+    // but cloud dashboard needs these events regardless of local config
+    if (!isTelemetryEnabled()) {
+      queueForUpload({
+        ...event,
+        device_id: getDeviceId(),
+        timestamp: new Date().toISOString(),
+      });
+    }
   } catch {
     // Telemetry should never break the proxy
   }
@@ -204,15 +294,15 @@ export function resolveModelAlias(model: string): string {
  * Uses Haiku 3.5 for cost optimization, upgrades based on learned rules
  */
 const DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> = {
-  code_generation: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  code_review: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  summarization: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  analysis: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  creative_writing: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  data_extraction: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  translation: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  question_answering: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-  general: { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
+  code_generation: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  code_review: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  summarization: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  analysis: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  creative_writing: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  data_extraction: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  translation: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  question_answering: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  general: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
 };
 
 type RoutingSuffix = 'cost' | 'fast' | 'quality';
@@ -371,6 +461,11 @@ interface RelayPlaneProxyConfigFile {
   routing?: Partial<RoutingConfig>;
   reliability?: { cooldowns?: Partial<CooldownConfig> };
   auth?: HybridAuthConfig;
+  cache?: Partial<CacheConfig>;
+  budget?: Partial<BudgetConfig>;
+  anomaly?: Partial<AnomalyConfig>;
+  alerts?: Partial<AlertsConfig>;
+  downgrade?: Partial<DowngradeConfig>;
   [key: string]: unknown;
 }
 
@@ -631,7 +726,6 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     cascade: {
       enabled: true,
       models: [
-        'claude-haiku-4-5',
         'claude-sonnet-4-6',
         'claude-opus-4-6',
       ],
@@ -640,7 +734,7 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     },
     complexity: {
       enabled: true,
-      simple: 'claude-haiku-4-5',
+      simple: 'claude-sonnet-4-6',
       moderate: 'claude-sonnet-4-6',
       complex: 'claude-opus-4-6',
     },
@@ -2358,10 +2452,14 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
+.vstat{display:inline-flex;align-items:center;gap:6px;margin-left:8px;padding:1px 8px;border-radius:999px;border:1px solid #334155;font-size:.72rem}
+.vstat.current{color:#94a3b8;border-color:#334155;background:#0f172a66}
+.vstat.outdated{color:#fbbf24;border-color:#f59e0b55;background:#3a2f1e66}
+.vstat.unavailable{color:#a3a3a3;border-color:#52525b66;background:#18181b66}
 @media(max-width:768px){.col-tt,.col-cx{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
 </style></head><body>
-<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
+<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span><span id="vstat" class="vstat unavailable">Unable to check</span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
@@ -2389,6 +2487,19 @@ async function load(){
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
+
+    const versionStatus = await fetch('/v1/version-status').then(r=>r.json()).catch(()=>({state:'unavailable', current: health.version, latest: null}));
+    const vEl = $('vstat');
+    if (vEl) {
+      vEl.className = 'vstat ' + (versionStatus.state === 'outdated' ? 'outdated' : versionStatus.state === 'up-to-date' ? 'current' : 'unavailable');
+      if (versionStatus.state === 'outdated') {
+        vEl.textContent = 'Update available · v' + versionStatus.current + ' → v' + versionStatus.latest;
+      } else if (versionStatus.state === 'up-to-date') {
+        vEl.textContent = 'Up to date · v' + versionStatus.current;
+      } else {
+        vEl.textContent = 'Unable to check · v' + versionStatus.current;
+      }
+    }
     const total=stats.summary?.totalEvents||0;
     $('totalReq').textContent=total;
     $('totalCost').textContent='$'+fmt(stats.summary?.totalCostUsd??0,4);
@@ -2513,6 +2624,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   // Flush history on shutdown
   const handleShutdown = () => {
+    meshHandle.stop();
     shutdownHistory();
     process.exit(0);
   };
@@ -2523,12 +2635,191 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   let proxyConfig = await loadProxyConfig(configPath, log);
   const cooldownManager = new CooldownManager(getCooldownConfig(proxyConfig));
 
+  // === Startup config validation (Task 4) ===
+  try {
+    const userConfig = loadUserConfig();
+    
+    // Check if config was just created (created_at within 5s of now)
+    const createdAt = new Date(userConfig.created_at).getTime();
+    const now = Date.now();
+    if (Math.abs(now - createdAt) < 5000) {
+      console.warn('[RelayPlane] WARNING: Fresh config detected — previous config may have been deleted');
+    }
+    
+    // Check if credentials exist but config doesn't reference them
+    if (hasValidCredentials() && !userConfig.api_key) {
+      console.warn('[RelayPlane] WARNING: credentials.json exists but config has no API key reference');
+    }
+    
+    // Auto-enable telemetry for authenticated users
+    if (hasValidCredentials() && !userConfig.telemetry_enabled) {
+      // Already handled in loadConfig() for fresh configs, but handle existing configs too
+    }
+    
+    // Validate expected fields
+    if (!userConfig.device_id || !userConfig.created_at || userConfig.config_version === undefined) {
+      console.warn('[RelayPlane] WARNING: Config is missing expected fields');
+    }
+  } catch (err) {
+    console.warn(`[RelayPlane] Config validation error: ${err}`);
+  }
+
+  // Initialize mesh learning layer
+  const meshConfig = getMeshConfig();
+  const userConfig = loadUserConfig();
+  const meshHandle: MeshHandle = _meshHandle = initMeshLayer(
+    {
+      enabled: meshConfig.enabled,
+      endpoint: meshConfig.endpoint,
+      sync_interval_ms: meshConfig.sync_interval_ms,
+      contribute: meshConfig.contribute,
+    },
+    userConfig.api_key,
+  );
+
+  // Initialize budget manager
+  const budgetManager = getBudgetManager(proxyConfig.budget);
+  if (proxyConfig.budget?.enabled) {
+    try {
+      budgetManager.init();
+      log('Budget manager initialized');
+    } catch (err) {
+      log(`Budget manager init failed: ${err}`);
+    }
+  }
+
+  // Initialize anomaly detector
+  const anomalyDetector = getAnomalyDetector(proxyConfig.anomaly);
+
+  // Initialize alert manager
+  const alertManager = getAlertManager(proxyConfig.alerts);
+  if (proxyConfig.alerts?.enabled) {
+    try {
+      alertManager.init();
+      log('Alert manager initialized');
+    } catch (err) {
+      log(`Alert manager init failed: ${err}`);
+    }
+  }
+
+  // Downgrade config
+  let downgradeConfig: DowngradeConfig = {
+    ...DEFAULT_DOWNGRADE_CONFIG,
+    ...(proxyConfig.downgrade ?? {}),
+  };
+
+  /**
+   * Pre-request budget check + auto-downgrade.
+   * Returns the (possibly downgraded) model and extra response headers.
+   * If the request should be blocked, returns { blocked: true }.
+   */
+  function preRequestBudgetCheck(
+    model: string,
+    estimatedCost?: number,
+  ): { blocked: boolean; model: string; headers: Record<string, string>; downgraded: boolean } {
+    const headers: Record<string, string> = {};
+    let finalModel = model;
+    let downgraded = false;
+
+    // Budget check
+    const budgetResult = budgetManager.checkBudget(estimatedCost);
+    if (budgetResult.breached) {
+      // Fire breach alert
+      const limit = budgetResult.breachType === 'hourly'
+        ? budgetManager.getConfig().hourlyUsd
+        : budgetManager.getConfig().dailyUsd;
+      const spend = budgetResult.breachType === 'hourly'
+        ? budgetResult.currentHourlySpend
+        : budgetResult.currentDailySpend;
+      alertManager.fireBreach(budgetResult.breachType, spend, limit);
+
+      if (budgetResult.action === 'block') {
+        return { blocked: true, model: finalModel, headers, downgraded: false };
+      }
+      if (budgetResult.action === 'downgrade') {
+        const dr = checkDowngrade(finalModel, 100, downgradeConfig);
+        if (dr.downgraded) {
+          finalModel = dr.newModel;
+          downgraded = true;
+          applyDowngradeHeaders(headers, dr);
+        }
+      }
+    }
+
+    // Fire threshold alerts
+    for (const threshold of budgetResult.thresholdsCrossed) {
+      alertManager.fireThreshold(
+        threshold,
+        (budgetResult.currentDailySpend / budgetManager.getConfig().dailyUsd) * 100,
+        budgetResult.currentDailySpend,
+        budgetManager.getConfig().dailyUsd,
+      );
+      budgetManager.markThresholdFired(threshold);
+    }
+
+    // Auto-downgrade based on budget percentage (even if not breached)
+    if (!downgraded && downgradeConfig.enabled) {
+      const pct = budgetManager.getConfig().dailyUsd > 0
+        ? (budgetResult.currentDailySpend / budgetManager.getConfig().dailyUsd) * 100
+        : 0;
+      const dr = checkDowngrade(finalModel, pct, downgradeConfig);
+      if (dr.downgraded) {
+        finalModel = dr.newModel;
+        downgraded = true;
+        applyDowngradeHeaders(headers, dr);
+      }
+    }
+
+    return { blocked: false, model: finalModel, headers, downgraded };
+  }
+
+  /**
+   * Post-request: record spend, run anomaly detection, fire anomaly alerts.
+   */
+  function postRequestRecord(
+    model: string,
+    tokensIn: number,
+    tokensOut: number,
+    costUsd: number,
+  ): void {
+    // Record spend
+    budgetManager.recordSpend(costUsd, model);
+
+    // Anomaly detection
+    const anomalyResult = anomalyDetector.recordAndAnalyze({
+      model,
+      tokensIn,
+      tokensOut,
+      costUsd,
+    });
+    if (anomalyResult.detected) {
+      for (const anomaly of anomalyResult.anomalies) {
+        alertManager.fireAnomaly(anomaly);
+      }
+    }
+  }
+
+  // Initialize response cache
+  const responseCache = getResponseCache(proxyConfig.cache);
+  if (proxyConfig.cache?.enabled !== false) {
+    try {
+      responseCache.init();
+      log('Response cache initialized');
+    } catch (err) {
+      log(`Response cache init failed: ${err}`);
+    }
+  }
+
   let configWatcher: fs.FSWatcher | null = null;
   let configReloadTimer: NodeJS.Timeout | null = null;
 
   const reloadConfig = async () => {
     proxyConfig = await loadProxyConfig(configPath, log);
     cooldownManager.updateConfig(getCooldownConfig(proxyConfig));
+    budgetManager.updateConfig({ ...budgetManager.getConfig(), ...(proxyConfig.budget ?? {}) });
+    anomalyDetector.updateConfig({ ...anomalyDetector.getConfig(), ...(proxyConfig.anomaly ?? {}) });
+    alertManager.updateConfig({ ...alertManager.getConfig(), ...(proxyConfig.alerts ?? {}) });
+    downgradeConfig = { ...DEFAULT_DOWNGRADE_CONFIG, ...(proxyConfig.downgrade ?? {}) };
     log(`Reloaded config from ${configPath}`);
   };
 
@@ -2555,7 +2846,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   const relay = new RelayPlane({ dbPath: config.dbPath });
 
   // Startup migration: clear default routing rules so complexity config takes priority
-  const clearedCount = relay.routing.clearDefaultRules();
+  const clearDefaultRules = (relay.routing as { clearDefaultRules?: () => number }).clearDefaultRules;
+  const clearedCount = typeof clearDefaultRules === 'function' ? clearDefaultRules.call(relay.routing) : 0;
   if (clearedCount > 0) {
     log(`Cleared ${clearedCount} default routing rules (complexity config takes priority)`);
   }
@@ -2611,6 +2903,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           modelCounts: globalStats.modelCounts,
         },
       }));
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/v1/version-status') {
+      const latest = await getLatestProxyVersion();
+      const status = getVersionStatus(PROXY_VERSION, latest);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' });
+      res.end(JSON.stringify(status));
       return;
     }
 
@@ -2686,6 +2986,35 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
         return;
       }
+    }
+
+    if (req.method === 'POST' && pathname === '/control/kill') {
+      try {
+        const body = await readJsonBody(req) as { sessionKey?: string; all?: boolean };
+        
+        if (body.all) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            killed: 0, 
+            sessions: [],
+            note: 'Local proxy mode: session kill not applicable'
+          }));
+        } else if (body.sessionKey) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ 
+            killed: 1, 
+            sessions: [body.sessionKey],
+            note: 'Rate limits reset for session'
+          }));
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Provide sessionKey or all=true' }));
+        }
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+      return;
     }
 
     // === Telemetry endpoints for dashboard ===
@@ -2885,6 +3214,25 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === Mesh stats endpoint ===
+    if (req.method === 'GET' && pathname === '/v1/mesh/stats') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(meshHandle.getStats()));
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/v1/mesh/sync') {
+      try {
+        const result = await meshHandle.forceSync();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sync: result }));
+      } catch (err: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sync: { error: err.message } }));
+      }
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/v1/config') {
       try {
         const raw = await fs.promises.readFile(getProxyConfigPath(), 'utf8');
@@ -3019,6 +3367,51 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       const isStreaming = requestBody['stream'] === true;
+
+      // ── Response Cache: check for cached response ──
+      const cacheBypass = responseCache.shouldBypass(requestBody);
+      let cacheHash: string | undefined;
+      if (!cacheBypass) {
+        cacheHash = responseCache.computeKey(requestBody);
+        const cached = responseCache.get(cacheHash);
+        if (cached) {
+          try {
+            const cachedData = JSON.parse(cached);
+            const cacheUsage = (cachedData as any)?.usage;
+              const cacheCost = estimateCost(
+                requestBody['model'] as string ?? '',
+                cacheUsage?.input_tokens ?? 0,
+                cacheUsage?.output_tokens ?? 0
+              );
+              responseCache.recordHit(cacheCost, 0);
+              // Replay cached streaming response as SSE
+              if (isStreaming && cachedData._relayplaneStreamCache) {
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache',
+                  'Connection': 'keep-alive',
+                  'X-RelayPlane-Cache': 'HIT',
+                });
+                res.end(cachedData.ssePayload);
+              } else {
+                res.writeHead(200, {
+                  'Content-Type': 'application/json',
+                  'X-RelayPlane-Cache': 'HIT',
+                });
+                res.end(cached);
+              }
+              log(`Cache HIT for ${requestBody['model']} (hash: ${cacheHash.slice(0, 8)})`);
+              return;
+          } catch {
+            // Corrupt cache entry, continue to provider
+          }
+        }
+        responseCache.recordMiss();
+      } else {
+        responseCache.recordBypass();
+      }
+      // ── End cache check ──
+
       const messages = Array.isArray(requestBody['messages'])
         ? (requestBody['messages'] as Array<{ role?: string; content?: unknown }>)
         : [];
@@ -3137,6 +3530,48 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         return;
       }
 
+      // ── Budget check + auto-downgrade ──
+      const budgetExtraHeaders: Record<string, string> = {};
+      {
+        const budgetCheck = preRequestBudgetCheck(targetModel || requestedModel);
+        if (budgetCheck.blocked) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: 'Budget limit exceeded. Request blocked.',
+            type: 'budget_exceeded',
+          }));
+          return;
+        }
+        if (budgetCheck.downgraded) {
+          log(`Budget downgrade: ${targetModel || requestedModel} → ${budgetCheck.model}`);
+          targetModel = budgetCheck.model;
+          if (requestBody) requestBody['model'] = targetModel;
+        }
+        Object.assign(budgetExtraHeaders, budgetCheck.headers);
+      }
+      // ── End budget check ──
+
+      // ── Rate limit check ──
+      const workspaceId = 'local'; // Local proxy uses single workspace
+      const rateLimit = checkLimit(workspaceId, targetModel);
+      if (!rateLimit.allowed) {
+        console.error(`[RATE LIMIT] ${targetModel} limit reached for workspace: ${workspaceId}`);
+        res.writeHead(429, { 
+          'Content-Type': 'application/json',
+          'Retry-After': String(rateLimit.retryAfter || 60),
+          'X-RelayPlane-RateLimit-Limit': String(rateLimit.limit),
+          'X-RelayPlane-RateLimit-Remaining': '0',
+          'X-RelayPlane-RateLimit-Reset': String(Math.ceil(rateLimit.resetAt / 1000))
+        });
+        res.end(JSON.stringify({ 
+          error: `Rate limit exceeded for ${targetModel}. Max ${rateLimit.limit} requests per minute.`,
+          type: 'rate_limit_exceeded',
+          retry_after: rateLimit.retryAfter || 60
+        }));
+        return;
+      }
+      // ── End rate limit check ──
+
       const startTime = Date.now();
       let nativeResponseData: Record<string, unknown> | undefined;
 
@@ -3230,11 +3665,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
               'Connection': 'keep-alive',
+              'X-RelayPlane-Cache': cacheBypass ? 'BYPASS' : 'MISS',
               ...nativeStreamRpHeaders,
             });
             const reader = providerResponse.body?.getReader();
             let streamTokensIn = 0;
             let streamTokensOut = 0;
+            let streamCacheCreation = 0;
+            let streamCacheRead = 0;
+            // Buffer raw SSE chunks for cache storage
+            const rawChunks: string[] = [];
             if (reader) {
               const decoder = new TextDecoder();
               let sseBuffer = '';
@@ -3244,6 +3684,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   if (done) break;
                   const chunk = decoder.decode(value, { stream: true });
                   res.write(chunk);
+                  if (cacheHash && !cacheBypass) rawChunks.push(chunk);
                   // Parse SSE events to extract usage from message_delta / message_stop
                   sseBuffer += chunk;
                   const lines = sseBuffer.split('\n');
@@ -3256,9 +3697,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                         if (evt.type === 'message_delta' && evt.usage) {
                           streamTokensOut = evt.usage.output_tokens ?? streamTokensOut;
                         }
-                        // Anthropic: message_start has usage.input_tokens
+                        // Anthropic: message_start has usage.input_tokens + cache tokens
                         if (evt.type === 'message_start' && evt.message?.usage) {
                           streamTokensIn = evt.message.usage.input_tokens ?? streamTokensIn;
+                          streamCacheCreation = evt.message.usage.cache_creation_input_tokens ?? 0;
+                          streamCacheRead = evt.message.usage.cache_read_input_tokens ?? 0;
                         }
                         // OpenAI format: choices with usage
                         if (evt.usage) {
@@ -3275,8 +3718,24 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 reader.releaseLock();
               }
             }
+            // ── Cache: store streaming response as raw SSE payload ──
+            if (cacheHash && !cacheBypass && rawChunks.length > 0) {
+              const streamPayload = JSON.stringify({
+                _relayplaneStreamCache: true,
+                ssePayload: rawChunks.join(''),
+                usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead },
+              });
+              responseCache.set(cacheHash, streamPayload, {
+                model: targetModel || requestedModel,
+                tokensIn: streamTokensIn,
+                tokensOut: streamTokensOut,
+                costUsd: estimateCost(targetModel || requestedModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined),
+                taskType,
+              });
+              log(`Cache STORE (stream) for ${targetModel || requestedModel} (hash: ${cacheHash.slice(0, 8)})`);
+            }
             // Store streaming token counts so telemetry can use them
-            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut } } as Record<string, unknown>;
+            nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead } } as Record<string, unknown>;
             res.end();
           } else {
             nativeResponseData = await providerResponse.json() as Record<string, unknown>;
@@ -3284,7 +3743,21 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const nativeRpHeaders = buildRelayPlaneResponseHeaders(
               targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
             );
-            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json', ...nativeRpHeaders });
+            // ── Cache: store non-streaming response ──
+            const nativeCacheHeader = cacheBypass ? 'BYPASS' : 'MISS';
+            if (cacheHash && !cacheBypass) {
+              const nativeRespJson = JSON.stringify(nativeResponseData);
+              const nativeUsage = (nativeResponseData as any)?.usage;
+              responseCache.set(cacheHash, nativeRespJson, {
+                model: targetModel || requestedModel,
+                tokensIn: nativeUsage?.input_tokens ?? 0,
+                tokensOut: nativeUsage?.output_tokens ?? 0,
+                costUsd: estimateCost(targetModel || requestedModel, nativeUsage?.input_tokens ?? 0, nativeUsage?.output_tokens ?? 0),
+                taskType,
+              });
+              log(`Cache STORE for ${targetModel || requestedModel} (hash: ${cacheHash.slice(0, 8)})`);
+            }
+            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': nativeCacheHeader, ...nativeRpHeaders });
             res.end(JSON.stringify(nativeResponseData));
           }
         }
@@ -3305,13 +3778,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         // nativeResponseData holds response JSON for non-streaming, or { usage: { input_tokens, output_tokens } }
         // synthesised from SSE events for streaming
         const nativeUsageData = (nativeResponseData as any)?.usage;
-        const nativeTokIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
+        const nativeBaseTokIn = nativeUsageData?.input_tokens ?? nativeUsageData?.prompt_tokens ?? 0;
         const nativeTokOut = nativeUsageData?.output_tokens ?? nativeUsageData?.completion_tokens ?? 0;
+        const nativeCacheCreation = nativeUsageData?.cache_creation_input_tokens ?? 0;
+        const nativeCacheRead = nativeUsageData?.cache_read_input_tokens ?? 0;
+        // Include cache tokens in displayed/recorded token count
+        const nativeTokIn = nativeBaseTokIn + nativeCacheCreation + nativeCacheRead;
+        // Cost calculation expects inputTokens to include cache tokens when cache params are provided
+        const nativeCostUsd = estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut, nativeCacheCreation || undefined, nativeCacheRead || undefined);
         updateLastHistoryEntry(
           nativeTokIn,
           nativeTokOut,
-          estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut),
+          nativeCostUsd,
         );
+
+        // ── Post-request: budget spend + anomaly detection ──
+        postRequestRecord(targetModel || requestedModel, nativeTokIn, nativeTokOut, nativeCostUsd);
 
         if (recordTelemetry) {
           relay
@@ -3321,7 +3803,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               model: `${targetProvider}:${targetModel || requestedModel}`,
             })
             .catch(() => {});
-          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined);
+          sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined, nativeCacheCreation || undefined, nativeCacheRead || undefined);
+          meshCapture(targetModel || requestedModel, targetProvider, taskType, nativeTokIn, nativeTokOut, estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut, nativeCacheCreation || undefined, nativeCacheRead || undefined), durationMs, true);
         }
       } catch (err) {
         const durationMs = Date.now() - startTime;
@@ -3421,6 +3904,49 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     const isStreaming = request.stream === true;
+
+    // ── Response Cache: check for cached response (chat/completions) ──
+    const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
+    let chatCacheHash: string | undefined;
+    if (!chatCacheBypass) {
+      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>);
+      const chatCached = responseCache.get(chatCacheHash);
+      if (chatCached) {
+        try {
+          const chatCachedData = JSON.parse(chatCached);
+          const chatCacheUsage = (chatCachedData as any)?.usage;
+            const chatCacheCost = estimateCost(
+              request.model ?? '',
+              chatCacheUsage?.prompt_tokens ?? chatCacheUsage?.input_tokens ?? 0,
+              chatCacheUsage?.completion_tokens ?? chatCacheUsage?.output_tokens ?? 0
+            );
+            responseCache.recordHit(chatCacheCost, 0);
+            if (isStreaming && chatCachedData._relayplaneStreamCache) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-RelayPlane-Cache': 'HIT',
+              });
+              res.end(chatCachedData.ssePayload);
+            } else {
+              res.writeHead(200, {
+                'Content-Type': 'application/json',
+                'X-RelayPlane-Cache': 'HIT',
+              });
+              res.end(chatCached);
+            }
+            log(`Cache HIT for chat/completions ${request.model} (hash: ${chatCacheHash.slice(0, 8)})`);
+            return;
+        } catch {
+          // Corrupt, continue
+        }
+      }
+      responseCache.recordMiss();
+    } else {
+      responseCache.recordBypass();
+    }
+    // ── End cache check ──
 
     const bypassRouting = !relayplaneEnabled || relayplaneBypass;
 
@@ -3644,6 +4170,46 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       apiKey = apiKeyResult.apiKey;
     }
 
+    // ── Budget check + auto-downgrade (chat/completions) ──
+    {
+      const chatBudgetCheck = preRequestBudgetCheck(targetModel);
+      if (chatBudgetCheck.blocked) {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: 'Budget limit exceeded. Request blocked.',
+          type: 'budget_exceeded',
+        }));
+        return;
+      }
+      if (chatBudgetCheck.downgraded) {
+        log(`Budget downgrade: ${targetModel} → ${chatBudgetCheck.model}`);
+        targetModel = chatBudgetCheck.model;
+        request.model = targetModel;
+      }
+    }
+    // ── End budget check ──
+
+    // ── Rate limit check ──
+    const chatWorkspaceId = 'local'; // Local proxy uses single workspace
+    const chatRateLimit = checkLimit(chatWorkspaceId, targetModel);
+    if (!chatRateLimit.allowed) {
+      console.error(`[RATE LIMIT] ${targetModel} limit reached for workspace: ${chatWorkspaceId}`);
+      res.writeHead(429, { 
+        'Content-Type': 'application/json',
+        'Retry-After': String(chatRateLimit.retryAfter || 60),
+        'X-RelayPlane-RateLimit-Limit': String(chatRateLimit.limit),
+        'X-RelayPlane-RateLimit-Remaining': '0',
+        'X-RelayPlane-RateLimit-Reset': String(Math.ceil(chatRateLimit.resetAt / 1000))
+      });
+      res.end(JSON.stringify({ 
+        error: `Rate limit exceeded for ${targetModel}. Max ${chatRateLimit.limit} requests per minute.`,
+        type: 'rate_limit_exceeded',
+        retry_after: chatRateLimit.retryAfter || 60
+      }));
+      return;
+    }
+    // ── End rate limit check ──
+
     const startTime = Date.now();
 
     // Handle streaming vs non-streaming
@@ -3665,7 +4231,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         log,
         cooldownManager,
         cooldownsEnabled,
-        complexity
+        complexity,
+        chatCacheHash,
+        chatCacheBypass,
       );
     } else {
       if (useCascade && cascadeConfig) {
@@ -3747,6 +4315,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               log(`Failed to record run: ${err}`);
             }
             sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
+            meshCapture(cascadeResult.model, cascadeResult.provider, taskType, cascadeTokensIn, cascadeTokensOut, cascadeCost, durationMs, true);
           }
 
           const chatCascadeRpHeaders = buildRelayPlaneResponseHeaders(
@@ -3790,6 +4359,76 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   });
 
+  // ── Health Watchdog ──
+  let watchdogFailures = 0;
+  const WATCHDOG_MAX_FAILURES = 3;
+  const WATCHDOG_INTERVAL_MS = 15_000; // Must be < WatchdogSec (30s) to avoid false kills
+  let watchdogTimer: NodeJS.Timeout | null = null;
+
+  /**
+   * sd_notify: write to $NOTIFY_SOCKET for systemd watchdog integration
+   */
+  function sdNotify(state: string): void {
+    const notifySocket = process.env['NOTIFY_SOCKET'];
+    if (!notifySocket) return;
+    try {
+      const dgram = require('node:dgram');
+      const client = dgram.createSocket('unix_dgram');
+      const buf = Buffer.from(state);
+      client.send(buf, 0, buf.length, notifySocket, () => {
+        client.close();
+      });
+    } catch (err) {
+      log(`sd_notify error: ${err}`);
+    }
+  }
+
+  function startWatchdog(): void {
+    // Notify systemd we're ready
+    sdNotify('READY=1');
+
+    watchdogTimer = setInterval(async () => {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const res = await fetch(`http://${host}:${port}/health`, { signal: controller.signal });
+        clearTimeout(timeout);
+
+        if (res.ok) {
+          watchdogFailures = 0;
+          // Notify systemd watchdog we're alive
+          sdNotify('WATCHDOG=1');
+        } else {
+          watchdogFailures++;
+          console.error(`[RelayPlane] Watchdog: health check returned ${res.status} (failure ${watchdogFailures}/${WATCHDOG_MAX_FAILURES})`);
+        }
+      } catch (err) {
+        watchdogFailures++;
+        console.error(`[RelayPlane] Watchdog: health check failed (failure ${watchdogFailures}/${WATCHDOG_MAX_FAILURES}): ${err}`);
+      }
+
+      if (watchdogFailures >= WATCHDOG_MAX_FAILURES) {
+        console.error('[RelayPlane] CRITICAL: 3 consecutive watchdog failures. Attempting graceful restart...');
+        sdNotify('STOPPING=1');
+        // Close server and exit — systemd Restart=always will restart us
+        server.close(() => {
+          process.exit(1);
+        });
+        // Force exit after 10s if graceful close hangs
+        setTimeout(() => process.exit(1), 10_000).unref();
+      }
+    }, WATCHDOG_INTERVAL_MS);
+    watchdogTimer.unref();
+  }
+
+  // Clean up watchdog on shutdown
+  const origHandleShutdown = () => {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    sdNotify('STOPPING=1');
+  };
+  process.on('SIGINT', origHandleShutdown);
+  process.on('SIGTERM', origHandleShutdown);
+
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, host, () => {
@@ -3802,6 +4441,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       console.log(`  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality`);
       console.log(`  Auth: Passthrough for Anthropic, env vars for other providers`);
       console.log(`  Streaming: ✅ Enabled`);
+      startWatchdog();
+      log('Health watchdog started (30s interval, sd_notify enabled)');
       resolve(server);
     });
   });
@@ -3884,7 +4525,9 @@ async function handleStreamingRequest(
   log: (msg: string) => void,
   cooldownManager: CooldownManager,
   cooldownsEnabled: boolean,
-  complexity: Complexity = 'simple'
+  complexity: Complexity = 'simple',
+  cacheHash?: string,
+  cacheBypass?: boolean,
 ): Promise<void> {
   let providerResponse: Response;
 
@@ -3944,6 +4587,8 @@ async function handleStreamingRequest(
   // Track token usage from streaming events
   let streamTokensIn = 0;
   let streamTokensOut = 0;
+  const shouldCacheStream = !!(cacheHash && !cacheBypass);
+  const rawChunks: string[] = [];
 
   try {
     // Stream the response based on provider format
@@ -3952,6 +4597,7 @@ async function handleStreamingRequest(
         // Convert Anthropic stream to OpenAI format
         for await (const chunk of convertAnthropicStream(providerResponse, targetModel)) {
           res.write(chunk);
+          if (shouldCacheStream) rawChunks.push(chunk);
           // Parse OpenAI-format chunks for usage (emitted at end of stream)
           try {
             const lines = chunk.split('\n');
@@ -3971,6 +4617,7 @@ async function handleStreamingRequest(
         // Convert Gemini stream to OpenAI format
         for await (const chunk of convertGeminiStream(providerResponse, targetModel)) {
           res.write(chunk);
+          if (shouldCacheStream) rawChunks.push(chunk);
           try {
             const lines = chunk.split('\n');
             for (const line of lines) {
@@ -3989,6 +4636,7 @@ async function handleStreamingRequest(
         // xAI, OpenRouter, DeepSeek, Groq, OpenAI all use OpenAI-compatible streaming format
         for await (const chunk of pipeOpenAIStream(providerResponse)) {
           res.write(chunk);
+          if (shouldCacheStream) rawChunks.push(chunk);
           try {
             const lines = chunk.split('\n');
             for (const line of lines) {
@@ -4005,6 +4653,24 @@ async function handleStreamingRequest(
     }
   } catch (err) {
     log(`Streaming error: ${err}`);
+  }
+
+  // ── Cache: store streaming response ──
+  if (shouldCacheStream && cacheHash && rawChunks.length > 0) {
+    const responseCache = getResponseCache();
+    const streamPayload = JSON.stringify({
+      _relayplaneStreamCache: true,
+      ssePayload: rawChunks.join(''),
+      usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, prompt_tokens: streamTokensIn, completion_tokens: streamTokensOut },
+    });
+    responseCache.set(cacheHash, streamPayload, {
+      model: targetModel,
+      tokensIn: streamTokensIn,
+      tokensOut: streamTokensOut,
+      costUsd: estimateCost(targetModel, streamTokensIn, streamTokensOut),
+      taskType,
+    });
+    log(`Cache STORE (stream) for chat/completions ${targetModel} (hash: ${cacheHash.slice(0, 8)})`);
   }
 
   if (cooldownsEnabled) {
@@ -4028,6 +4694,17 @@ async function handleStreamingRequest(
   const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut);
   updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost);
 
+  // ── Post-request: budget spend + anomaly detection ──
+  try {
+    getBudgetManager().recordSpend(streamCost, targetModel);
+    const anomalyResult = getAnomalyDetector().recordAndAnalyze({ model: targetModel, tokensIn: streamTokensIn, tokensOut: streamTokensOut, costUsd: streamCost });
+    if (anomalyResult.detected) {
+      for (const anomaly of anomalyResult.anomalies) {
+        getAlertManager().fireAnomaly(anomaly);
+      }
+    }
+  } catch { /* budget/anomaly should never block */ }
+
   if (recordTelemetry) {
     // Record the run (non-blocking)
     relay
@@ -4043,6 +4720,7 @@ async function handleStreamingRequest(
         log(`Failed to record run: ${err}`);
       });
     sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined);
+    meshCapture(targetModel, targetProvider, taskType, streamTokensIn, streamTokensOut, streamCost, durationMs, true);
   }
 
   res.end();
@@ -4121,6 +4799,17 @@ async function handleNonStreamingRequest(
   const cost = estimateCost(targetModel, tokensIn, tokensOut);
   updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel);
 
+  // ── Post-request: budget spend + anomaly detection ──
+  try {
+    getBudgetManager().recordSpend(cost, targetModel);
+    const anomalyResult = getAnomalyDetector().recordAndAnalyze({ model: targetModel, tokensIn, tokensOut, costUsd: cost });
+    if (anomalyResult.detected) {
+      for (const anomaly of anomalyResult.anomalies) {
+        getAlertManager().fireAnomaly(anomaly);
+      }
+    }
+  } catch { /* budget/anomaly should never block */ }
+
   if (recordTelemetry) {
     // Record the run in RelayPlane
     try {
@@ -4149,13 +4838,31 @@ async function handleNonStreamingRequest(
     const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
     const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
     sendCloudTelemetry(taskType, targetModel, tokensIn, tokensOut, durationMs, true);
+    meshCapture(targetModel, targetProvider, taskType, tokensIn, tokensOut, cost, durationMs, true);
+  }
+
+  // ── Cache: store non-streaming chat/completions response ──
+  const chatRespCache = getResponseCache();
+  const chatReqAsRecord = request as unknown as Record<string, unknown>;
+  const chatCacheBypassLocal = chatRespCache.shouldBypass(chatReqAsRecord);
+  let chatCacheHeaderVal: string = chatCacheBypassLocal ? 'BYPASS' : 'MISS';
+  if (!chatCacheBypassLocal) {
+    const chatHashLocal = chatRespCache.computeKey(chatReqAsRecord);
+    chatRespCache.set(chatHashLocal, JSON.stringify(responseData), {
+      model: targetModel,
+      tokensIn: tokensIn,
+      tokensOut: tokensOut,
+      costUsd: cost,
+      taskType,
+    });
+    log(`Cache STORE for chat/completions ${targetModel} (hash: ${chatHashLocal.slice(0, 8)})`);
   }
 
   // Send response with RelayPlane routing headers
   const nonStreamRpHeaders = buildRelayPlaneResponseHeaders(
     targetModel, request.model ?? 'unknown', complexity, targetProvider, routingMode
   );
-  res.writeHead(200, { 'Content-Type': 'application/json', ...nonStreamRpHeaders });
+  res.writeHead(200, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': chatCacheHeaderVal, ...nonStreamRpHeaders });
   res.end(JSON.stringify(responseData));
 }
 

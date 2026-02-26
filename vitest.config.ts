@@ -1,6 +1,12 @@
 import { defineConfig } from 'vitest/config';
+import { resolve } from 'node:path';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@relayplane/learning-engine': resolve(__dirname, '../learning-engine/src/index.ts'),
+    },
+  },
   test: {
     globals: true,
     environment: 'node',

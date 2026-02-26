@@ -255,8 +255,12 @@ export class ProxyServer {
 
     // Initialize learning engine (Phase 5)
     if (this.config.enableLearning) {
+      const ledgerMaybe = this.ledger as unknown as { getStorage?: () => unknown };
+      const ledgerStorage = typeof ledgerMaybe.getStorage === 'function'
+        ? ledgerMaybe.getStorage()
+        : this.ledger;
       this.learningEngine = config.learningEngine ?? createLearningEngine(
-        this.ledger.getStorage(),
+        ledgerStorage as any,
         undefined,
         config.learningConfig,
       );

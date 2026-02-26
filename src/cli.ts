@@ -46,6 +46,8 @@ import {
   disableTelemetry,
   getConfigPath,
   setApiKey,
+  getMeshConfig,
+  updateMeshConfig,
 } from './config.js';
 import {
   printTelemetryDisclosure,
@@ -57,8 +59,12 @@ import {
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+import { getResponseCache } from './response-cache.js';
+import { getBudgetManager } from './budget.js';
+import { getAlertManager } from './alerts.js';
+
+// __dirname is available natively in CJS
 
 let VERSION = '0.0.0';
 try {
@@ -441,6 +447,7 @@ Usage:
 
 Commands:
   (default)              Start the proxy server
+  init                   Initialize config files
   login                  Log in to RelayPlane (opens browser)
   logout                 Clear stored credentials
   status                 Show proxy status, plan, and cloud sync
@@ -450,8 +457,13 @@ Commands:
   telemetry [on|off|status]  Manage telemetry settings
   stats                  Show usage statistics
   config                 Show configuration
-  autostart [on|off|status]  Manage autostart on boot (systemd)
-  mesh [status|sync|tips|contribute]  Mesh learning layer management
+  config set-key <key>   Set RelayPlane API key
+  budget [status|set|reset]  Manage spend budgets and limits
+  alerts [list|counts]   View cost alerts and anomaly history
+  cache [on|off|status|clear|stats]  Manage response cache
+  service [install|uninstall|status]  Manage system service (systemd/launchd)
+  autostart [on|off|status]  Manage autostart on boot (systemd, legacy)
+  mesh [status|on|off|sync|contribute]  Mesh learning layer management
 
 Options:
   --port <number>    Port to listen on (default: 4100)
@@ -483,8 +495,8 @@ Example:
   npx @relayplane/proxy telemetry off
 
   # Point your agent at the proxy:
-  # ANTHROPIC_BASE_URL=http://localhost:4801 your-agent
-  # OPENAI_BASE_URL=http://localhost:4801/v1 your-agent
+  # ANTHROPIC_BASE_URL=http://localhost:4100 your-agent
+  # OPENAI_BASE_URL=http://localhost:4100/v1 your-agent
 
 Learn more: https://relayplane.com/docs
 `);
@@ -820,49 +832,55 @@ WantedBy=multi-user.target
 }
 
 async function handleMeshCommand(args: string[]): Promise<void> {
-  const { resolveMeshConfig } = await import('./relay-config.js');
-  const config = resolveMeshConfig();
-
+  const meshCfg = getMeshConfig();
   const sub = args[0] ?? 'status';
 
   if (sub === 'status') {
-    // Try hitting the running proxy's mesh status endpoint
+    // Try hitting the running proxy's mesh stats endpoint
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 2000);
-      const res = await fetch('http://127.0.0.1:4100/v1/mesh/status', { signal: controller.signal });
+      const res = await fetch('http://127.0.0.1:4100/v1/mesh/stats', { signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) {
-        const data = await res.json() as { mesh: { available: boolean; enabled: boolean; atomCount: number; contributing: boolean; meshUrl: string; dataDir: string } };
-        const m = data.mesh;
+        const data = await res.json() as { enabled: boolean; atoms_local: number; atoms_synced: number; last_sync: string | null; endpoint: string };
         console.log('');
         console.log('🧠 Mesh Learning Layer');
         console.log('══════════════════════');
-        console.log(`  Available:     ${m.available ? '✅' : '❌'}`);
-        console.log(`  Enabled:       ${m.enabled ? '✅' : '❌'}`);
-        console.log(`  Atoms:         ${m.atomCount}`);
-        console.log(`  Contributing:  ${m.contributing ? '✅ Yes (sharing with mesh)' : '❌ No (local only)'}`);
-        console.log(`  Mesh URL:      ${m.meshUrl}`);
-        console.log(`  Data dir:      ${m.dataDir}`);
+        console.log(`  Enabled:       ${data.enabled ? '✅' : '❌'}`);
+        console.log(`  Atoms (local): ${data.atoms_local}`);
+        console.log(`  Atoms (synced): ${data.atoms_synced}`);
+        console.log(`  Last sync:     ${data.last_sync ?? 'never'}`);
+        console.log(`  Endpoint:      ${data.endpoint}`);
         console.log('');
         return;
       }
     } catch {
-      // Proxy not running, show config
+      // Proxy not running
     }
 
     console.log('');
     console.log('🧠 Mesh Learning Layer (proxy not running)');
     console.log('══════════════════════════════════════════');
-    console.log(`  Enabled:      ${config.enabled ? '✅' : '❌'}`);
-    console.log(`  Contribute:   ${config.contribute ? '✅' : '❌'}`);
-    console.log(`  Mesh URL:     ${config.meshUrl}`);
-    console.log(`  Data dir:     ${config.dataDir}`);
-    console.log(`  Sync interval: ${config.syncIntervalMs / 1000}s`);
-    console.log(`  Inject interval: ${config.injectIntervalMs / 1000}s`);
+    console.log(`  Enabled:        ${meshCfg.enabled ? '✅' : '❌'}`);
+    console.log(`  Contribute:     ${meshCfg.contribute ? '✅' : '❌'}`);
+    console.log(`  Endpoint:       ${meshCfg.endpoint}`);
+    console.log(`  Sync interval:  ${meshCfg.sync_interval_ms / 1000}s`);
     console.log('');
     console.log('  Start the proxy to see live status.');
     console.log('');
+    return;
+  }
+
+  if (sub === 'on') {
+    updateMeshConfig({ enabled: true });
+    console.log('  ✅ Mesh enabled. Restart the proxy for changes to take effect.');
+    return;
+  }
+
+  if (sub === 'off') {
+    updateMeshConfig({ enabled: false });
+    console.log('  ❌ Mesh disabled. Restart the proxy for changes to take effect.');
     return;
   }
 
@@ -870,9 +888,9 @@ async function handleMeshCommand(args: string[]): Promise<void> {
     try {
       const res = await fetch('http://127.0.0.1:4100/v1/mesh/sync', { method: 'POST' });
       if (res.ok) {
-        const data = await res.json() as { sync: { pushed?: number; pulled?: number; error?: string } };
-        if (data.sync.error) {
-          console.log(`⚠️  ${data.sync.error}`);
+        const data = await res.json() as { sync: { pushed?: number; pulled?: number; errors?: string[] } };
+        if (data.sync.errors && data.sync.errors.length > 0) {
+          console.log(`⚠️  Sync errors: ${data.sync.errors.join('; ')}`);
         } else {
           console.log(`✅ Synced: pushed ${data.sync.pushed ?? 0}, pulled ${data.sync.pulled ?? 0}`);
         }
@@ -885,94 +903,335 @@ async function handleMeshCommand(args: string[]): Promise<void> {
     return;
   }
 
-  if (sub === 'tips') {
-    try {
-      const res = await fetch('http://127.0.0.1:4100/v1/mesh/tips');
-      if (res.ok) {
-        const data = await res.json() as { tips: Array<{ observation: string; fitness: number; type: string }> };
-        if (data.tips.length === 0) {
-          console.log('No tips yet. Use the proxy to build knowledge.');
-          return;
-        }
-        console.log('');
-        console.log('🧠 Current Tips');
-        console.log('═══════════════');
-        for (const tip of data.tips) {
-          const icon = tip.type === 'tool' ? '🔧' : tip.type === 'negative' ? '🚫' : '💡';
-          console.log(`  ${icon} [${tip.fitness.toFixed(2)}] ${tip.observation}`);
-        }
-        console.log('');
-      } else {
-        console.log('❌ Cannot fetch tips — is the proxy running?');
-      }
-    } catch {
-      console.log('❌ Cannot connect to proxy. Start it first.');
-    }
-    return;
-  }
-
   if (sub === 'contribute') {
     const value = args[1]?.toLowerCase();
-    const configPath = join(homedir(), '.relayplane', 'config.json');
-    const configDir = join(homedir(), '.relayplane');
-    
-    // Load or create config
-    let config: Record<string, any> = {};
-    try {
-      if (existsSync(configPath)) {
-        config = JSON.parse(readFileSync(configPath, 'utf8'));
-      }
-    } catch { /* fresh config */ }
-
     if (!value || value === 'status') {
-      const enabled = config.mesh?.contribute === true;
-      console.log(`\n  Mesh contribution: ${enabled ? '✅ Enabled' : '❌ Disabled'}`);
-      console.log('');
-      if (enabled) {
-        console.log('  You are sharing anonymized routing data with the collective mesh.');
-        console.log('  This improves routing for everyone on the network.');
-        console.log('  To disable: relayplane mesh contribute off');
-      } else {
-        console.log('  You are NOT sharing data with the mesh.');
-        console.log('  Your routing is local-only.');
-        console.log('  To enable:  relayplane mesh contribute on');
-      }
-      console.log('');
-      console.log('  What gets shared (anonymized):');
-      console.log('    • Task type (code_review, file_read, etc.)');
-      console.log('    • Model used and whether it succeeded');
-      console.log('    • Token count and latency');
-      console.log('    • Cost estimate');
-      console.log('');
-      console.log('  Never shared: prompts, responses, file paths, API keys');
+      console.log(`\n  Mesh contribution: ${meshCfg.contribute ? '✅ Enabled' : '❌ Disabled'}`);
       console.log('');
       return;
     }
-
     if (value === 'on') {
-      if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
-      config.mesh = { ...(config.mesh || {}), contribute: true };
-      writeFileSync(configPath, JSON.stringify(config, null, 2));
-      console.log('\n  ✅ Mesh contribution enabled');
-      console.log('  Anonymized routing data will be shared with the collective mesh.');
-      console.log('  Restart the proxy for changes to take effect.\n');
+      updateMeshConfig({ contribute: true });
+      console.log('\n  ✅ Mesh contribution enabled. Restart proxy for changes.\n');
       return;
     }
-
     if (value === 'off') {
-      if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
-      config.mesh = { ...(config.mesh || {}), contribute: false };
-      writeFileSync(configPath, JSON.stringify(config, null, 2));
-      console.log('\n  ❌ Mesh contribution disabled');
-      console.log('  Your data stays local. Restart the proxy for changes to take effect.\n');
+      updateMeshConfig({ contribute: false });
+      console.log('\n  ❌ Mesh contribution disabled. Restart proxy for changes.\n');
       return;
     }
-
     console.log('Usage: relayplane mesh contribute [on|off|status]');
     return;
   }
 
-  console.log('Unknown mesh subcommand. Available: status, sync, tips, contribute');
+  console.log('Unknown mesh subcommand. Available: status, on, off, sync, contribute');
+}
+
+// ============================================
+// SERVICE INSTALL/UNINSTALL/STATUS COMMAND
+// ============================================
+
+function getServiceAssetPath(): string {
+  return join(__dirname, '..', 'assets', 'relayplane-proxy.service');
+}
+
+function generateLaunchdPlist(binPath: string): string {
+  const envKeys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY'];
+  const envDict = envKeys
+    .filter(k => process.env[k])
+    .map(k => `      <key>${k}</key>\n      <string>${process.env[k]}</string>`)
+    .join('\n');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.relayplane.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${binPath}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${homedir()}/Library/Logs/relayplane-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>${homedir()}/Library/Logs/relayplane-proxy.error.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${homedir()}</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+${envDict}
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+async function handleServiceCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? 'status';
+  const dryRun = args.includes('--dry-run');
+  const isMac = process.platform === 'darwin';
+  const isLinux = process.platform === 'linux';
+
+  if (!isMac && !isLinux) {
+    console.log('  ⚠️  Service management is only supported on Linux (systemd) and macOS (launchd).');
+    return;
+  }
+
+  const { execSync } = require('child_process');
+
+  // Detect binary path
+  let binPath: string;
+  try {
+    binPath = execSync('which relayplane', { encoding: 'utf8' }).trim();
+  } catch {
+    binPath = process.argv[0] ?? 'relayplane';
+  }
+
+  if (sub === 'install') {
+    if (isLinux) {
+      if (!hasSystemd()) {
+        console.log('  ⚠️  systemd not found on this system.');
+        return;
+      }
+      if (!isRoot() && !dryRun) {
+        console.log('  ⚠️  Service install requires root. Try: sudo relayplane service install');
+        return;
+      }
+
+      // Read the shipped service template and patch ExecStart
+      const assetPath = getServiceAssetPath();
+      let serviceContent: string;
+      if (existsSync(assetPath)) {
+        serviceContent = readFileSync(assetPath, 'utf8');
+        serviceContent = serviceContent.replace(/^ExecStart=.*$/m, `ExecStart=${binPath}`);
+      } else {
+        // Fallback: generate inline
+        const envKeys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY'];
+        const envLines = envKeys
+          .filter(k => process.env[k])
+          .map(k => `Environment=${k}=${process.env[k]}`)
+          .join('\n');
+        serviceContent = `[Unit]
+Description=RelayPlane Proxy - Intelligent AI Model Routing
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+User=root
+ExecStart=${binPath}
+Restart=always
+RestartSec=5
+WatchdogSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=HOME=/root
+Environment=NODE_ENV=production
+${envLines}
+
+[Install]
+WantedBy=multi-user.target
+`;
+      }
+
+      // Append current env API keys not already in template
+      const envKeys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY'];
+      for (const key of envKeys) {
+        if (process.env[key] && !serviceContent.includes(`Environment=${key}=`)) {
+          serviceContent = serviceContent.replace(
+            /\[Install\]/,
+            `Environment=${key}=${process.env[key]}\n\n[Install]`
+          );
+        }
+      }
+
+      if (dryRun) {
+        console.log('');
+        console.log('  [DRY RUN] Would write to /etc/systemd/system/relayplane-proxy.service:');
+        console.log('  ─────────────────────────────────────────');
+        console.log(serviceContent);
+        console.log('  ─────────────────────────────────────────');
+        console.log('  [DRY RUN] Would run: systemctl daemon-reload && systemctl enable --now relayplane-proxy');
+        console.log('');
+        return;
+      }
+
+      writeFileSync(SERVICE_PATH, serviceContent);
+      execSync('systemctl daemon-reload && systemctl enable --now relayplane-proxy', { stdio: 'inherit' });
+
+      const config = loadRelayplaneConfig();
+      config.autostart = true;
+      saveRelayplaneConfig(config);
+
+      console.log('');
+      console.log('  ✅ Service installed and started.');
+      console.log('     RelayPlane will start on boot and restart on crash.');
+      console.log('     Run `relayplane service status` to verify.');
+      console.log('');
+
+    } else if (isMac) {
+      const plistPath = join(homedir(), 'Library', 'LaunchAgents', 'com.relayplane.proxy.plist');
+
+      const plistContent = generateLaunchdPlist(binPath);
+
+      if (dryRun) {
+        console.log('');
+        console.log(`  [DRY RUN] Would write to ${plistPath}:`);
+        console.log('  ─────────────────────────────────────────');
+        console.log(plistContent);
+        console.log('  ─────────────────────────────────────────');
+        console.log(`  [DRY RUN] Would run: launchctl load ${plistPath}`);
+        console.log('');
+        return;
+      }
+
+      const dir = dirname(plistPath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(plistPath, plistContent);
+      execSync(`launchctl load "${plistPath}"`, { stdio: 'inherit' });
+
+      console.log('');
+      console.log('  ✅ Service installed and loaded via launchd.');
+      console.log('     RelayPlane will start on login and restart on crash.');
+      console.log('');
+    }
+    return;
+  }
+
+  if (sub === 'uninstall') {
+    if (isLinux) {
+      if (!isRoot() && !dryRun) {
+        console.log('  ⚠️  Service uninstall requires root. Try: sudo relayplane service uninstall');
+        return;
+      }
+
+      if (dryRun) {
+        console.log('');
+        console.log('  [DRY RUN] Would run: systemctl stop relayplane-proxy && systemctl disable relayplane-proxy');
+        console.log('  [DRY RUN] Would remove /etc/systemd/system/relayplane-proxy.service');
+        console.log('  [DRY RUN] Would run: systemctl daemon-reload');
+        console.log('');
+        return;
+      }
+
+      try {
+        execSync('systemctl stop relayplane-proxy && systemctl disable relayplane-proxy', { stdio: 'inherit' });
+      } catch { /* may not exist */ }
+
+      try {
+        if (existsSync(SERVICE_PATH)) {
+          const { unlinkSync } = require('fs');
+          unlinkSync(SERVICE_PATH);
+          execSync('systemctl daemon-reload', { stdio: 'inherit' });
+        }
+      } catch {}
+
+      const config = loadRelayplaneConfig();
+      config.autostart = false;
+      saveRelayplaneConfig(config);
+
+      console.log('');
+      console.log('  ✅ Service uninstalled.');
+      console.log('');
+
+    } else if (isMac) {
+      const plistPath = join(homedir(), 'Library', 'LaunchAgents', 'com.relayplane.proxy.plist');
+
+      if (dryRun) {
+        console.log('');
+        console.log(`  [DRY RUN] Would run: launchctl unload ${plistPath}`);
+        console.log(`  [DRY RUN] Would remove ${plistPath}`);
+        console.log('');
+        return;
+      }
+
+      try {
+        execSync(`launchctl unload "${plistPath}"`, { stdio: 'inherit' });
+      } catch {}
+
+      try {
+        if (existsSync(plistPath)) {
+          const { unlinkSync } = require('fs');
+          unlinkSync(plistPath);
+        }
+      } catch {}
+
+      console.log('');
+      console.log('  ✅ Service uninstalled from launchd.');
+      console.log('');
+    }
+    return;
+  }
+
+  // status (default)
+  if (isLinux && hasSystemd()) {
+    let isEnabled = false;
+    let isActive = false;
+    let statusOutput = '';
+
+    try {
+      const enabled = execSync(`systemctl is-enabled ${SERVICE_NAME} 2>/dev/null`, { encoding: 'utf8' }).trim();
+      isEnabled = enabled === 'enabled';
+    } catch {}
+
+    try {
+      const active = execSync(`systemctl is-active ${SERVICE_NAME} 2>/dev/null`, { encoding: 'utf8' }).trim();
+      isActive = active === 'active';
+    } catch {}
+
+    try {
+      statusOutput = execSync(`systemctl status ${SERVICE_NAME} 2>&1 || true`, { encoding: 'utf8' });
+    } catch {}
+
+    console.log('');
+    console.log('  🔧 Service Status (systemd)');
+    console.log('  ═══════════════════════════');
+    console.log(`  Enabled:  ${isEnabled ? '✅ Yes' : '❌ No'}`);
+    console.log(`  Running:  ${isActive ? '🟢 Active' : '🔴 Inactive'}`);
+    console.log('');
+    if (statusOutput) {
+      console.log(statusOutput.split('\n').map(l => '  ' + l).join('\n'));
+    }
+    if (!isEnabled) {
+      console.log('  To install: sudo relayplane service install');
+    } else {
+      console.log('  To uninstall: sudo relayplane service uninstall');
+    }
+    console.log('');
+
+  } else if (isMac) {
+    const plistPath = join(homedir(), 'Library', 'LaunchAgents', 'com.relayplane.proxy.plist');
+    const installed = existsSync(plistPath);
+    let isLoaded = false;
+
+    try {
+      const output = execSync('launchctl list com.relayplane.proxy 2>&1', { encoding: 'utf8' });
+      isLoaded = !output.includes('Could not find');
+    } catch {}
+
+    console.log('');
+    console.log('  🔧 Service Status (launchd)');
+    console.log('  ═══════════════════════════');
+    console.log(`  Installed: ${installed ? '✅ Yes' : '❌ No'}`);
+    console.log(`  Loaded:    ${isLoaded ? '🟢 Yes' : '🔴 No'}`);
+    console.log('');
+    if (!installed) {
+      console.log('  To install: relayplane service install');
+    } else {
+      console.log('  To uninstall: relayplane service uninstall');
+    }
+    console.log('');
+  }
 }
 
 async function main(): Promise<void> {
@@ -1020,6 +1279,17 @@ async function main(): Promise<void> {
     args.shift();
   }
 
+  const knownCommands = new Set([
+    'init', 'start', 'telemetry', 'stats', 'config', 'login', 'logout', 'upgrade',
+    'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
+  ]);
+
+  if (command && !command.startsWith('-') && !knownCommands.has(command)) {
+    console.error(`Unknown command: ${command}`);
+    console.error('Run relayplane --help to see available commands.');
+    process.exit(1);
+  }
+
   if (command === 'telemetry') {
     handleTelemetryCommand(args.slice(1));
     process.exit(0);
@@ -1060,8 +1330,28 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (command === 'service') {
+    await handleServiceCommand(args.slice(1));
+    process.exit(0);
+  }
+
   if (command === 'mesh') {
     await handleMeshCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'cache') {
+    handleCacheCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'budget') {
+    handleBudgetCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'alerts') {
+    handleAlertsCommand(args.slice(1));
     process.exit(0);
   }
 
@@ -1191,6 +1481,165 @@ async function main(): Promise<void> {
     console.error('Failed to start proxy:', err);
     process.exit(1);
   }
+}
+
+function handleAlertsCommand(args: string[]): void {
+  const sub = args[0] ?? 'list';
+  const alertMgr = getAlertManager({ enabled: true });
+
+  try { alertMgr.init(); } catch { /* ok */ }
+
+  if (sub === 'list' || sub === 'recent') {
+    const limit = parseInt(args[1] ?? '20', 10);
+    const recent = alertMgr.getRecent(limit);
+    console.log('');
+    console.log('🔔 Recent Alerts');
+    console.log('═════════════════');
+    if (recent.length === 0) {
+      console.log('  No alerts yet.');
+    } else {
+      for (const a of recent) {
+        const icon = a.severity === 'critical' ? '🔴' : a.severity === 'warning' ? '🟡' : 'ℹ️';
+        const time = new Date(a.timestamp).toISOString().slice(0, 19);
+        console.log(`  ${icon} [${time}] ${a.type}: ${a.message}`);
+      }
+    }
+    console.log('');
+    alertMgr.close();
+    return;
+  }
+
+  if (sub === 'counts') {
+    const counts = alertMgr.getCounts();
+    console.log('');
+    console.log('🔔 Alert Counts');
+    console.log(`   Threshold: ${counts.threshold}`);
+    console.log(`   Anomaly:   ${counts.anomaly}`);
+    console.log(`   Breach:    ${counts.breach}`);
+    console.log('');
+    alertMgr.close();
+    return;
+  }
+
+  console.log('Usage: relayplane alerts [list|counts]');
+  alertMgr.close();
+}
+
+function handleBudgetCommand(args: string[]): void {
+  const sub = args[0] ?? 'status';
+  const budget = getBudgetManager();
+
+  if (sub === 'status') {
+    try { budget.init(); } catch { /* ok */ }
+    const status = budget.getStatus();
+    const config = budget.getConfig();
+    console.log('');
+    console.log('💰 Budget Status');
+    console.log(`   Enabled:     ${config.enabled ? '✅' : '❌'}`);
+    console.log(`   Daily:       $${status.dailySpend.toFixed(4)} / $${status.dailyLimit} (${status.dailyPercent.toFixed(1)}%)`);
+    console.log(`   Hourly:      $${status.hourlySpend.toFixed(4)} / $${status.hourlyLimit} (${status.hourlyPercent.toFixed(1)}%)`);
+    console.log(`   Per-request: max $${config.perRequestUsd}`);
+    console.log(`   On breach:   ${config.onBreach}`);
+    if (status.breached) {
+      console.log(`   ⚠️  BREACHED: ${status.breachType}`);
+    }
+    console.log('');
+    budget.close();
+    return;
+  }
+
+  if (sub === 'set') {
+    const daily = args.find((a, i) => args[i - 1] === '--daily');
+    const hourly = args.find((a, i) => args[i - 1] === '--hourly');
+    const perReq = args.find((a, i) => args[i - 1] === '--per-request');
+    if (daily) budget.setLimits({ dailyUsd: parseFloat(daily) });
+    if (hourly) budget.setLimits({ hourlyUsd: parseFloat(hourly) });
+    if (perReq) budget.setLimits({ perRequestUsd: parseFloat(perReq) });
+    console.log('✅ Budget limits updated');
+    budget.close();
+    return;
+  }
+
+  if (sub === 'reset') {
+    try { budget.init(); } catch { /* ok */ }
+    budget.reset();
+    console.log('✅ Budget spend reset for current window');
+    budget.close();
+    return;
+  }
+
+  console.log('Usage: relayplane budget [status|set|reset]');
+  console.log('  set --daily <usd> --hourly <usd> --per-request <usd>');
+  budget.close();
+}
+
+function handleCacheCommand(args: string[]): void {
+  const sub = args[0] ?? 'status';
+  const cache = getResponseCache();
+
+  if (sub === 'status') {
+    try { cache.init(); } catch { /* ok */ }
+    const status = cache.getStatus();
+    console.log('');
+    console.log('📦 Response Cache Status');
+    console.log(`   Enabled:    ${status.enabled ? '✅' : '❌'}`);
+    console.log(`   Entries:    ${status.entries}`);
+    console.log(`   Size:       ${status.sizeMb} MB`);
+    console.log(`   Hit rate:   ${status.hitRate}`);
+    console.log(`   Saved:      $${status.savedCostUsd}`);
+    console.log('');
+    return;
+  }
+
+  if (sub === 'clear') {
+    try { cache.init(); } catch { /* ok */ }
+    cache.clear();
+    console.log('✅ Cache cleared');
+    return;
+  }
+
+  if (sub === 'stats') {
+    try { cache.init(); } catch { /* ok */ }
+    const stats = cache.getStats();
+    console.log('');
+    console.log('📊 Cache Statistics');
+    console.log(`   Total entries:  ${stats.totalEntries}`);
+    console.log(`   Total size:     ${(stats.totalSizeBytes / (1024 * 1024)).toFixed(2)} MB`);
+    console.log(`   Hit rate:       ${(stats.hitRate * 100).toFixed(1)}%`);
+    console.log(`   Hits: ${stats.hits}  Misses: ${stats.misses}  Bypasses: ${stats.bypasses}`);
+    console.log(`   Saved:          $${stats.savedCostUsd.toFixed(4)} across ${stats.savedRequests} requests`);
+    console.log('');
+    const models = Object.entries(stats.byModel);
+    if (models.length > 0) {
+      console.log('   By Model:');
+      for (const [model, m] of models) {
+        console.log(`     ${model}: ${m.entries} entries, ${m.hits} hits, $${m.savedCostUsd.toFixed(4)} saved`);
+      }
+    }
+    const tasks = Object.entries(stats.byTaskType);
+    if (tasks.length > 0) {
+      console.log('   By Task Type:');
+      for (const [task, t] of tasks) {
+        console.log(`     ${task}: ${t.entries} entries, ${t.hits} hits, $${t.savedCostUsd.toFixed(4)} saved`);
+      }
+    }
+    console.log('');
+    return;
+  }
+
+  if (sub === 'on') {
+    cache.setEnabled(true);
+    console.log('✅ Cache enabled');
+    return;
+  }
+
+  if (sub === 'off') {
+    cache.setEnabled(false);
+    console.log('✅ Cache disabled');
+    return;
+  }
+
+  console.log('Usage: relayplane cache [status|clear|stats|on|off]');
 }
 
 main();

@@ -27,6 +27,14 @@ export const DEFAULT_MESH_CONFIG: MeshConfig = {
   dataDir: `${process.env.HOME ?? '/root'}/.relayplane/mesh`,
 };
 
+export interface ResponseCacheConfig {
+  enabled: boolean;
+  maxSizeMb: number;
+  defaultTtlSeconds: number;
+  ttlByTaskType?: Record<string, number>;
+  onlyWhenDeterministic: boolean;
+}
+
 export interface RelayPlaneConfig {
   enabled: boolean;
   /** Proxy URL (default: http://127.0.0.1:4100) */
@@ -40,6 +48,8 @@ export interface RelayPlaneConfig {
   autoStart?: boolean;
   /** Mesh learning layer config */
   mesh?: Partial<MeshConfig>;
+  /** Response cache config */
+  cache?: Partial<ResponseCacheConfig>;
 }
 
 export const DEFAULT_RELAY_CONFIG: Required<RelayPlaneConfig> = {
@@ -52,6 +62,7 @@ export const DEFAULT_RELAY_CONFIG: Required<RelayPlaneConfig> = {
   },
   autoStart: true,
   mesh: { ...DEFAULT_MESH_CONFIG },
+  cache: { enabled: true, maxSizeMb: 100, defaultTtlSeconds: 3600, onlyWhenDeterministic: true },
 };
 
 export function resolveConfig(partial?: Partial<RelayPlaneConfig>): Required<RelayPlaneConfig> {
@@ -65,6 +76,7 @@ export function resolveConfig(partial?: Partial<RelayPlaneConfig>): Required<Rel
     },
     autoStart: partial.autoStart ?? DEFAULT_RELAY_CONFIG.autoStart,
     mesh: { ...DEFAULT_MESH_CONFIG, ...partial.mesh },
+    cache: { ...DEFAULT_RELAY_CONFIG.cache, ...partial.cache },
   };
 }
 
