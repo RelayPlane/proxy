@@ -127,19 +127,32 @@ const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   // Anthropic — versioned IDs
   'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
+  'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-20240620': { input: 3.0, output: 15.0 },
   'claude-3-5-haiku-20241022': { input: 0.8, output: 4.0 },
   'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
   'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
   'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  // Anthropic — generation-versioned aliases (e.g. claude-opus-4-6 = Opus 4 snapshot 6)
+  'claude-opus-4-6': { input: 15.0, output: 75.0 },
+  'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
+  'claude-haiku-4-6': { input: 0.8, output: 4.0 },
+  'claude-opus-4-5': { input: 15.0, output: 75.0 },
+  'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
+  'claude-haiku-4-5': { input: 0.8, output: 4.0 },
   // Anthropic — -latest aliases (resolve to same tier)
   'claude-opus-4-latest': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
+  'claude-3-7-sonnet-latest': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-latest': { input: 3.0, output: 15.0 },
   'claude-3-5-haiku-latest': { input: 0.8, output: 4.0 },
   'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
   // Anthropic — short aliases used in proxy MODEL_MAPPING
+  'claude-opus-4': { input: 15.0, output: 75.0 },
+  'claude-sonnet-4': { input: 3.0, output: 15.0 },
+  'claude-haiku-4': { input: 0.8, output: 4.0 },
+  'claude-3-7-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-haiku': { input: 0.8, output: 4.0 },
   

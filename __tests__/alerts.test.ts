@@ -177,7 +177,10 @@ describe('Cost Alerts & Webhooks', () => {
       const fired = webhookAlerts.fireBreach('daily', 70, 50);
       expect(fired).not.toBeNull();
 
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Wait for webhook delivery (CI can be slow)
+      for (let i = 0; i < 20 && !body; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       server.close();
       webhookAlerts.close();
 

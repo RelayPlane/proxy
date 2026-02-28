@@ -3,23 +3,25 @@
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
 
-An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and offers configurable task-aware routing — all running locally.
+An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and offers configurable task-aware routing — all running **locally, for free**.
 
-**Key features:**
+**Free, open-source proxy features:**
 - 📊 Per-request cost tracking across 11+ providers
-- 💰 **Cache-aware cost tracking** — accurately tracks Anthropic prompt caching with cache read savings, creation costs, and true per-request costs including cached tokens
+- 💰 **Cache-aware cost tracking** — accurately tracks Anthropic prompt caching with cache read savings, creation costs, and true per-request costs
 - 🔀 Configurable task-aware routing (complexity-based, cascade, model overrides)
-- 🛡️ Circuit breaker architecture — if the proxy fails, your agent doesn't notice
-- 📈 Local dashboard with cost breakdown, savings analysis, and provider health
+- 🛡️ Circuit breaker — if the proxy fails, your agent doesn't notice
+- 📈 **Local dashboard** at `localhost:4100` — cost breakdown, savings analysis, provider health
 - 💵 **Budget enforcement** — daily/hourly/per-request spend limits with block, warn, downgrade, or alert actions
 - 🔍 **Anomaly detection** — catches runaway agent loops, cost spikes, and token explosions in real time
 - 🔔 **Cost alerts** — threshold alerts at configurable percentages, webhook delivery, alert history
 - ⬇️ **Auto-downgrade** — automatically switches to cheaper models when budget thresholds are hit
-- 📦 **Aggressive cache** — exact-match and aggressive response caching with gzipped disk persistence
-- 🧠 **Osmosis mesh** — opt-in collective learning layer that shares anonymized routing signals across users
+- 📦 **Aggressive cache** — exact-match response caching with gzipped disk persistence
+- 🧠 **Osmosis mesh** — opt-in collective learning layer that shares anonymized routing signals across users (free, opt-in)
 - 🔧 **systemd/launchd service** — `relayplane service install` for always-on operation with auto-restart
 - 🏥 **Health watchdog** — `/health` endpoint with uptime tracking and active probing
 - 🛡️ **Config resilience** — atomic writes, automatic backup/restore, credential separation
+
+> **Cloud dashboard available separately** — see [Cloud Dashboard & Pro Features](#cloud-dashboard--pro-features) below. Your prompts always stay local.
 
 ## Quick Start
 
@@ -296,6 +298,15 @@ When enabled, the proxy sends anonymized metadata to `api.relayplane.com`:
 
 **Never collected:** prompts, responses, file paths, or anything that could identify you or your project. Your prompts go directly to LLM providers, never through RelayPlane servers.
 
+> **Cloud dashboard setup:** To see your data at [relayplane.com/dashboard](https://relayplane.com/dashboard), run `relayplane login` then `relayplane telemetry on`. This is the explicit opt-in — you're choosing to send anonymous metadata to power the cloud dashboard. You can disable anytime.
+
+When the proxy connects and telemetry is enabled, it will confirm:
+```
+[RelayPlane] Cloud dashboard connected — telemetry enabled.
+Your prompts stay local. Only anonymous metadata (model, tokens, cost) is sent.
+Disable anytime: relayplane telemetry off
+```
+
 ### Audit mode
 
 Audit mode buffers telemetry events in memory so you can inspect exactly what would be sent before it goes anywhere. Useful for compliance review.
@@ -554,6 +565,36 @@ relayplane [command] [options]
 | `--offline` | — | No network calls except LLM endpoints |
 | `--audit` | — | Show telemetry payloads before sending |
 | `-v, --verbose` | — | Verbose logging |
+
+## Cloud Dashboard & Pro Features
+
+The proxy is fully functional without a cloud account. All features above are **local and free**.
+
+For teams that want persistent cloud analytics, email digests, and shared routing intelligence, [relayplane.com](https://relayplane.com) offers:
+
+| Feature | Plan |
+|---------|------|
+| Cloud dashboard — run history, cost trends, analytics | Starter ($9/mo) |
+| Policy engine — budget rules, model allowlists, approval gates | Starter |
+| Weekly cost digest emails | Starter |
+| Routing recommendations from collective intelligence | Starter |
+| 90-day history, data export | Pro ($29/mo) |
+| Cloud anomaly alerts (email, webhook) | Pro |
+| Team access & shared dashboards | Max ($99/mo) |
+| Governance & compliance rules | Max |
+
+**[View pricing →](https://relayplane.com/pricing)**
+
+### Connecting to Cloud
+
+```bash
+relayplane login          # authenticate with your cloud account
+relayplane telemetry on   # opt in to send anonymous metadata (model, tokens, cost, latency)
+```
+
+> **Privacy-first:** Enabling cloud telemetry sends only anonymous metadata — model name, token counts, cost, latency. Your prompts, inputs, and outputs **never leave your machine**. You can disable anytime: `relayplane telemetry off`.
+
+---
 
 ## Your Keys Stay Yours
 

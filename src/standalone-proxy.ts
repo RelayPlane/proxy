@@ -522,6 +522,8 @@ interface RequestHistoryEntry {
   tokensIn: number;
   tokensOut: number;
   costUsd: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
   taskType?: string;
   complexity?: string;
   responseModel?: string;
@@ -706,7 +708,7 @@ function logRequest(
 }
 
 /** Update the most recent history entry with token/cost info */
-function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string): void {
+function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number): void {
   if (requestHistory.length > 0) {
     const last = requestHistory[requestHistory.length - 1]!;
     last.tokensIn = tokensIn;
@@ -715,6 +717,8 @@ function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: nu
     if (responseModel) {
       last.responseModel = responseModel;
     }
+    if (cacheCreationTokens !== undefined) last.cacheCreationTokens = cacheCreationTokens;
+    if (cacheReadTokens !== undefined) last.cacheReadTokens = cacheReadTokens;
   }
 }
 
@@ -956,7 +960,20 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   const andCount = (text.match(/\band\b/g) || []).length;
   if (andCount >= 3) score += 1;
   if (andCount >= 5) score += 1;
-  
+
+  // Calculate total tokens across ALL messages, not just last user message.
+  // For agent workloads (OpenClaw, aider, Claude Code) the last user message is
+  // often tiny while the real complexity lives in the 100K+ token context.
+  const allText = extractMessageText(messages);
+  const totalTokens = Math.ceil(allText.length / 4);
+  // Context size floor — use as a hard signal regardless of last-message score
+  if (totalTokens > 100000) score += 5;      // definitely complex
+  else if (totalTokens > 50000) score += 3;  // likely moderate+
+  else if (totalTokens > 20000) score += 2;
+  // Message count signal — long conversations imply multi-step reasoning
+  if (messages.length > 50) score += 2;
+  else if (messages.length > 20) score += 1;
+
   if (score >= 4) return 'complex';
   if (score >= 2) return 'moderate';
   return 'simple';
@@ -1901,11 +1918,13 @@ function convertAnthropicStreamEvent(
       const msg = eventData['message'] as Record<string, unknown> | undefined;
       baseChunk.id = (msg?.['id'] as string) || messageId;
       choice.delta = { role: 'assistant', content: '' };
-      // Pass through input token count from message_start
+      // Pass through input token count from message_start (including cache tokens)
       const msgUsage = msg?.['usage'] as Record<string, unknown> | undefined;
       if (msgUsage) {
         (baseChunk as Record<string, unknown>)['usage'] = {
           prompt_tokens: msgUsage['input_tokens'] ?? 0,
+          cache_creation_tokens: msgUsage['cache_creation_input_tokens'] ?? 0,
+          cache_read_tokens: msgUsage['cache_read_input_tokens'] ?? 0,
         };
       }
       return `data: ${JSON.stringify(baseChunk)}\n\n`;
@@ -2470,7 +2489,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
-<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
 <script>
 const $ = id => document.getElementById(id);
 function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
@@ -2511,8 +2530,8 @@ async function load(){
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
     $('runs').innerHTML=(runsR.runs||[]).map(r=>
-      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
-    ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
+      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
+    ).join('')||'<tr><td colspan=11 style="color:#64748b">No runs yet</td></tr>';
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const dotClass = p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
       const rate = p.successRate!==undefined?(' '+Math.round(p.successRate*100)+'%'):'';
@@ -3071,7 +3090,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const offset = parseInt(params.get('offset') || '0', 10);
         const sorted = [...requestHistory].reverse();
         const runs = sorted.slice(offset, offset + limit).map(r => {
-          const origCost = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut);
+          // Savings should reflect routing decisions only — pass same cache tokens to baseline
+          // so the cache discount doesn't get counted as "savings from routing"
+          const origCost = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut, r.cacheCreationTokens || undefined, r.cacheReadTokens || undefined);
           const perRunSavings = Math.max(0, origCost - r.costUsd);
           return {
             id: r.id,
@@ -3091,6 +3112,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             latencyMs: r.latencyMs,
             tokensIn: r.tokensIn,
             tokensOut: r.tokensOut,
+            cacheCreationTokens: r.cacheCreationTokens ?? 0,
+            cacheReadTokens: r.cacheReadTokens ?? 0,
             savings: Math.round(perRunSavings * 10000) / 10000,
             escalated: r.escalated,
           };
@@ -3110,7 +3133,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const byDayMap = new Map<string, { savedAmount: number; originalCost: number; actualCost: number }>();
 
         for (const r of requestHistory) {
-          const origCost = estimateCost(OPUS_BASELINE, r.tokensIn, r.tokensOut);
+          // Pass same cache tokens to baseline so savings only reflect routing decisions,
+          // not prompt-cache discounts (those happen regardless of which model is chosen).
+          const origCost = estimateCost(OPUS_BASELINE, r.tokensIn, r.tokensOut, r.cacheCreationTokens || undefined, r.cacheReadTokens || undefined);
           const actualCost = r.costUsd;
           const saved = Math.max(0, origCost - actualCost);
 
@@ -3752,7 +3777,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 model: targetModel || requestedModel,
                 tokensIn: nativeUsage?.input_tokens ?? 0,
                 tokensOut: nativeUsage?.output_tokens ?? 0,
-                costUsd: estimateCost(targetModel || requestedModel, nativeUsage?.input_tokens ?? 0, nativeUsage?.output_tokens ?? 0),
+                costUsd: estimateCost(targetModel || requestedModel, nativeUsage?.input_tokens ?? 0, nativeUsage?.output_tokens ?? 0, nativeUsage?.cache_creation_input_tokens || undefined, nativeUsage?.cache_read_input_tokens || undefined),
                 taskType,
               });
               log(`Cache STORE for ${targetModel || requestedModel} (hash: ${cacheHash.slice(0, 8)})`);
@@ -3790,6 +3815,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           nativeTokIn,
           nativeTokOut,
           nativeCostUsd,
+          undefined,
+          nativeCacheCreation || undefined,
+          nativeCacheRead || undefined,
         );
 
         // ── Post-request: budget spend + anomaly detection ──
@@ -3801,6 +3829,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               prompt: promptText.slice(0, 500),
               taskType,
               model: `${targetProvider}:${targetModel || requestedModel}`,
+            })
+            .then((runResult) => {
+              // Backfill token/cost data — relay.run() has no adapters so records NULLs
+              relay.patchRunTokens(runResult.runId, nativeTokIn, nativeTokOut, nativeCostUsd);
             })
             .catch(() => {});
           sendCloudTelemetry(taskType, targetModel || requestedModel, nativeTokIn, nativeTokOut, durationMs, true, undefined, originalModel ?? undefined, nativeCacheCreation || undefined, nativeCacheRead || undefined);
@@ -4291,8 +4323,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const cascadeUsage = (responseData as any)?.usage;
           const cascadeTokensIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
           const cascadeTokensOut = cascadeUsage?.output_tokens ?? cascadeUsage?.completion_tokens ?? 0;
-          const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut);
-          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel);
+          const cascadeCacheCreation = cascadeUsage?.cache_creation_input_tokens || undefined;
+          const cascadeCacheRead = cascadeUsage?.cache_read_input_tokens || undefined;
+          const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut, cascadeCacheCreation, cascadeCacheRead);
+          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel, cascadeCacheCreation, cascadeCacheRead);
 
           if (recordTelemetry) {
             try {
@@ -4301,6 +4335,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 taskType,
                 model: `${cascadeResult.provider}:${cascadeResult.model}`,
               });
+              // Backfill token/cost data — relay.run() has no adapters so records NULLs
+              relay.patchRunTokens(runResult.runId, cascadeTokensIn, cascadeTokensOut, cascadeCost);
               responseData['_relayplane'] = {
                 runId: runResult.runId,
                 routedTo: `${cascadeResult.provider}/${cascadeResult.model}`,
@@ -4314,7 +4350,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             } catch (err) {
               log(`Failed to record run: ${err}`);
             }
-            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
+            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined, cascadeCacheCreation, cascadeCacheRead);
             meshCapture(cascadeResult.model, cascadeResult.provider, taskType, cascadeTokensIn, cascadeTokensOut, cascadeCost, durationMs, true);
           }
 
@@ -4584,9 +4620,11 @@ async function handleStreamingRequest(
     ...streamRpHeaders,
   });
 
-  // Track token usage from streaming events
+  // Track token usage from streaming events (including Anthropic prompt cache tokens)
   let streamTokensIn = 0;
   let streamTokensOut = 0;
+  let streamCacheCreation = 0;
+  let streamCacheRead = 0;
   const shouldCacheStream = !!(cacheHash && !cacheBypass);
   const rawChunks: string[] = [];
 
@@ -4598,7 +4636,8 @@ async function handleStreamingRequest(
         for await (const chunk of convertAnthropicStream(providerResponse, targetModel)) {
           res.write(chunk);
           if (shouldCacheStream) rawChunks.push(chunk);
-          // Parse OpenAI-format chunks for usage (emitted at end of stream)
+          // Parse OpenAI-format chunks for usage — the converter embeds
+          // cache_creation_tokens and cache_read_tokens from message_start.
           try {
             const lines = chunk.split('\n');
             for (const line of lines) {
@@ -4607,6 +4646,8 @@ async function handleStreamingRequest(
                 if (evt.usage) {
                   streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
                   streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+                  streamCacheCreation = evt.usage.cache_creation_tokens ?? streamCacheCreation;
+                  streamCacheRead = evt.usage.cache_read_tokens ?? streamCacheRead;
                 }
               }
             }
@@ -4661,13 +4702,13 @@ async function handleStreamingRequest(
     const streamPayload = JSON.stringify({
       _relayplaneStreamCache: true,
       ssePayload: rawChunks.join(''),
-      usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, prompt_tokens: streamTokensIn, completion_tokens: streamTokensOut },
+      usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, prompt_tokens: streamTokensIn, completion_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead },
     });
     responseCache.set(cacheHash, streamPayload, {
       model: targetModel,
       tokensIn: streamTokensIn,
       tokensOut: streamTokensOut,
-      costUsd: estimateCost(targetModel, streamTokensIn, streamTokensOut),
+      costUsd: estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined),
       taskType,
     });
     log(`Cache STORE (stream) for chat/completions ${targetModel} (hash: ${cacheHash.slice(0, 8)})`);
@@ -4690,9 +4731,9 @@ async function handleStreamingRequest(
     undefined,
     taskType, complexity
   );
-  // Update token/cost info on the history entry
-  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut);
-  updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost);
+  // Update token/cost info on the history entry (with cache token discount)
+  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
+  updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost, undefined, streamCacheCreation || undefined, streamCacheRead || undefined);
 
   // ── Post-request: budget spend + anomaly detection ──
   try {
@@ -4714,12 +4755,14 @@ async function handleStreamingRequest(
         model: `${targetProvider}:${targetModel}`,
       })
       .then((runResult) => {
+        // Backfill token/cost data — relay.run() has no adapters so records NULLs
+        relay.patchRunTokens(runResult.runId, streamTokensIn, streamTokensOut, streamCost);
         log(`Completed streaming in ${durationMs}ms, runId: ${runResult.runId}`);
       })
       .catch((err) => {
         log(`Failed to record run: ${err}`);
       });
-    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined);
+    sendCloudTelemetry(taskType, targetModel, streamTokensIn, streamTokensOut, durationMs, true, undefined, request.model ?? undefined, streamCacheCreation || undefined, streamCacheRead || undefined);
     meshCapture(targetModel, targetProvider, taskType, streamTokensIn, streamTokensOut, streamCost, durationMs, true);
   }
 
@@ -4792,12 +4835,14 @@ async function handleNonStreamingRequest(
 
   // Log the successful request
   logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
-  // Update token/cost info
+  // Update token/cost info (including Anthropic prompt cache tokens)
   const usage = (responseData as any)?.usage;
   const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
   const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-  const cost = estimateCost(targetModel, tokensIn, tokensOut);
-  updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel);
+  const cacheCreationTokens = usage?.cache_creation_input_tokens ?? 0;
+  const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
+  const cost = estimateCost(targetModel, tokensIn, tokensOut, cacheCreationTokens || undefined, cacheReadTokens || undefined);
+  updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel, cacheCreationTokens || undefined, cacheReadTokens || undefined);
 
   // ── Post-request: budget spend + anomaly detection ──
   try {
@@ -4818,6 +4863,8 @@ async function handleNonStreamingRequest(
         taskType,
         model: `${targetProvider}:${targetModel}`,
       });
+      // Backfill token/cost data — relay.run() has no adapters so records NULLs
+      relay.patchRunTokens(runResult.runId, tokensIn, tokensOut, cost);
 
       // Add routing metadata to response
       responseData['_relayplane'] = {
@@ -4833,12 +4880,14 @@ async function handleNonStreamingRequest(
     } catch (err) {
       log(`Failed to record run: ${err}`);
     }
-    // Extract token counts from response if available (Anthropic/OpenAI format)
-    const usage = (responseData as any)?.usage;
-    const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
-    const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-    sendCloudTelemetry(taskType, targetModel, tokensIn, tokensOut, durationMs, true);
-    meshCapture(targetModel, targetProvider, taskType, tokensIn, tokensOut, cost, durationMs, true);
+    // Extract token counts from response if available (Anthropic/OpenAI format, including cache)
+    const innerUsage = (responseData as any)?.usage;
+    const innerTokIn = innerUsage?.input_tokens ?? innerUsage?.prompt_tokens ?? 0;
+    const innerTokOut = innerUsage?.output_tokens ?? innerUsage?.completion_tokens ?? 0;
+    const innerCacheCreation = innerUsage?.cache_creation_input_tokens ?? 0;
+    const innerCacheRead = innerUsage?.cache_read_input_tokens ?? 0;
+    sendCloudTelemetry(taskType, targetModel, innerTokIn, innerTokOut, durationMs, true, undefined, undefined, innerCacheCreation || undefined, innerCacheRead || undefined);
+    meshCapture(targetModel, targetProvider, taskType, innerTokIn, innerTokOut, cost, durationMs, true);
   }
 
   // ── Cache: store non-streaming chat/completions response ──
