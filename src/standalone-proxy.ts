@@ -47,6 +47,7 @@ import { getBudgetManager, type BudgetConfig } from './budget.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
+import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
 import { getVersionStatus } from './utils/version-status.js';
 const PROXY_VERSION: string = (() => {
   try {
@@ -466,6 +467,7 @@ interface RelayPlaneProxyConfigFile {
   anomaly?: Partial<AnomalyConfig>;
   alerts?: Partial<AlertsConfig>;
   downgrade?: Partial<DowngradeConfig>;
+  dashboard?: { showRequestContent?: boolean };
   [key: string]: unknown;
 }
 
@@ -509,6 +511,13 @@ const globalStats: RequestStats = {
 };
 
 /** Rolling request history for telemetry endpoints (max 10000 entries) */
+export interface RequestContentData {
+  systemPrompt?: string;
+  userMessage?: string;
+  responsePreview?: string;
+  fullResponse?: string;
+}
+
 interface RequestHistoryEntry {
   id: string;
   originalModel: string;
@@ -527,6 +536,9 @@ interface RequestHistoryEntry {
   taskType?: string;
   complexity?: string;
   responseModel?: string;
+  agentFingerprint?: string;
+  agentId?: string;
+  requestContent?: RequestContentData;
 }
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
@@ -651,7 +663,9 @@ function logRequest(
   mode: string,
   escalated?: boolean,
   taskType?: string,
-  complexity?: string
+  complexity?: string,
+  agentFingerprint?: string,
+  agentId?: string,
 ): void {
   const timestamp = new Date().toISOString();
   const status = success ? '✓' : '✗';
@@ -699,6 +713,8 @@ function logRequest(
     costUsd: 0,
     taskType: taskType || 'general',
     complexity: complexity || 'simple',
+    agentFingerprint,
+    agentId,
   };
   requestHistory.push(entry);
   if (requestHistory.length > MAX_HISTORY) {
@@ -708,7 +724,7 @@ function logRequest(
 }
 
 /** Update the most recent history entry with token/cost info */
-function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number): void {
+function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number, agentFingerprint?: string, agentId?: string, requestContent?: RequestContentData): void {
   if (requestHistory.length > 0) {
     const last = requestHistory[requestHistory.length - 1]!;
     last.tokensIn = tokensIn;
@@ -719,7 +735,79 @@ function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: nu
     }
     if (cacheCreationTokens !== undefined) last.cacheCreationTokens = cacheCreationTokens;
     if (cacheReadTokens !== undefined) last.cacheReadTokens = cacheReadTokens;
+    if (agentFingerprint !== undefined) last.agentFingerprint = agentFingerprint;
+    if (agentId !== undefined) last.agentId = agentId;
+    if (requestContent) last.requestContent = requestContent;
   }
+}
+
+/**
+ * Extract request content for logging. Handles Anthropic and OpenAI formats.
+ */
+export function extractRequestContent(
+  body: Record<string, unknown>,
+  isAnthropic: boolean,
+): { systemPrompt?: string; userMessage?: string } {
+  let systemPrompt = '';
+  let userMessage = '';
+  if (isAnthropic) {
+    if (typeof body.system === 'string') {
+      systemPrompt = body.system;
+    } else if (Array.isArray(body.system)) {
+      systemPrompt = (body.system as Array<{ type?: string; text?: string }>)
+        .map(p => p.type === 'text' ? (p.text ?? '') : (typeof p === 'string' ? String(p) : ''))
+        .join('');
+    }
+  } else {
+    const sysmsgs = body.messages as Array<{ role?: string; content?: unknown }> | undefined;
+    if (Array.isArray(sysmsgs)) {
+      for (const msg of sysmsgs) {
+        if (msg.role === 'system') {
+          systemPrompt = typeof msg.content === 'string' ? msg.content : '';
+          break;
+        }
+      }
+    }
+  }
+  const msgs = body.messages as Array<{ role?: string; content?: unknown }> | undefined;
+  if (Array.isArray(msgs)) {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]!.role === 'user') {
+        const content = msgs[i]!.content;
+        if (typeof content === 'string') {
+          userMessage = content;
+        } else if (Array.isArray(content)) {
+          userMessage = (content as Array<{ type?: string; text?: string }>)
+            .filter(p => p.type === 'text')
+            .map(p => p.text ?? '')
+            .join('');
+        }
+        break;
+      }
+    }
+  }
+  return {
+    systemPrompt: systemPrompt ? systemPrompt.slice(0, 200) : undefined,
+    userMessage: userMessage || undefined,
+  };
+}
+
+/**
+ * Extract assistant response text from response payload.
+ */
+export function extractResponseText(responseData: Record<string, unknown>, isAnthropic: boolean): string {
+  if (isAnthropic) {
+    const content = responseData.content as Array<{ type?: string; text?: string }> | undefined;
+    if (Array.isArray(content)) {
+      return content.filter(p => p.type === 'text').map(p => p.text ?? '').join('');
+    }
+  } else {
+    const choices = responseData.choices as Array<{ message?: { content?: string } }> | undefined;
+    if (Array.isArray(choices) && choices[0]?.message?.content) {
+      return choices[0].message.content;
+    }
+  }
+  return '';
 }
 
 const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
@@ -752,6 +840,13 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     },
   },
 };
+
+/** Module-level ref to active proxy config (set during startProxy) */
+let _activeProxyConfig: RelayPlaneProxyConfigFile = {};
+
+function isContentLoggingEnabled(): boolean {
+  return _activeProxyConfig.dashboard?.showRequestContent !== false;
+}
 
 function getProxyConfigPath(): string {
   const customPath = process.env['RELAYPLANE_CONFIG_PATH'];
@@ -2203,7 +2298,7 @@ function resolveConfigModel(modelName: string): { provider: Provider; model: str
   return resolveExplicitModel(modelName) ?? parsePreferredModel(modelName);
 }
 
-function extractResponseText(responseData: Record<string, unknown>): string {
+function extractResponseTextAuto(responseData: Record<string, unknown>): string {
   const openAiChoices = responseData['choices'] as Array<Record<string, unknown>> | undefined;
   if (openAiChoices && openAiChoices.length > 0) {
     const first = openAiChoices[0] as { message?: { content?: string | null } };
@@ -2421,7 +2516,7 @@ async function cascadeRequest(
     
     try {
       const { responseData, provider, model: resolvedModel } = await makeRequest(model);
-      const text = extractResponseText(responseData);
+      const text = extractResponseTextAuto(responseData);
       
       if (isLastModel || escalations >= config.maxEscalations) {
         return { responseData, provider, model: resolvedModel, escalations };
@@ -2477,6 +2572,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .vstat.unavailable{color:#a3a3a3;border-color:#52525b66;background:#18181b66}
 @media(max-width:768px){.col-tt,.col-cx{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+.rename-btn{background:none;border:none;cursor:pointer;font-size:.75rem;opacity:.5;padding:2px}.rename-btn:hover{opacity:1}
 </style></head><body>
 <div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span><span id="vstat" class="vstat unavailable">Unable to check</span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
@@ -2487,6 +2583,8 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 </div>
 <div class="section"><h2>Model Breakdown</h2>
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<div class="section"><h2>Agent Cost Breakdown</h2>
+<table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
 <table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
@@ -2497,12 +2595,13 @@ function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
 function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
 async function load(){
   try{
-    const [health,stats,runsR,sav,provH]=await Promise.all([
+    const [health,stats,runsR,sav,provH,agentsR]=await Promise.all([
       fetch('/health').then(r=>r.json()),
       fetch('/v1/telemetry/stats').then(r=>r.json()),
       fetch('/v1/telemetry/runs?limit=20').then(r=>r.json()),
       fetch('/v1/telemetry/savings').then(r=>r.json()),
-      fetch('/v1/telemetry/health').then(r=>r.json())
+      fetch('/v1/telemetry/health').then(r=>r.json()),
+      fetch('/api/agents').then(r=>r.json()).catch(()=>({agents:[]}))
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
@@ -2529,9 +2628,26 @@ async function load(){
     ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
-    $('runs').innerHTML=(runsR.runs||[]).map(r=>
-      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
-    ).join('')||'<tr><td colspan=11 style="color:#64748b">No runs yet</td></tr>';
+    function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+    $('runs').innerHTML=(runsR.runs||[]).map((r,i)=>{
+      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')" title="Click to expand"><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
+      const c=r.requestContent||{};
+      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="11" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
+      if(c.systemPrompt||c.userMessage||c.responsePreview){
+        if(c.systemPrompt) detail+='<div style="color:#64748b;font-size:.85rem;margin-bottom:10px;font-style:italic"><strong style="color:#94a3b8">System:</strong> '+esc(c.systemPrompt)+'</div>';
+        if(c.userMessage) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">User Message</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.userMessage)+'</div></div>';
+        if(c.responsePreview) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">Response Preview</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.responsePreview)+'</div></div>';
+        detail+='<button onclick="event.stopPropagation();loadFullResponse(\''+r.id+'\','+i+')" id="full-btn-'+i+'" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:.8rem">Show full response</button><pre id="full-resp-'+i+'" style="display:none;white-space:pre-wrap;margin-top:10px;background:#0d0e11;border:1px solid #1e293b;border-radius:8px;padding:12px;max-height:400px;overflow:auto;font-size:.8rem"></pre>';
+      } else {
+        detail+='<span style="color:#64748b">No content captured for this request</span>';
+      }
+      detail+='</td></tr>';
+      return row+detail;
+    }).join('')||'<tr><td colspan=11 style="color:#64748b">No runs yet</td></tr>';
+    const agents=(agentsR.agents||[]).sort((a,b)=>(b.totalCost||0)-(a.totalCost||0));
+    $('agents').innerHTML=agents.length?agents.map(a=>
+      '<tr><td><span class="agent-name" data-fp="'+a.fingerprint+'">'+a.name+'</span> <button class="rename-btn" onclick="renameAgent(\''+a.fingerprint+'\',\''+a.name.replace(/'/g,"\\'")+'\')">✏️</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b" title="'+a.systemPromptPreview+'">'+a.fingerprint+'</td></tr>'
+    ).join(''):'<tr><td colspan=5 style="color:#64748b">No agents detected yet</td></tr>';
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const dotClass = p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
       const rate = p.successRate!==undefined?(' '+Math.round(p.successRate*100)+'%'):'';
@@ -2539,8 +2655,27 @@ async function load(){
     }).join('');
   }catch(e){console.error(e)}
 }
+async function renameAgent(fp,currentName){
+  const name=prompt('Rename agent:',currentName);
+  if(!name||name===currentName)return;
+  await fetch('/api/agents/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp,name:name})});
+  load();
+}
+function toggleDetail(i){var d=document.getElementById('run-detail-'+i);d.style.display=d.style.display==='none'?'table-row':'none'}
+async function loadFullResponse(runId,i){
+  const btn=document.getElementById('full-btn-'+i);
+  const pre=document.getElementById('full-resp-'+i);
+  if(pre.style.display!=='none'){pre.style.display='none';btn.textContent='Show full response';return}
+  btn.textContent='Loading...';
+  try{
+    const data=await fetch('/api/runs/'+runId).then(r=>r.json());
+    const full=data.requestContent&&data.requestContent.fullResponse;
+    if(full){pre.textContent=full;pre.style.display='block';btn.textContent='Hide full response'}
+    else{btn.textContent='No full response available'}
+  }catch{btn.textContent='Error loading response'}
+}
 load();setInterval(load,5000);
-</script></body></html>`;
+</script><footer style="text-align:center;padding:20px 0;color:#475569;font-size:.75rem;border-top:1px solid #1e293b;margin-top:20px">🔒 Request content stays on your machine. Never sent to cloud.</footer></body></html>`;
 }
 
 function getConfigDashboardHTML(): string {
@@ -2640,9 +2775,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   // Load persistent history from disk
   loadHistoryFromDisk();
+  loadAgentRegistry();
 
   // Flush history on shutdown
   const handleShutdown = () => {
+    flushAgentRegistry();
     meshHandle.stop();
     shutdownHistory();
     process.exit(0);
@@ -2652,6 +2789,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const configPath = getProxyConfigPath();
   let proxyConfig = await loadProxyConfig(configPath, log);
+  _activeProxyConfig = proxyConfig;
   const cooldownManager = new CooldownManager(getCooldownConfig(proxyConfig));
 
   // === Startup config validation (Task 4) ===
@@ -3116,6 +3254,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             cacheReadTokens: r.cacheReadTokens ?? 0,
             savings: Math.round(perRunSavings * 10000) / 10000,
             escalated: r.escalated,
+            requestContent: r.requestContent ? {
+              systemPrompt: r.requestContent.systemPrompt,
+              userMessage: r.requestContent.userMessage,
+              responsePreview: r.requestContent.responsePreview,
+              // fullResponse excluded from list endpoint to keep payloads small
+            } : undefined,
           };
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3226,6 +3370,65 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === Agent tracking API ===
+    // === /api/runs/:id — full request/response content for a single run ===
+    const runsIdMatch = pathname.match(/^\/api\/runs\/(.+)$/);
+    if (req.method === 'GET' && runsIdMatch) {
+      const runId = runsIdMatch[1];
+      const run = requestHistory.find(r => r.id === runId);
+      if (!run) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Run not found' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: run.id,
+        model: run.targetModel,
+        provider: run.provider,
+        timestamp: run.timestamp,
+        tokensIn: run.tokensIn,
+        tokensOut: run.tokensOut,
+        costUsd: run.costUsd,
+        latencyMs: run.latencyMs,
+        success: run.success,
+        requestContent: run.requestContent,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/agents') {
+      const summaries = getAgentSummaries(requestHistory);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ agents: summaries }));
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/agents/rename') {
+      try {
+        const body = await readJsonBody(req);
+        const fingerprint = body['fingerprint'] as string;
+        const name = body['name'] as string;
+        if (!fingerprint || !name) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing fingerprint or name' }));
+          return;
+        }
+        const ok = renameAgent(fingerprint, name);
+        if (!ok) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Agent not found' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+      return;
+    }
+
     // === Dashboard ===
     if (req.method === 'GET' && (pathname === '/' || pathname === '/dashboard')) {
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -3309,6 +3512,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
         return;
+      }
+
+      // Extract agent fingerprint and explicit agent ID
+      const nativeSystemPrompt = extractSystemPromptFromBody(requestBody);
+      const nativeExplicitAgentId = getHeaderValue(req, 'x-relayplane-agent') || undefined;
+      let nativeAgentFingerprint: string | undefined;
+      if (nativeSystemPrompt) {
+        const agentResult = trackAgent(nativeSystemPrompt, 0, nativeExplicitAgentId);
+        nativeAgentFingerprint = agentResult.fingerprint;
       }
 
       const originalModel = requestBody['model'] as string | undefined;
@@ -3811,6 +4023,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const nativeTokIn = nativeBaseTokIn + nativeCacheCreation + nativeCacheRead;
         // Cost calculation expects inputTokens to include cache tokens when cache params are provided
         const nativeCostUsd = estimateCost(targetModel || requestedModel, nativeTokIn, nativeTokOut, nativeCacheCreation || undefined, nativeCacheRead || undefined);
+        // Build request content if logging enabled
+        let nativeContentData: RequestContentData | undefined;
+        if (isContentLoggingEnabled()) {
+          const extracted = extractRequestContent(requestBody, true);
+          const responseText = nativeResponseData ? extractResponseText(nativeResponseData, true) : '';
+          nativeContentData = {
+            ...extracted,
+            responsePreview: responseText ? responseText.slice(0, 500) : undefined,
+            fullResponse: responseText || undefined,
+          };
+        }
         updateLastHistoryEntry(
           nativeTokIn,
           nativeTokOut,
@@ -3818,7 +4041,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           undefined,
           nativeCacheCreation || undefined,
           nativeCacheRead || undefined,
+          nativeAgentFingerprint,
+          nativeExplicitAgentId,
+          nativeContentData,
         );
+
+        // Update agent cost now that we know the actual cost
+        if (nativeAgentFingerprint && nativeAgentFingerprint !== 'unknown') {
+          updateAgentCost(nativeAgentFingerprint, nativeCostUsd);
+        }
 
         // ── Post-request: budget spend + anomaly detection ──
         postRequestRecord(targetModel || requestedModel, nativeTokIn, nativeTokOut, nativeCostUsd);
@@ -3936,6 +4167,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     const isStreaming = request.stream === true;
+
+    // Extract agent fingerprint for chat/completions
+    const chatSystemPrompt = extractSystemPromptFromBody(request as unknown as Record<string, unknown>);
+    const chatExplicitAgentId = getHeaderValue(req, 'x-relayplane-agent') || undefined;
+    let chatAgentFingerprint: string | undefined;
+    if (chatSystemPrompt) {
+      const agentResult = trackAgent(chatSystemPrompt, 0, chatExplicitAgentId);
+      chatAgentFingerprint = agentResult.fingerprint;
+    }
 
     // ── Response Cache: check for cached response (chat/completions) ──
     const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
@@ -4266,6 +4506,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         complexity,
         chatCacheHash,
         chatCacheBypass,
+        chatAgentFingerprint,
+        chatExplicitAgentId,
       );
     } else {
       if (useCascade && cascadeConfig) {
@@ -4326,7 +4568,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const cascadeCacheCreation = cascadeUsage?.cache_creation_input_tokens || undefined;
           const cascadeCacheRead = cascadeUsage?.cache_read_input_tokens || undefined;
           const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut, cascadeCacheCreation, cascadeCacheRead);
-          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel, cascadeCacheCreation, cascadeCacheRead);
+          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel, cascadeCacheCreation, cascadeCacheRead, chatAgentFingerprint, chatExplicitAgentId);
+          if (chatAgentFingerprint && chatAgentFingerprint !== 'unknown') updateAgentCost(chatAgentFingerprint, cascadeCost);
 
           if (recordTelemetry) {
             try {
@@ -4389,7 +4632,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           log,
           cooldownManager,
           cooldownsEnabled,
-          complexity
+          complexity,
+          chatAgentFingerprint,
+          chatExplicitAgentId,
         );
       }
     }
@@ -4564,6 +4809,8 @@ async function handleStreamingRequest(
   complexity: Complexity = 'simple',
   cacheHash?: string,
   cacheBypass?: boolean,
+  agentFingerprint?: string,
+  agentId?: string,
 ): Promise<void> {
   let providerResponse: Response;
 
@@ -4733,7 +4980,8 @@ async function handleStreamingRequest(
   );
   // Update token/cost info on the history entry (with cache token discount)
   const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
-  updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost, undefined, streamCacheCreation || undefined, streamCacheRead || undefined);
+  updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost, undefined, streamCacheCreation || undefined, streamCacheRead || undefined, agentFingerprint, agentId);
+  if (agentFingerprint && agentFingerprint !== 'unknown') updateAgentCost(agentFingerprint, streamCost);
 
   // ── Post-request: budget spend + anomaly detection ──
   try {
@@ -4789,7 +5037,9 @@ async function handleNonStreamingRequest(
   log: (msg: string) => void,
   cooldownManager: CooldownManager,
   cooldownsEnabled: boolean,
-  complexity: Complexity = 'simple'
+  complexity: Complexity = 'simple',
+  agentFingerprint?: string,
+  agentId?: string,
 ): Promise<void> {
   let responseData: Record<string, unknown>;
 
@@ -4842,7 +5092,8 @@ async function handleNonStreamingRequest(
   const cacheCreationTokens = usage?.cache_creation_input_tokens ?? 0;
   const cacheReadTokens = usage?.cache_read_input_tokens ?? 0;
   const cost = estimateCost(targetModel, tokensIn, tokensOut, cacheCreationTokens || undefined, cacheReadTokens || undefined);
-  updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel, cacheCreationTokens || undefined, cacheReadTokens || undefined);
+  updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel, cacheCreationTokens || undefined, cacheReadTokens || undefined, agentFingerprint, agentId);
+  if (agentFingerprint && agentFingerprint !== 'unknown') updateAgentCost(agentFingerprint, cost);
 
   // ── Post-request: budget spend + anomaly detection ──
   try {
