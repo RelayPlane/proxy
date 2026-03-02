@@ -483,6 +483,10 @@ interface RequestContext {
   versionHeader?: string;
   /** x-api-key header from incoming request */
   apiKeyHeader?: string;
+  /** user-agent header from incoming request (needed for OAuth passthrough) */
+  userAgent?: string;
+  /** x-app header from incoming request (needed for OAuth passthrough) */
+  xApp?: string;
 }
 
 /**
@@ -539,6 +543,8 @@ interface RequestHistoryEntry {
   agentFingerprint?: string;
   agentId?: string;
   requestContent?: RequestContentData;
+  error?: string;
+  statusCode?: number;
 }
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
@@ -666,6 +672,8 @@ function logRequest(
   complexity?: string,
   agentFingerprint?: string,
   agentId?: string,
+  errorMessage?: string,
+  errorStatusCode?: number,
 ): void {
   const timestamp = new Date().toISOString();
   const status = success ? '✓' : '✗';
@@ -715,6 +723,8 @@ function logRequest(
     complexity: complexity || 'simple',
     agentFingerprint,
     agentId,
+    error: errorMessage,
+    statusCode: errorStatusCode,
   };
   requestHistory.push(entry);
   if (requestHistory.length > MAX_HISTORY) {
@@ -724,7 +734,7 @@ function logRequest(
 }
 
 /** Update the most recent history entry with token/cost info */
-function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number, agentFingerprint?: string, agentId?: string, requestContent?: RequestContentData): void {
+function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number, agentFingerprint?: string, agentId?: string, requestContent?: RequestContentData, errorMessage?: string, errorStatusCode?: number): void {
   if (requestHistory.length > 0) {
     const last = requestHistory[requestHistory.length - 1]!;
     last.tokensIn = tokensIn;
@@ -738,6 +748,8 @@ function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: nu
     if (agentFingerprint !== undefined) last.agentFingerprint = agentFingerprint;
     if (agentId !== undefined) last.agentId = agentId;
     if (requestContent) last.requestContent = requestContent;
+    if (errorMessage !== undefined) last.error = errorMessage;
+    if (errorStatusCode !== undefined) last.statusCode = errorStatusCode;
   }
 }
 
@@ -1120,23 +1132,21 @@ function buildAnthropicHeadersWithAuth(
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
 
-  // Auth: prefer incoming auth for passthrough, but OAuth doesn't work for all models (e.g. Haiku)
-  // When we have a regular API key AND incoming auth is OAuth, prefer the API key for rerouted requests
-  // because OAuth may not be supported on the target model. The API key works for ALL models.
-  const incomingIsOAuth = !!(ctx.apiKeyHeader?.startsWith('sk-ant-oat') || ctx.authHeader?.includes('sk-ant-oat'));
-  if (incomingIsOAuth && apiKey && !apiKey.startsWith('sk-ant-oat')) {
-    headers['x-api-key'] = apiKey;
-  } else if (ctx.authHeader) {
+  // Auth: ALWAYS prefer incoming auth for passthrough (don't replace it)
+  // Incoming auth is from Claude Code/OpenClaw and is already the right token for the request
+  if (ctx.authHeader) {
+    // Incoming Authorization header takes priority - use it as-is
     headers['Authorization'] = ctx.authHeader;
   } else if (ctx.apiKeyHeader) {
-    // MAX/OAuth tokens (sk-ant-oat*) must use Authorization: Bearer, not x-api-key
+    // Incoming x-api-key header
     if (ctx.apiKeyHeader.startsWith('sk-ant-oat')) {
+      // MAX/OAuth tokens must use Authorization: Bearer, not x-api-key
       headers['Authorization'] = `Bearer ${ctx.apiKeyHeader}`;
     } else {
       headers['x-api-key'] = ctx.apiKeyHeader;
     }
   } else if (apiKey) {
-    // MAX tokens (OAuth) use Authorization: Bearer, API keys use x-api-key
+    // Fallback to configured API key (only if no incoming auth)
     if (isMaxToken || apiKey.startsWith('sk-ant-oat')) {
       headers['Authorization'] = `Bearer ${apiKey}`;
     } else {
@@ -1147,6 +1157,14 @@ function buildAnthropicHeadersWithAuth(
   // Pass through beta headers
   if (ctx.betaHeaders) {
     headers['anthropic-beta'] = ctx.betaHeaders;
+  }
+
+  // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
+  if (ctx.userAgent) {
+    headers['user-agent'] = ctx.userAgent;
+  }
+  if (ctx.xApp) {
+    headers['x-app'] = ctx.xApp;
   }
 
   return headers;
@@ -1191,6 +1209,14 @@ function buildAnthropicHeaders(
   // Pass through beta headers (prompt caching, extended thinking, etc.)
   if (ctx.betaHeaders) {
     headers['anthropic-beta'] = ctx.betaHeaders;
+  }
+
+  // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
+  if (ctx.userAgent) {
+    headers['user-agent'] = ctx.userAgent;
+  }
+  if (ctx.xApp) {
+    headers['x-app'] = ctx.xApp;
   }
 
   return headers;
@@ -2359,6 +2385,24 @@ function checkResponseModelMismatch(
   return responseModel;
 }
 
+/**
+ * Extract a human-readable error message from a provider error payload.
+ * Handles Anthropic ({ error: { type, message } }) and OpenAI ({ error: { message } }) formats.
+ */
+function extractProviderErrorMessage(payload: Record<string, unknown>, statusCode?: number): string {
+  const err = payload['error'] as Record<string, unknown> | string | undefined;
+  if (typeof err === 'string') return err;
+  if (err && typeof err === 'object') {
+    const errType = err['type'] as string | undefined;
+    const errMsg = err['message'] as string | undefined;
+    if (errType && errMsg) return `${errType}: ${errMsg}`;
+    if (errMsg) return errMsg;
+    if (errType) return errType;
+  }
+  if (statusCode) return `HTTP ${statusCode}`;
+  return 'Unknown error';
+}
+
 class ProviderResponseError extends Error {
   status: number;
   payload: Record<string, unknown>;
@@ -2388,6 +2432,8 @@ function extractRequestContext(req: http.IncomingMessage): RequestContext {
     betaHeaders: req.headers['anthropic-beta'] as string | undefined,
     versionHeader: req.headers['anthropic-version'] as string | undefined,
     apiKeyHeader: req.headers['x-api-key'] as string | undefined,
+    userAgent: req.headers['user-agent'] as string | undefined,
+    xApp: req.headers['x-app'] as string | undefined,
   };
 }
 
@@ -2549,7 +2595,7 @@ async function cascadeRequest(
 function getDashboardHTML(): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Dashboard</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1200px;margin:0 auto}
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1600px;margin:0 auto}
 a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
 .header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
 .header .meta{font-size:.8rem;color:#64748b}
@@ -2557,13 +2603,18 @@ a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
 .card{background:#111318;border:1px solid #1e293b;border-radius:12px;padding:20px}
 .card .label{font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
 .card .value{font-size:1.75rem;font-weight:700}.green{color:#34d399}
+.tooltip-wrap{position:relative;display:inline-block}
+.tooltip-wrap .tooltip-box{visibility:hidden;opacity:0;background:#1e293b;color:#e2e8f0;font-size:.8rem;font-weight:400;text-transform:none;letter-spacing:0;line-height:1.5;border:1px solid #334155;border-radius:8px;padding:10px 14px;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:280px;z-index:999;pointer-events:none;transition:opacity .15s;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+.tooltip-wrap .tooltip-box::after{content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-bottom-color:#334155}
+.tooltip-wrap:hover .tooltip-box{visibility:visible;opacity:1}
+.info-icon{cursor:help;color:#64748b;font-size:.75rem;vertical-align:middle;margin-left:4px}
 table{width:100%;border-collapse:collapse;font-size:.85rem}
 th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
 td{padding:8px 12px;border-bottom:1px solid #111318}
 .section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.warn{background:#fbbf24}.dot.down{background:#ef4444}
 .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
-.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
+.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}.badge.err-auth{background:#2d0a0a;color:#ef4444}.badge.err-rate{background:#2d2a0a;color:#fbbf24}.badge.err-timeout{background:#2d1a0a;color:#fb923c}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
 .vstat{display:inline-flex;align-items:center;gap:6px;margin-left:8px;padding:1px 8px;border-radius:999px;border:1px solid #334155;font-size:.72rem}
@@ -2578,16 +2629,16 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
-  <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
+  <div class="card"><div class="label">Routing Savings <span class="tooltip-wrap"><span class="info-icon">ⓘ</span><span class="tooltip-box" id="savings-tooltip">Loading...</span></span></div><div class="value green" id="savings">—</div><div id="savings-detail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
 </div>
 <div class="section"><h2>Model Breakdown</h2>
-<table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<table><thead><tr><th>Provider</th><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Agent Cost Breakdown</h2>
 <table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
-<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<table><thead><tr><th>Time</th><th>Agent</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
 <script>
 const $ = id => document.getElementById(id);
 function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
@@ -2621,32 +2672,64 @@ async function load(){
     const total=stats.summary?.totalEvents||0;
     $('totalReq').textContent=total;
     $('totalCost').textContent='$'+fmt(stats.summary?.totalCostUsd??0,4);
-    $('savings').textContent=(sav.percentage??0)+'%';
+    const savAmt=sav.savedAmount??sav.savings??0;
+    const cacheSav=sav.cacheSavings??0;
+    const routeSav=sav.routingSavings??0;
+    const actual=sav.actualCost??0;
+    const hasAnthropic=sav.hasAnthropicCalls!==false;
+    const baseline=sav.potentialSavings??sav.total??0;
+    // Headline = routing savings % (RelayPlane's actual contribution)
+    const routeBaseline=baseline>0?baseline:1;
+    const routePct=hasAnthropic?Math.round((routeSav/routeBaseline)*100):0;
+    const totalPct=sav.percentage??0;
+    $('savings').textContent='$'+fmt(routeSav,2);
+    // Secondary: show total % including cache as context
+    if(hasAnthropic){
+      $('savings-detail').innerHTML='<span style="color:#60a5fa">routing savings</span> · <span style="color:#64748b" title="Includes Anthropic prompt cache hits which happen regardless of routing">'+totalPct+'% total incl. cache</span>';
+    } else {
+      $('savings-detail').innerHTML='<span style="color:#a78bfa">$'+fmt(cacheSav,2)+' cache</span> · <span style="color:#64748b">'+totalPct+'% total</span>';
+    }
+    const tipEl=$('savings-tooltip');
+    if(tipEl){
+      let tip='<strong>How savings are calculated</strong><br><br>';
+      if(hasAnthropic){
+        tip+='<span style="color:#60a5fa">🔀 Routing savings: $'+fmt(routeSav,2)+'</span><br><small>Requests routed to cheaper models (e.g. Sonnet) vs always using Opus. RelayPlane contribution.</small><br><br>';
+        tip+='<span style="color:#a78bfa">💾 Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Anthropic prompt cache hits (10× cheaper reads). This would happen without RelayPlane too.</small><br><br>';
+      } else {
+        tip+='<span style="color:#a78bfa">💾 Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Provider cache hits. Happens automatically, not specific to RelayPlane.</small><br><br>';
+      }
+      tip+='💳 Actual cost: <b>$'+fmt(actual,2)+'</b><br>✅ Total saved: <b>$'+fmt(savAmt,2)+'</b>';
+      tipEl.innerHTML=tip;
+    }
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(total>0?m.count/total*100:0,1)+'%</td></tr>'
-    ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
+      '<tr><td style="color:#94a3b8;font-size:.85rem">'+(m.provider||'—')+'</td><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(total>0?m.count/total*100:0,1)+'%</td></tr>'
+    ).join('')||'<tr><td colspan=5 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
     function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+    const agents=(agentsR.agents||[]).sort((a,b)=>(b.totalCost||0)-(a.totalCost||0));
     $('runs').innerHTML=(runsR.runs||[]).map((r,i)=>{
-      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')" title="Click to expand"><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
+      function errBadge(r){if(r.status==='success')return '<span class="badge ok">success</span>';var cls='err';var label=r.error||'error';if(r.statusCode===401||r.statusCode===403||(r.error&&/auth/i.test(r.error)))cls='err-auth';else if(r.statusCode===429||(r.error&&/rate.?limit/i.test(r.error)))cls='err-rate';else if(r.error&&/timeout/i.test(r.error))cls='err-timeout';return '<span class="badge '+cls+'" title="'+esc(r.error||'')+' (HTTP '+( r.statusCode||'?')+')">'+(r.statusCode?r.statusCode+' ':'')+ (label.length>40?label.slice(0,40)+'…':label)+'</span>';}
+      const agentName=agents.find(a=>a.fingerprint===r.agentFingerprint)?.name||(r.agentId||'—');
+      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')"><td><span id="arrow-'+i+'" style="color:#64748b;font-size:.7rem;margin-right:6px">▶</span>'+fmtTime(r.started_at)+'</td><td style="font-size:.85rem">'+esc(agentName)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+errBadge(r)+'</td></tr>';
       const c=r.requestContent||{};
-      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="11" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
+      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="12" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
       if(c.systemPrompt||c.userMessage||c.responsePreview){
         if(c.systemPrompt) detail+='<div style="color:#64748b;font-size:.85rem;margin-bottom:10px;font-style:italic"><strong style="color:#94a3b8">System:</strong> '+esc(c.systemPrompt)+'</div>';
         if(c.userMessage) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">User Message</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.userMessage)+'</div></div>';
         if(c.responsePreview) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">Response Preview</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.responsePreview)+'</div></div>';
-        detail+='<button onclick="event.stopPropagation();loadFullResponse(\''+r.id+'\','+i+')" id="full-btn-'+i+'" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:.8rem">Show full response</button><pre id="full-resp-'+i+'" style="display:none;white-space:pre-wrap;margin-top:10px;background:#0d0e11;border:1px solid #1e293b;border-radius:8px;padding:12px;max-height:400px;overflow:auto;font-size:.8rem"></pre>';
+        const btnAttrs='id="full-btn-'+i+'" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;font-size:.8rem"';
+        detail+=(r.tokensOut>0?'<button onclick="event.stopPropagation();loadFullResponse(&quot;'+r.id+'&quot;,'+i+')" '+btnAttrs+'>Show full response</button>':'<button disabled '+btnAttrs+' style="opacity:.4;cursor:default">Response not available (streaming)</button>')+'<pre id="full-resp-'+i+'" style="display:none;white-space:pre-wrap;margin-top:10px;background:#0d0e11;border:1px solid #1e293b;border-radius:8px;padding:12px;max-height:400px;overflow:auto;font-size:.8rem"></pre>';
       } else {
         detail+='<span style="color:#64748b">No content captured for this request</span>';
       }
       detail+='</td></tr>';
       return row+detail;
-    }).join('')||'<tr><td colspan=11 style="color:#64748b">No runs yet</td></tr>';
-    const agents=(agentsR.agents||[]).sort((a,b)=>(b.totalCost||0)-(a.totalCost||0));
+    }).join('')||'<tr><td colspan=12 style="color:#64748b">No runs yet</td></tr>';
+    restoreExpanded();
     $('agents').innerHTML=agents.length?agents.map(a=>
-      '<tr><td><span class="agent-name" data-fp="'+a.fingerprint+'">'+a.name+'</span> <button class="rename-btn" onclick="renameAgent(\''+a.fingerprint+'\',\''+a.name.replace(/'/g,"\\'")+'\')">✏️</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b" title="'+a.systemPromptPreview+'">'+a.fingerprint+'</td></tr>'
+      '<tr><td><span class="agent-name" data-fp="'+a.fingerprint+'">'+esc(a.name)+'</span> <button class="rename-btn" onclick="renameAgent(&quot;'+a.fingerprint+'&quot;,&quot;'+a.name.replace(/"/g,'')+'&quot;)">✏️</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b" title="'+esc(a.systemPromptPreview||'')+'">'+a.fingerprint+'</td></tr>'
     ).join(''):'<tr><td colspan=5 style="color:#64748b">No agents detected yet</td></tr>';
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const dotClass = p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
@@ -2661,7 +2744,9 @@ async function renameAgent(fp,currentName){
   await fetch('/api/agents/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp,name:name})});
   load();
 }
-function toggleDetail(i){var d=document.getElementById('run-detail-'+i);d.style.display=d.style.display==='none'?'table-row':'none'}
+const expandedRows=new Set();
+function toggleDetail(i){var d=document.getElementById('run-detail-'+i);var arrow=document.getElementById('arrow-'+i);if(d.style.display==='none'){d.style.display='table-row';expandedRows.add(i);if(arrow)arrow.textContent='▼'}else{d.style.display='none';expandedRows.delete(i);if(arrow)arrow.textContent='▶'}}
+function restoreExpanded(){expandedRows.forEach(i=>{var d=document.getElementById('run-detail-'+i);var arrow=document.getElementById('arrow-'+i);if(d)d.style.display='table-row';if(arrow)arrow.textContent='▼'})}
 async function loadFullResponse(runId,i){
   const btn=document.getElementById('full-btn-'+i);
   const pre=document.getElementById('full-resp-'+i);
@@ -2681,7 +2766,7 @@ load();setInterval(load,5000);
 function getConfigDashboardHTML(): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Config</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1200px;margin:0 auto}
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1600px;margin:0 auto}
 a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
 .header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
 .header .meta{font-size:.8rem;color:#64748b}
@@ -3185,11 +3270,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const cutoff = Date.now() - days * 86400000;
         const recent = requestHistory.filter(r => new Date(r.timestamp).getTime() >= cutoff);
         
-        // Model breakdown
-        const modelMap = new Map<string, { count: number; cost: number }>();
+        // Model breakdown (keyed by provider/model for disambiguation)
+        const modelMap = new Map<string, { count: number; cost: number; provider: string; model: string }>();
         for (const r of recent) {
-          const key = r.targetModel;
-          const cur = modelMap.get(key) || { count: 0, cost: 0 };
+          const key = `${r.provider || 'unknown'}/${r.targetModel}`;
+          const cur = modelMap.get(key) || { count: 0, cost: 0, provider: r.provider || 'unknown', model: r.targetModel };
           cur.count++;
           cur.cost += r.costUsd;
           modelMap.set(key, cur);
@@ -3215,7 +3300,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             avgLatencyMs: recent.length ? Math.round(totalLatency / recent.length) : 0,
             successRate: recent.length ? recent.filter(r => r.success).length / recent.length : 0,
           },
-          byModel: Array.from(modelMap.entries()).map(([model, v]) => ({ model, count: v.count, costUsd: v.cost, savings: 0 })),
+          byModel: Array.from(modelMap.entries()).map(([, v]) => ({ model: v.model, provider: v.provider, count: v.count, costUsd: v.cost, savings: 0 })),
           dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({ date, costUsd: v.cost, requests: v.requests })),
         };
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3254,6 +3339,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             cacheReadTokens: r.cacheReadTokens ?? 0,
             savings: Math.round(perRunSavings * 10000) / 10000,
             escalated: r.escalated,
+            error: r.error ?? null,
+            statusCode: r.statusCode ?? null,
+            agentFingerprint: r.agentFingerprint ?? null,
+            agentId: r.agentId ?? null,
             requestContent: r.requestContent ? {
               systemPrompt: r.requestContent.systemPrompt,
               userMessage: r.requestContent.userMessage,
@@ -3268,29 +3357,38 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       if (req.method === 'GET' && telemetryPath === 'savings') {
-        // Savings = cost if everything ran on Opus - actual cost
-        // Always compare against Opus as the baseline
-        const OPUS_BASELINE = 'claude-opus-4-6';
-        let totalOriginalCost = 0;
+        // Routing savings: cost at same model with no cache vs actual cost
+        // Cache savings: what cache hits saved vs paying full input price
+        // Baseline: each request at full input price (no cache, no routing)
         let totalActualCost = 0;
-        let totalSavedAmount = 0;
+        let totalCacheSavings = 0;   // savings from cache hits (Anthropic feature)
+        let totalRoutingSavings = 0; // savings from routing to cheaper model
+        let hasAnthropicCalls = false;
         const byDayMap = new Map<string, { savedAmount: number; originalCost: number; actualCost: number }>();
 
         for (const r of requestHistory) {
-          // Pass same cache tokens to baseline so savings only reflect routing decisions,
-          // not prompt-cache discounts (those happen regardless of which model is chosen).
-          const origCost = estimateCost(OPUS_BASELINE, r.tokensIn, r.tokensOut, r.cacheCreationTokens || undefined, r.cacheReadTokens || undefined);
           const actualCost = r.costUsd;
-          const saved = Math.max(0, origCost - actualCost);
-
-          totalOriginalCost += origCost;
           totalActualCost += actualCost;
-          totalSavedAmount += saved;
+
+          // Cache savings: full input price vs what was paid with cache
+          const fullInputCost = estimateCost(r.targetModel, r.tokensIn + (r.cacheCreationTokens||0) + (r.cacheReadTokens||0), r.tokensOut);
+          const cachedCost = r.costUsd;
+          const cacheSaved = Math.max(0, fullInputCost - cachedCost);
+          totalCacheSavings += cacheSaved;
+
+          // Routing savings: what would this request cost at full Opus price (no cache)
+          // vs what the routed model cost (no cache). Only meaningful for Anthropic.
+          if (r.provider === 'anthropic') {
+            hasAnthropicCalls = true;
+            const opusCost = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut);
+            const modelCost = estimateCost(r.targetModel, r.tokensIn, r.tokensOut);
+            const routingSaved = Math.max(0, opusCost - modelCost);
+            totalRoutingSavings += routingSaved;
+          }
 
           const date = r.timestamp.slice(0, 10);
           const day = byDayMap.get(date) || { savedAmount: 0, originalCost: 0, actualCost: 0 };
-          day.savedAmount += saved;
-          day.originalCost += origCost;
+          day.savedAmount += Math.max(0, totalCacheSavings + totalRoutingSavings);
           day.actualCost += actualCost;
           byDayMap.set(date, day);
         }
@@ -3304,16 +3402,19 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             actualCost: Math.round(v.actualCost * 10000) / 10000,
           }));
 
+        const totalSaved = totalCacheSavings + totalRoutingSavings;
+        const baseline = totalActualCost + totalSaved;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          total: Math.round(totalOriginalCost * 10000) / 10000,
           actualCost: Math.round(totalActualCost * 10000) / 10000,
-          savings: Math.round(totalSavedAmount * 10000) / 10000,
-          savedAmount: Math.round(totalSavedAmount * 10000) / 10000,
-          potentialSavings: Math.round(totalOriginalCost * 10000) / 10000,
-          percentage: totalOriginalCost > 0
-            ? Math.round((totalSavedAmount / totalOriginalCost) * 100)
-            : 0,
+          savedAmount: Math.round(totalSaved * 10000) / 10000,
+          savings: Math.round(totalSaved * 10000) / 10000,
+          cacheSavings: Math.round(totalCacheSavings * 10000) / 10000,
+          routingSavings: Math.round(totalRoutingSavings * 10000) / 10000,
+          hasAnthropicCalls,
+          potentialSavings: Math.round(baseline * 10000) / 10000,
+          total: Math.round(baseline * 10000) / 10000,
+          percentage: baseline > 0 ? Math.round((totalSaved / baseline) * 100) : 0,
           byDay,
         }));
         return;
@@ -3876,6 +3977,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
             }
             const durationMs = Date.now() - startTime;
+            const errMsg = extractProviderErrorMessage(errorPayload, providerResponse.status);
             logRequest(
               originalModel ?? 'unknown',
               targetModel || requestedModel,
@@ -3884,7 +3986,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               false,
               routingMode,
               undefined,
-              taskType, complexity
+              taskType, complexity,
+              undefined, undefined,
+              errMsg, providerResponse.status
             );
             res.writeHead(providerResponse.status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(errorPayload));
@@ -4071,6 +4175,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       } catch (err) {
         const durationMs = Date.now() - startTime;
+        let catchErrMsg: string;
+        let catchErrStatus: number;
+        if (err instanceof ProviderResponseError) {
+          catchErrMsg = extractProviderErrorMessage(err.payload, err.status);
+          catchErrStatus = err.status;
+        } else {
+          catchErrMsg = err instanceof Error ? err.message : String(err);
+          catchErrStatus = 500;
+        }
         logRequest(
           originalModel ?? 'unknown',
           targetModel || requestedModel,
@@ -4079,7 +4192,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           false,
           routingMode,
           undefined,
-          taskType, complexity
+          taskType, complexity,
+          undefined, undefined,
+          catchErrMsg, catchErrStatus
         );
         if (err instanceof ProviderResponseError) {
           res.writeHead(err.status, { 'Content-Type': 'application/json' });
@@ -4604,7 +4719,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           res.end(JSON.stringify(responseData));
         } catch (err) {
           const durationMs = Date.now() - startTime;
-          logRequest(originalRequestedModel ?? 'unknown', targetModel || 'unknown', targetProvider, durationMs, false, 'cascade', undefined, taskType, complexity);
+          let cascadeErrMsg: string;
+          let cascadeErrStatus: number;
+          if (err instanceof ProviderResponseError) {
+            cascadeErrMsg = extractProviderErrorMessage(err.payload, err.status);
+            cascadeErrStatus = err.status;
+          } else {
+            cascadeErrMsg = err instanceof Error ? err.message : String(err);
+            cascadeErrStatus = 500;
+          }
+          logRequest(originalRequestedModel ?? 'unknown', targetModel || 'unknown', targetProvider, durationMs, false, 'cascade', undefined, taskType, complexity, undefined, undefined, cascadeErrMsg, cascadeErrStatus);
           if (err instanceof ProviderResponseError) {
             res.writeHead(err.status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(err.payload));
@@ -4834,12 +4958,13 @@ async function handleStreamingRequest(
     }
 
     if (!providerResponse.ok) {
-      const errorData = await providerResponse.json();
+      const errorData = await providerResponse.json() as Record<string, unknown>;
       if (cooldownsEnabled) {
         cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData));
       }
       const durationMs = Date.now() - startTime;
-      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
+      const streamErrMsg = extractProviderErrorMessage(errorData, providerResponse.status);
+      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, undefined, undefined, streamErrMsg, providerResponse.status);
       res.writeHead(providerResponse.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(errorData));
       return;
@@ -4850,7 +4975,7 @@ async function handleStreamingRequest(
       cooldownManager.recordFailure(targetProvider, errorMsg);
     }
     const durationMs = Date.now() - startTime;
-    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
+    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, undefined, undefined, errorMsg, 500);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
     return;
@@ -5057,7 +5182,8 @@ async function handleNonStreamingRequest(
         cooldownManager.recordFailure(targetProvider, JSON.stringify(responseData));
       }
       const durationMs = Date.now() - startTime;
-      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
+      const nsErrMsg = extractProviderErrorMessage(responseData, result.status);
+      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, undefined, undefined, nsErrMsg, result.status);
       res.writeHead(result.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(responseData));
       return;
@@ -5068,7 +5194,7 @@ async function handleNonStreamingRequest(
       cooldownManager.recordFailure(targetProvider, errorMsg);
     }
     const durationMs = Date.now() - startTime;
-    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
+    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, undefined, undefined, errorMsg, 500);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
     return;
