@@ -2638,7 +2638,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div><div id="avgLatDetail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
 </div>
 <div class="section collapsible collapsed"><h2>Model Breakdown <span style="font-size:.75rem;color:#64748b;font-weight:400">(7d window, history-capped)</span></h2>
-<table><thead><tr><th>Provider</th><th>Model</th><th>Requests</th><th>Cost</th><th>% of 7d Window</th></tr></thead><tbody id="models"></tbody></table></div>
+<table><thead><tr><th>Provider</th><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total Cost</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section collapsible collapsed"><h2>Agent Cost Breakdown</h2>
 <table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
@@ -2714,8 +2714,9 @@ async function load(){
     }
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
     $('avgLatDetail').textContent='7d window metric (history-capped)';
+    const modelTotalCost=(stats.byModel||[]).reduce((s,m)=>s+(m.costUsd||0),0);
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td style="color:#94a3b8;font-size:.85rem">'+(m.provider||'—')+'</td><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(historyTotal>0?m.count/historyTotal*100:0,1)+'%</td></tr>'
+      '<tr><td style="color:#94a3b8;font-size:.85rem">'+(m.provider||'—')+'</td><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(modelTotalCost>0?m.costUsd/modelTotalCost*100:0,1)+'%</td></tr>'
     ).join('')||'<tr><td colspan=5 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
