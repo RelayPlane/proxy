@@ -271,9 +271,10 @@ Use your Anthropic MAX subscription token for expensive models (Opus) while usin
 
 **How it works:**
 
-- When a request targets a model matching any pattern in `useMaxForModels`, the proxy uses `anthropicMaxToken` with `Authorization: Bearer` header (OAuth-style)
+- When a request targets a model matching any pattern in `useMaxForModels`, the proxy uses `anthropicMaxToken` via `x-api-key` header
 - All other Anthropic requests use the standard `ANTHROPIC_API_KEY` env var with `x-api-key` header
-- Pattern matching is case-insensitive substring match — `"opus"` matches `claude-opus-4-20250514`
+- Pattern matching is case-insensitive substring match, so `"opus"` matches `claude-opus-4-20250514`
+- Both `sk-ant-api*` and `sk-ant-oat*` tokens are sent as `x-api-key` (Anthropic accepts all token types via this header)
 
 Set your standard key in the environment as usual:
 
@@ -356,11 +357,66 @@ When content logging is enabled, the dashboard stores and displays:
 
 This makes it easy to correlate a cost spike with the actual request that caused it. Content is stored locally only — nothing is sent to RelayPlane servers.
 
-### OAuth Passthrough (Claude Max / OpenClaw Users)
+### Auth Passthrough (Claude Max / OpenClaw Users)
 
-If you use a Claude Max subscription via OAuth (e.g., through OpenClaw's browser relay), RelayPlane now correctly forwards the `user-agent` and `x-app` headers required by Anthropic's OAuth endpoint. Without this fix, Max subscription tokens would fail authentication when proxied.
+If you use a Claude Max subscription (tokens starting with `sk-ant-oat*`), the proxy handles them correctly via the `x-api-key` header. No special configuration needed. The proxy also forwards `user-agent` and `x-app` headers required by Anthropic for subscription validation.
 
-No configuration needed — the proxy detects OAuth-style requests and preserves the necessary headers automatically.
+**Important:** All Anthropic token types (`sk-ant-api*` and `sk-ant-oat*`) are sent via `x-api-key`. The proxy does not use `Authorization: Bearer` for Anthropic requests.
+
+## OpenClaw Integration
+
+The simplest way to use RelayPlane with OpenClaw is to point the Anthropic provider at the proxy. This routes all Anthropic model requests through RelayPlane transparently, with no changes to model names or agent configs.
+
+### Setup
+
+1. Install and start the proxy:
+
+```bash
+npm install -g @relayplane/proxy
+relayplane init
+relayplane start
+```
+
+2. Point OpenClaw's Anthropic provider at the proxy:
+
+```bash
+openclaw config set models.providers.anthropic.baseUrl http://localhost:4100
+```
+
+That's it. All `anthropic/*` model requests now flow through RelayPlane. Your existing model names (`anthropic/claude-sonnet-4-6`, `anthropic/claude-opus-4-6`) work unchanged.
+
+### What you get
+
+- **Cost tracking** per agent, per model, per day
+- **Complexity-based routing** (e.g., simple tasks use Sonnet, complex tasks use Opus)
+- **Budget enforcement** with automatic downgrades
+- **Dashboard** at http://localhost:4100
+
+### Complexity routing example
+
+Configure the proxy to automatically route simple tasks to Sonnet and complex tasks to Opus:
+
+```json
+{
+  "routing": {
+    "mode": "complexity",
+    "complexity": {
+      "enabled": true,
+      "simple": "claude-sonnet-4-6",
+      "moderate": "claude-sonnet-4-6",
+      "complex": "claude-opus-4-6"
+    }
+  }
+}
+```
+
+OpenClaw agents request whatever model they're configured with. The proxy classifies the task and routes accordingly. No agent config changes needed.
+
+### Auth
+
+The proxy passes through whatever API key OpenClaw sends. If you use a MAX subscription, OpenClaw sends your `sk-ant-oat*` token and the proxy forwards it directly to Anthropic. No extra auth configuration in the proxy is needed for passthrough mode.
+
+For hybrid auth (MAX token for expensive models, standard key for cheap ones), see [Hybrid Auth](#hybrid-auth).
 
 ### API Endpoints
 
