@@ -1174,8 +1174,10 @@ function getAuthForModel(
 
 /**
  * Build Anthropic headers with hybrid auth support
- * MAX tokens (sk-ant-oat*) use Authorization: Bearer header
- * API keys (sk-ant-api*) use x-api-key header
+ * 
+ * All Anthropic token types (sk-ant-api*, sk-ant-oat*) work via x-api-key header.
+ * The Bearer header approach was incorrectly assumed for oat tokens but Anthropic
+ * rejects it with "OAuth authentication is currently not supported."
  */
 function buildAnthropicHeadersWithAuth(
   ctx: RequestContext,
@@ -1188,32 +1190,18 @@ function buildAnthropicHeadersWithAuth(
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
 
-  // Detect if incoming auth is OAuth (sk-ant-oat*)
-  const incomingIsOAuth = ctx.apiKeyHeader?.startsWith('sk-ant-oat') || ctx.authHeader?.includes('sk-ant-oat');
-  const apiKeyIsRegular = apiKey && apiKey.startsWith('sk-ant-api');
-
-  // When rerouted (auto mode changed the model) and incoming is OAuth,
-  // prefer the regular API key — OAuth doesn't work for all models (e.g. Haiku)
-  if (isRerouted && incomingIsOAuth && apiKeyIsRegular) {
-    headers['x-api-key'] = apiKey;
-  } else if (ctx.authHeader) {
-    // Incoming Authorization header takes priority - use it as-is
-    headers['Authorization'] = ctx.authHeader;
+  // Auth priority: incoming auth (passthrough) > configured API key > env key
+  // All Anthropic tokens use x-api-key header (including sk-ant-oat* MAX tokens)
+  if (ctx.authHeader) {
+    // Extract token from "Bearer <token>" and send as x-api-key
+    const token = ctx.authHeader.replace(/^Bearer\s+/i, '');
+    headers['x-api-key'] = token;
   } else if (ctx.apiKeyHeader) {
-    // Incoming x-api-key header
-    if (ctx.apiKeyHeader.startsWith('sk-ant-oat')) {
-      // MAX/OAuth tokens must use Authorization: Bearer, not x-api-key
-      headers['Authorization'] = `Bearer ${ctx.apiKeyHeader}`;
-    } else {
-      headers['x-api-key'] = ctx.apiKeyHeader;
-    }
+    // Incoming x-api-key header — pass through as-is
+    headers['x-api-key'] = ctx.apiKeyHeader;
   } else if (apiKey) {
-    // Fallback to configured API key (only if no incoming auth)
-    if (isMaxToken || apiKey.startsWith('sk-ant-oat')) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
-    } else {
-      headers['x-api-key'] = apiKey;
-    }
+    // Fallback to configured API key
+    headers['x-api-key'] = apiKey;
   }
 
   // Pass through beta headers
@@ -1250,16 +1238,11 @@ function buildAnthropicHeaders(
   };
 
   // Auth: prefer incoming auth for passthrough, fallback to env
+  // All Anthropic tokens use x-api-key (including sk-ant-oat* MAX tokens)
   if (ctx.authHeader) {
-    // Extract the token from "Bearer <token>"
+    // Extract token from "Bearer <token>" and send as x-api-key
     const token = ctx.authHeader.replace(/^Bearer\s+/i, '');
-    // MAX tokens (sk-ant-oat*) use Authorization: Bearer, API keys use x-api-key
-    if (token.startsWith('sk-ant-oat')) {
-      headers['Authorization'] = ctx.authHeader;
-    } else {
-      // Regular API keys should use x-api-key header
-      headers['x-api-key'] = token;
-    }
+    headers['x-api-key'] = token;
   } else if (ctx.apiKeyHeader) {
     // Direct x-api-key header
     headers['x-api-key'] = ctx.apiKeyHeader;
