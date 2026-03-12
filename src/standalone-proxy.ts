@@ -69,6 +69,15 @@ import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptF
 import { getVersionStatus } from './utils/version-status.js';
 import { initNudge, checkAndShowNudge } from './signup-nudge.js';
 import { initStarNudge, checkAndShowStarNudge } from './star-nudge.js';
+import { handleEstimateRequest, checkEstimateRateLimit, purgeExpiredRateLimitEntries, type EstimateRateLimitEntry } from './estimate.js';
+
+// Per-IP rate limit state for /v1/estimate (60 req/min per IP)
+const estimateRateMap = new Map<string, EstimateRateLimitEntry>();
+
+// Fix A: Purge expired rate-limit entries every 5 minutes to prevent memory leak.
+// Without this, IPs that make one request and disappear stay in the map forever.
+setInterval(() => purgeExpiredRateLimitEntries(estimateRateMap, Date.now()), 5 * 60 * 1000);
+
 const PROXY_VERSION: string = (() => {
   try {
     const pkgPath = path.join(__dirname, '..', 'package.json');
@@ -4637,6 +4646,42 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === Pre-flight cost estimation endpoint (Pro-tier) ===
+    if (req.method === 'POST' && (url === '/v1/estimate' || url.endsWith('/v1/estimate'))) {
+      log('Pre-flight estimate request');
+
+      // --- Per-IP rate limit: 60 requests/minute ---
+      // Fix B: Use only the raw socket address — never x-forwarded-for.
+      // x-forwarded-for is a client-controlled header and is trivially spoofed;
+      // any attacker can send "X-Forwarded-For: 1.2.3.4" to bypass per-IP limits.
+      // The socket remoteAddress reflects the actual TCP connection and cannot be faked.
+      const clientIp = req.socket?.remoteAddress ?? 'unknown';
+      const now = Date.now();
+      // Fix C: Delegate rate limit logic to the testable checkEstimateRateLimit() function
+      // (extracted in estimate.ts so it can be unit-tested in isolation).
+      const rateLimitResult = checkEstimateRateLimit(estimateRateMap, clientIp, now);
+      if (!rateLimitResult.allowed) {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+        res.end(JSON.stringify({ error: 'rate_limit_exceeded', message: 'Too many estimate requests. Limit: 60/minute.' }));
+        return;
+      }
+
+      // --- Read body with size limit (uses existing MAX_BODY_SIZE helper) ---
+      let body: string;
+      try {
+        body = await readRequestBody(req);
+      } catch (err) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'payload_too_large', message: 'Request body too large (max 10MB)' }));
+        return;
+      }
+
+      const result = handleEstimateRequest(body);
+      res.writeHead(result.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result.body));
+      return;
+    }
+
     // === Token counting endpoint ===
     if (req.method === 'POST' && url.includes('/v1/messages/count_tokens')) {
       log('Token count request');
@@ -4691,7 +4736,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // === OpenAI-compatible /v1/chat/completions endpoint ===
     if (req.method !== 'POST' || !url.includes('/chat/completions')) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found. Supported: POST /v1/messages, POST /v1/chat/completions, GET /v1/models' }));
+      res.end(JSON.stringify({ error: 'Not found. Supported: POST /v1/messages, POST /v1/chat/completions, POST /v1/estimate, GET /v1/models' }));
       return;
     }
 

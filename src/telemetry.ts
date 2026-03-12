@@ -129,7 +129,7 @@ export function inferTaskType(
  * Estimate cost based on model and token counts
  * Pricing as of 2024 (USD per 1M tokens)
  */
-const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
   // Anthropic — versioned IDs
   'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },

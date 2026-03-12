@@ -101,6 +101,23 @@ export type {
 // Re-export core types
 export type { Provider, TaskType } from '@relayplane/core';
 
+// Adaptive Provider Recovery (Phase 1)
+export {
+  RecoveryEngine,
+  RecoveryPatternStore,
+  FailureObserver,
+  PatternApplicator,
+} from './recovery.js';
+export type {
+  RecoveryConfig,
+  RecoveryPattern,
+  RecoveryPatternType,
+  RecoveryResult,
+  RecoveryEvent,
+  FailureContext,
+  RequestOverrides,
+} from './recovery.js';
+
 // Advanced proxy server (requires @relayplane/ledger, @relayplane/auth-gate, etc.)
 export { ProxyServer, createProxyServer, createSandboxedProxyServer } from './server.js';
 export type { ProxyServerConfig } from './server.js';

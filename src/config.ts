@@ -134,10 +134,29 @@ export interface ProxyConfig {
 }
 
 const CONFIG_VERSION = 1;
-const CONFIG_DIR = path.join(os.homedir(), '.relayplane');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const CONFIG_BACKUP = path.join(CONFIG_DIR, 'config.json.bak');
-const CONFIG_TMP = path.join(CONFIG_DIR, 'config.json.tmp');
+
+/**
+ * Resolve the base RelayPlane config directory.
+ * Supports RELAYPLANE_HOME_OVERRIDE env var for dev/test isolation
+ * (e.g. RELAYPLANE_HOME_OVERRIDE=/root → uses /root/.relayplane/).
+ * Also supports RELAYPLANE_CONFIG_PATH for a fully custom config file path.
+ */
+function resolveConfigDir(): string {
+  const homeOverride = process.env['RELAYPLANE_HOME_OVERRIDE'];
+  const base = homeOverride ?? os.homedir();
+  return path.join(base, '.relayplane');
+}
+
+function resolveConfigFilePath(): string {
+  const customPath = process.env['RELAYPLANE_CONFIG_PATH'];
+  if (customPath && customPath.trim()) return customPath;
+  return path.join(resolveConfigDir(), 'config.json');
+}
+
+const CONFIG_DIR = resolveConfigDir();
+const CONFIG_FILE = resolveConfigFilePath();
+const CONFIG_BACKUP = CONFIG_FILE + '.bak';
+const CONFIG_TMP = CONFIG_FILE + '.tmp';
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, 'credentials.json');
 
 /**
