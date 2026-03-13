@@ -1241,11 +1241,27 @@ function getAuthForModel(
 }
 
 /**
+ * Set Anthropic auth header for a token.
+ * OAT tokens (sk-ant-oat*) require Authorization: Bearer + oauth beta header.
+ * Standard API keys use x-api-key.
+ */
+function setAnthropicAuth(headers: Record<string, string>, token: string): void {
+  if (token.startsWith('sk-ant-oat')) {
+    headers['Authorization'] = `Bearer ${token}`;
+    const existing = headers['anthropic-beta'];
+    const oauthBeta = 'oauth-2025-04-20';
+    if (!existing) {
+      headers['anthropic-beta'] = oauthBeta;
+    } else if (!existing.includes(oauthBeta)) {
+      headers['anthropic-beta'] = `${existing},${oauthBeta}`;
+    }
+  } else {
+    headers['x-api-key'] = token;
+  }
+}
+
+/**
  * Build Anthropic headers with hybrid auth support
- * 
- * All Anthropic token types (sk-ant-api*, sk-ant-oat*) work via x-api-key header.
- * The Bearer header approach was incorrectly assumed for oat tokens but Anthropic
- * rejects it with "OAuth authentication is currently not supported."
  */
 function buildAnthropicHeadersWithAuth(
   ctx: RequestContext,
@@ -1259,22 +1275,23 @@ function buildAnthropicHeadersWithAuth(
   };
 
   // Auth priority: incoming auth (passthrough) > configured API key > env key
-  // All Anthropic tokens use x-api-key header (including sk-ant-oat* MAX tokens)
   if (ctx.authHeader) {
-    // Extract token from "Bearer <token>" and send as x-api-key
     const token = ctx.authHeader.replace(/^Bearer\s+/i, '');
-    headers['x-api-key'] = token;
+    setAnthropicAuth(headers, token);
   } else if (ctx.apiKeyHeader) {
-    // Incoming x-api-key header — pass through as-is
-    headers['x-api-key'] = ctx.apiKeyHeader;
+    setAnthropicAuth(headers, ctx.apiKeyHeader);
   } else if (apiKey) {
-    // Fallback to configured API key
-    headers['x-api-key'] = apiKey;
+    setAnthropicAuth(headers, apiKey);
   }
 
   // Pass through beta headers
   if (ctx.betaHeaders) {
-    headers['anthropic-beta'] = ctx.betaHeaders;
+    const existing = headers['anthropic-beta'];
+    if (!existing) {
+      headers['anthropic-beta'] = ctx.betaHeaders;
+    } else if (!existing.includes(ctx.betaHeaders)) {
+      headers['anthropic-beta'] = `${existing},${ctx.betaHeaders}`;
+    }
   }
 
   // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
@@ -1290,11 +1307,6 @@ function buildAnthropicHeadersWithAuth(
 
 /**
  * Build Anthropic headers with auth passthrough support
- * 
- * Auth priority:
- * 1. Incoming Authorization header (Bearer token from Claude Code OAuth)
- * 2. Incoming x-api-key header 
- * 3. ANTHROPIC_API_KEY env var (or MAX token for Opus models)
  */
 function buildAnthropicHeaders(
   ctx: RequestContext,
@@ -1305,23 +1317,24 @@ function buildAnthropicHeaders(
     'anthropic-version': ctx.versionHeader || '2023-06-01',
   };
 
-  // Auth: prefer incoming auth for passthrough, fallback to env
-  // All Anthropic tokens use x-api-key (including sk-ant-oat* MAX tokens)
+  // Auth priority: incoming auth > x-api-key header > env key
   if (ctx.authHeader) {
-    // Extract token from "Bearer <token>" and send as x-api-key
     const token = ctx.authHeader.replace(/^Bearer\s+/i, '');
-    headers['x-api-key'] = token;
+    setAnthropicAuth(headers, token);
   } else if (ctx.apiKeyHeader) {
-    // Direct x-api-key header
-    headers['x-api-key'] = ctx.apiKeyHeader;
+    setAnthropicAuth(headers, ctx.apiKeyHeader);
   } else if (envApiKey) {
-    // Fallback to env var
-    headers['x-api-key'] = envApiKey;
+    setAnthropicAuth(headers, envApiKey);
   }
 
-  // Pass through beta headers (prompt caching, extended thinking, etc.)
+  // Pass through beta headers
   if (ctx.betaHeaders) {
-    headers['anthropic-beta'] = ctx.betaHeaders;
+    const existing = headers['anthropic-beta'];
+    if (!existing) {
+      headers['anthropic-beta'] = ctx.betaHeaders;
+    } else if (!existing.includes(ctx.betaHeaders)) {
+      headers['anthropic-beta'] = `${existing},${ctx.betaHeaders}`;
+    }
   }
 
   // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
