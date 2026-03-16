@@ -806,8 +806,11 @@ function logRequest(
   const timestamp = new Date().toISOString();
   const status = success ? '✓' : '✗';
   const escalateTag = escalated ? ' [ESCALATED]' : '';
+  const routingTag = mode === 'passthrough'
+    ? '(forwarded)'
+    : `(RelayPlane routed → ${mode})`;
   console.log(
-    `[RelayPlane] ${timestamp} ${status} ${originalModel} → ${provider}/${targetModel} (${mode}) ${latencyMs}ms${escalateTag}`
+    `[RelayPlane] ${timestamp} ${status} ${originalModel} → ${provider}/${targetModel} ${routingTag} ${latencyMs}ms${escalateTag}`
   );
   
   // Update stats
@@ -5105,9 +5108,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       targetProvider = proxyConfig.defaultProvider as Provider;
       // When routing to OpenRouter (or any aggregator), model names need provider prefixes.
       // Complexity routing produces bare names like 'claude-sonnet-4-6' — OpenRouter needs
-      // 'anthropic/claude-sonnet-4-6'. Passthrough mode preserves the original request model.
+      // 'anthropic/claude-sonnet-4-6'. Passthrough mode preserves the original request model,
+      // but strips any leading provider-prefix that matches the defaultProvider
+      // (e.g. "openrouter/anthropic/claude-opus-4.6" → "anthropic/claude-opus-4.6").
       if (routingMode === 'passthrough') {
-        targetModel = requestedModel;
+        const dpPrefix = (proxyConfig.defaultProvider as string) + '/';
+        targetModel = requestedModel.startsWith(dpPrefix)
+          ? requestedModel.slice(dpPrefix.length)
+          : requestedModel;
       } else {
         // Add provider prefix for bare model names when routing to an aggregator
         targetModel = addProviderPrefix(targetModel, originalProvider);
