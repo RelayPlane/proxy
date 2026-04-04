@@ -95,6 +95,14 @@ const PROXY_VERSION: string = (() => {
   }
 })();
 
+/** Returns true when the model is a Haiku variant (does not support extended thinking) */
+function isHaikuModel(model: string): boolean {
+  return model.includes('haiku');
+}
+
+/** Beta flags that OAT tokens (sk-ant-oat*) do not support */
+const OAT_UNSUPPORTED_BETA_FLAGS = new Set(['max-tokens-3-5-sonnet-2025-04-14']);
+
 let latestProxyVersionCache: { value: string | null; checkedAt: number } = { value: null, checkedAt: 0 };
 const LATEST_PROXY_VERSION_TTL_MS = 30 * 60 * 1000;
 
@@ -1528,6 +1536,23 @@ function buildAnthropicHeadersWithAuth(
     }
   }
 
+  // Strip beta flags unsupported by OAT tokens
+  if (headers['anthropic-beta']) {
+    const token = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? apiKey ?? '';
+    if (token.startsWith('sk-ant-oat')) {
+      const cleaned = headers['anthropic-beta']
+        .split(',')
+        .map(b => b.trim())
+        .filter(b => !OAT_UNSUPPORTED_BETA_FLAGS.has(b))
+        .join(',');
+      if (cleaned) {
+        headers['anthropic-beta'] = cleaned;
+      } else {
+        delete headers['anthropic-beta'];
+      }
+    }
+  }
+
   // Pass through OAuth identity headers (required by Anthropic for OAuth token validation)
   if (ctx.userAgent) {
     headers['user-agent'] = ctx.userAgent;
@@ -1568,6 +1593,23 @@ function buildAnthropicHeaders(
       headers['anthropic-beta'] = ctx.betaHeaders;
     } else if (!existing.includes(ctx.betaHeaders)) {
       headers['anthropic-beta'] = `${existing},${ctx.betaHeaders}`;
+    }
+  }
+
+  // Strip beta flags unsupported by OAT tokens
+  if (headers['anthropic-beta']) {
+    const token = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? envApiKey ?? '';
+    if (token.startsWith('sk-ant-oat')) {
+      const cleaned = headers['anthropic-beta']
+        .split(',')
+        .map(b => b.trim())
+        .filter(b => !OAT_UNSUPPORTED_BETA_FLAGS.has(b))
+        .join(',');
+      if (cleaned) {
+        headers['anthropic-beta'] = cleaned;
+      } else {
+        delete headers['anthropic-beta'];
+      }
     }
   }
 
@@ -5504,6 +5546,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       const startTime = Date.now();
       let nativeResponseData: Record<string, unknown> | undefined;
+      let _strippedThinking = false;
+      let _strippedBetaFlags: string[] = [];
 
       try {
         if (useCascade && cascadeConfig) {
@@ -5520,11 +5564,26 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (proxyConfig.reliability?.cooldowns?.enabled && !cooldownManager.isAvailable(resolved.provider)) {
                 throw new CooldownError(resolved.provider);
               }
-              const attemptBody = { ...requestBody, model: resolved.model };
+              let attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
+              if (isHaikuModel(resolved.model) && 'thinking' in attemptBody) {
+                const { thinking: _t, ...rest } = attemptBody;
+                attemptBody = rest;
+                _strippedThinking = true;
+                log(`Stripped thinking from Haiku request (${resolved.model} does not support extended thinking)`);
+              }
               // Hybrid auth: use MAX token for Opus models, API key for others
               const modelAuth = getAuthForModel(resolved.model, proxyConfig.auth, useAnthropicEnvKey);
               if (modelAuth.isMax) {
                 log(`Using MAX token for ${resolved.model}`);
+              }
+              // Log OAT beta flag stripping if applicable
+              const cascadeEffectiveToken = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? modelAuth.apiKey ?? '';
+              const cascadeLocalStrippedBeta = cascadeEffectiveToken.startsWith('sk-ant-oat') && ctx.betaHeaders
+                ? ctx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
+                : [];
+              if (cascadeLocalStrippedBeta.length > 0) {
+                _strippedBetaFlags = cascadeLocalStrippedBeta;
+                log(`Stripped OAT-unsupported beta flags from request: ${cascadeLocalStrippedBeta.join(', ')}`);
               }
               const isCascadeRerouted = resolved.model !== originalModel;
               const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
@@ -5547,7 +5606,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const cascadeRpHeaders = buildRelayPlaneResponseHeaders(
             cascadeResult.model, originalModel ?? 'unknown', complexity, cascadeResult.provider, 'cascade'
           );
-          res.writeHead(200, { 'Content-Type': 'application/json', ...cascadeRpHeaders });
+          const cascadeStrippedRpHeaders: Record<string, string> = {};
+          if (_strippedThinking) cascadeStrippedRpHeaders['X-RelayPlane-Stripped-Thinking'] = 'true';
+          if (_strippedBetaFlags.length > 0) cascadeStrippedRpHeaders['X-RelayPlane-Stripped-Beta'] = _strippedBetaFlags.join(',');
+          res.writeHead(200, { 'Content-Type': 'application/json', ...cascadeRpHeaders, ...cascadeStrippedRpHeaders });
           res.end(JSON.stringify(cascadeResult.responseData));
           targetProvider = cascadeResult.provider;
           targetModel = cascadeResult.model;
@@ -5569,8 +5631,31 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             ? { ...effectiveCtx, authHeader: undefined, apiKeyHeader: undefined }
             : effectiveCtx;
 
+          // Strip thinking from body for Haiku models (does not support extended thinking)
+          let _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
+          if (isHaikuModel(finalModel) && 'thinking' in _nativeReqBody) {
+            const { thinking: _t, ...rest } = _nativeReqBody;
+            _nativeReqBody = rest;
+            _strippedThinking = true;
+            log(`Stripped thinking from Haiku request (${finalModel} does not support extended thinking)`);
+          }
+
+          // Log OAT beta flag stripping if applicable
+          const _nativeEffectiveToken = _poolSelectedToken
+            || effectiveCtx.authHeader?.replace(/^Bearer\s+/i, '')
+            || effectiveCtx.apiKeyHeader
+            || modelAuth.apiKey
+            || '';
+          const _nativeStrippedBeta = _nativeEffectiveToken.startsWith('sk-ant-oat') && effectiveCtx.betaHeaders
+            ? effectiveCtx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
+            : [];
+          if (_nativeStrippedBeta.length > 0) {
+            _strippedBetaFlags = _nativeStrippedBeta;
+            log(`Stripped OAT-unsupported beta flags from request: ${_nativeStrippedBeta.join(', ')}`);
+          }
+
           let providerResponse = await forwardNativeAnthropicRequest(
-            { ...requestBody, model: finalModel },
+            _nativeReqBody,
             _nativeReqCtx,
             modelAuth.apiKey,
             modelAuth.isMax,
@@ -5591,7 +5676,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               _poolSelectedToken = _nextPoolToken.apiKey;
               const _retryCtx: RequestContext = { ...ctx, authHeader: undefined, apiKeyHeader: undefined };
               providerResponse = await forwardNativeAnthropicRequest(
-                { ...requestBody, model: finalModel },
+                _nativeReqBody,
                 _retryCtx,
                 _nextPoolToken.apiKey,
                 _nextPoolToken.isOat,
@@ -5705,6 +5790,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const nativeStreamRpHeaders = buildRelayPlaneResponseHeaders(
               targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
             );
+            const nativeStreamStrippedHeaders: Record<string, string> = {};
+            if (_strippedThinking) nativeStreamStrippedHeaders['X-RelayPlane-Stripped-Thinking'] = 'true';
+            if (_strippedBetaFlags.length > 0) nativeStreamStrippedHeaders['X-RelayPlane-Stripped-Beta'] = _strippedBetaFlags.join(',');
             res.writeHead(providerResponse.status, {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
@@ -5713,6 +5801,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               'X-Relay-Trace-Id': nativeTraceId,
               'X-Relay-Memory-Hits': String(countAtomsForSession(nativeSessionId)),
               ...nativeStreamRpHeaders,
+              ...nativeStreamStrippedHeaders,
             });
             const reader = providerResponse.body?.getReader();
             let streamTokensIn = 0;
@@ -5803,7 +5892,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               });
               log(`Cache STORE for ${targetModel || requestedModel} (hash: ${cacheHash.slice(0, 8)})`);
             }
-            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': nativeCacheHeader, 'X-Relay-Trace-Id': nativeTraceId, 'X-Relay-Memory-Hits': String(countAtomsForSession(nativeSessionId)), ...nativeRpHeaders });
+            const nativeStrippedHeaders: Record<string, string> = {};
+            if (_strippedThinking) nativeStrippedHeaders['X-RelayPlane-Stripped-Thinking'] = 'true';
+            if (_strippedBetaFlags.length > 0) nativeStrippedHeaders['X-RelayPlane-Stripped-Beta'] = _strippedBetaFlags.join(',');
+            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': nativeCacheHeader, 'X-Relay-Trace-Id': nativeTraceId, 'X-Relay-Memory-Hits': String(countAtomsForSession(nativeSessionId)), ...nativeRpHeaders, ...nativeStrippedHeaders });
             res.end(JSON.stringify(nativeResponseData));
           }
         }
