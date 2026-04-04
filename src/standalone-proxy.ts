@@ -633,7 +633,7 @@ function buildDefaultComplexityTiers(
 }
 
 interface RoutingConfig {
-  mode: 'standard' | 'cascade' | 'auto' | 'passthrough';
+  mode: 'standard' | 'cascade' | 'auto' | 'passthrough' | 'complexity';
   cascade: CascadeConfig;
   complexity: ComplexityConfig;
 }
@@ -5132,9 +5132,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // KEY: When routing.mode is "auto", ALWAYS classify and route based on complexity,
       // even when the user sends a specific model like "claude-opus-4-6".
       // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
-      if (routingMode === 'passthrough' && proxyConfig.routing?.mode === 'auto') {
+      if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
         routingMode = 'auto';
-        log(`Config routing.mode=auto: overriding passthrough → auto for model ${requestedModel}`);
+        log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
       }
 
       const isStreaming = requestBody['stream'] === true;
@@ -6217,12 +6217,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       routingMode = 'passthrough';
     }
 
-    // KEY: When routing.mode is "auto", ALWAYS classify and route based on complexity,
+    // KEY: When routing.mode is "auto", "complexity", or "cascade", ALWAYS classify and route,
     // even when the user sends a specific model like "claude-opus-4-6".
-    // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
-    if (routingMode === 'passthrough' && proxyConfig.routing?.mode === 'auto') {
+    // This is the core UX: user flips routing.mode and the proxy handles the rest.
+    if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
       routingMode = 'auto';
-      log(`Config routing.mode=auto: overriding passthrough → auto for model ${requestedModel}`);
+      log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
     }
 
     log(`Received request for model: ${requestedModel} (mode: ${routingMode}, stream: ${isStreaming})`);
