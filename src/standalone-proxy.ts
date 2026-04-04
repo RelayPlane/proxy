@@ -5565,11 +5565,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 throw new CooldownError(resolved.provider);
               }
               let attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
-              if (isHaikuModel(resolved.model) && 'thinking' in attemptBody) {
+              if ((isHaikuModel(resolved.model) || isHaikuModel(requestedModel)) && 'thinking' in attemptBody) {
                 const { thinking: _t, ...rest } = attemptBody;
                 attemptBody = rest;
                 _strippedThinking = true;
-                log(`Stripped thinking from Haiku request (${resolved.model} does not support extended thinking)`);
+                log(`Stripped thinking from request (${resolved.model} does not support extended thinking, originally requested: ${requestedModel})`);
               }
               // Hybrid auth: use MAX token for Opus models, API key for others
               const modelAuth = getAuthForModel(resolved.model, proxyConfig.auth, useAnthropicEnvKey);
@@ -5631,13 +5631,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             ? { ...effectiveCtx, authHeader: undefined, apiKeyHeader: undefined }
             : effectiveCtx;
 
-          // Strip thinking from body for Haiku models (does not support extended thinking)
+          // Strip thinking from body when routing to (or from) Haiku models.
+          // Haiku does not support extended thinking. Also strip when the original
+          // requested model was Haiku but routing.mode overrode it to a different
+          // model — the user's intent was a non-thinking model, so thinking params
+          // (which may also be malformed, e.g. budget_tokens < 1024) should be dropped.
           let _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
-          if (isHaikuModel(finalModel) && 'thinking' in _nativeReqBody) {
+          if ((isHaikuModel(finalModel) || isHaikuModel(requestedModel)) && 'thinking' in _nativeReqBody) {
             const { thinking: _t, ...rest } = _nativeReqBody;
             _nativeReqBody = rest;
             _strippedThinking = true;
-            log(`Stripped thinking from Haiku request (${finalModel} does not support extended thinking)`);
+            log(`Stripped thinking from request (${finalModel} does not support extended thinking, originally requested: ${requestedModel})`);
           }
 
           // Log OAT beta flag stripping if applicable

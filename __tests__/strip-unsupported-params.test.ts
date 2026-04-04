@@ -58,6 +58,13 @@ describe('thinking stripping for Haiku models', () => {
     const content = getDistContent();
     expect(content).toContain('X-RelayPlane-Stripped-Thinking');
   });
+
+  it('strips thinking when ORIGINAL requested model was Haiku (routing override case)', () => {
+    const content = getDistContent();
+    // The condition must check requestedModel too, not only finalModel/resolved.model
+    // This ensures stripping happens even when routing.mode=auto overrides haiku→sonnet
+    expect(content).toMatch(/isHaikuModel\(finalModel\)\s*\|\|\s*isHaikuModel\(requestedModel\)|isHaikuModel\(resolved\.model\)\s*\|\|\s*isHaikuModel\(requestedModel\)/);
+  });
 });
 
 describe('OAT beta flag stripping in header builders', () => {
