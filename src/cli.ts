@@ -64,6 +64,7 @@ import { unlinkSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { homedir } from 'os';
 import * as net from 'net';
+import * as readline from 'readline';
 import { spawn } from 'child_process';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager } from './budget.js';
@@ -519,7 +520,7 @@ Usage:
 
 Commands:
   (default)              Start the proxy server
-  init                   Initialize config files
+  init                   Interactive setup wizard (API key, budget cap, routing mode)
   login                  Log in to RelayPlane (opens browser)
   logout                 Clear stored credentials
   status                 Show proxy status, plan, and cloud sync
@@ -1416,64 +1417,7 @@ async function main(): Promise<void> {
   const command = args[0];
   
   if (command === 'init') {
-    // Auto-load .env file before key detection
-    const envPathsInit = [join(process.cwd(), '.env'), join(homedir(), '.env')];
-    for (const envPath of envPathsInit) {
-      if (existsSync(envPath)) {
-        try {
-          const lines = readFileSync(envPath, 'utf-8').split('\n');
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('#')) continue;
-            const eqIdx = trimmed.indexOf('=');
-            if (eqIdx < 1) continue;
-            const key = trimmed.slice(0, eqIdx).trim();
-            const val = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
-            if (key && !process.env[key]) process.env[key] = val;
-          }
-        } catch { /* best-effort */ }
-        break;
-      }
-    }
-
-    // Ensure config exists (loadConfig creates default if missing)
-    const config = loadConfig();
-    const configPath = getConfigPath();
-
-    // Auto-detect OpenRouter-only setup: if only OPENROUTER_API_KEY is set (no Anthropic or
-    // OpenAI keys), automatically configure defaultProvider so all requests route via OpenRouter.
-    const hasOpenRouterKey = !!process.env['OPENROUTER_API_KEY'];
-    const hasAnthropicKey = !!process.env['ANTHROPIC_API_KEY'];
-    const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
-    if (hasOpenRouterKey && !hasAnthropicKey && !hasOpenAIKey) {
-      try {
-        let rawConfig: Record<string, unknown> = {};
-        if (existsSync(configPath)) {
-          rawConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
-        }
-        if (!rawConfig['defaultProvider']) {
-          rawConfig['defaultProvider'] = 'openrouter';
-          writeFileSync(configPath, JSON.stringify(rawConfig, null, 2));
-          console.log('[RelayPlane] Auto-configured defaultProvider: "openrouter" (OpenRouter-only setup detected)');
-        }
-      } catch { /* best-effort — never block init */ }
-    }
-
-    console.log('');
-    console.log('✅ RelayPlane initialized');
-    console.log(`   Config: ${configPath}`);
-    console.log('');
-    console.log('Next steps:');
-    console.log('  1. Start the proxy:');
-    console.log('     relayplane start');
-    console.log('');
-    console.log('  2. Point your agent at the proxy:');
-    console.log('     export ANTHROPIC_BASE_URL=http://localhost:4100');
-    console.log('     export OPENAI_BASE_URL=http://localhost:4100');
-    console.log('');
-    console.log('  3. Check your costs:');
-    console.log('     relayplane stats');
-    console.log('');
+    await handleInitWizard();
     process.exit(0);
   }
 
@@ -1767,6 +1711,271 @@ function handleAlertsCommand(args: string[]): void {
 
   console.log('Usage: relayplane alerts [list|counts]');
   alertMgr.close();
+}
+
+// ============================================
+// INIT WIZARD
+// ============================================
+
+/**
+ * Interactive 6-step setup wizard for new users (esp. refugees from direct Anthropic billing).
+ * Prompts for: API key, daily budget cap, routing mode → writes ~/.relayplane/config.json.
+ *
+ * Falls back to non-interactive init when stdin is not a TTY (CI/CD, piped scripts).
+ */
+async function handleInitWizard(): Promise<void> {
+  const configDir = join(homedir(), '.relayplane');
+  const configPath = join(configDir, 'config.json');
+
+  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+
+  if (!isTTY) {
+    // Non-interactive: ensure config exists, auto-detect OpenRouter-only setups, and exit
+    loadConfig();
+
+    // Auto-detect OpenRouter-only setup
+    const hasOpenRouterKey = !!process.env['OPENROUTER_API_KEY'];
+    const hasAnthropicKey = !!process.env['ANTHROPIC_API_KEY'];
+    const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
+    if (hasOpenRouterKey && !hasAnthropicKey && !hasOpenAIKey) {
+      try {
+        let rawCfg: Record<string, unknown> = {};
+        if (existsSync(configPath)) rawCfg = JSON.parse(readFileSync(configPath, 'utf-8'));
+        if (!rawCfg['defaultProvider']) {
+          rawCfg['defaultProvider'] = 'openrouter';
+          writeFileSync(configPath, JSON.stringify(rawCfg, null, 2));
+          console.log('[RelayPlane] Auto-configured defaultProvider: "openrouter" (OpenRouter-only setup detected)');
+        }
+      } catch { /* best-effort — never block init */ }
+    }
+
+    console.log('✅ RelayPlane initialized');
+    console.log(`   Config: ${configPath}`);
+    return;
+  }
+
+  // ── helpers ──────────────────────────────────────────────────────────────
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const prompt = (question: string): Promise<string> =>
+    new Promise((resolve) => rl.question(question, (answer) => resolve(answer.trim())));
+
+  const hr = '  ─────────────────────────────────────────────────';
+
+  // Load raw config JSON (may include fields unknown to ProxyConfig)
+  let rawConfig: Record<string, unknown> = {};
+  const configExists = existsSync(configPath);
+  if (configExists) {
+    try {
+      rawConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch {
+      rawConfig = {};
+    }
+  }
+
+  // Detect existing values
+  const existingProviders = rawConfig['providers'] as Record<string, unknown> | undefined;
+  const existingAnthropicAccounts = (
+    existingProviders?.['anthropic'] as Record<string, unknown> | undefined
+  )?.['accounts'] as Array<{ label: string; apiKey: string }> | undefined;
+  const existingApiKey = existingAnthropicAccounts?.[0]?.apiKey ?? '';
+
+  const existingBudget = rawConfig['budget'] as Record<string, unknown> | undefined;
+  const existingDailyUsd = typeof existingBudget?.['dailyUsd'] === 'number'
+    ? (existingBudget['dailyUsd'] as number)
+    : null;
+  const existingOnBreach = typeof existingBudget?.['onBreach'] === 'string'
+    ? (existingBudget['onBreach'] as string)
+    : null;
+
+  // ── Banner ───────────────────────────────────────────────────────────────
+
+  console.log('');
+  console.log('  ╭─────────────────────────────────────────────╮');
+  console.log('  │       RelayPlane Setup Wizard               │');
+  console.log('  │  Cost-intelligent routing for AI agents     │');
+  console.log('  ╰─────────────────────────────────────────────╯');
+  console.log('');
+
+  if (configExists) {
+    console.log(`  Existing config found at: ${configPath}`);
+    console.log('  (Pre-filling with saved values — press Enter to keep)');
+  } else {
+    console.log('  No config found — setting up fresh.');
+  }
+  console.log('');
+
+  // ── Step 1: API Key ───────────────────────────────────────────────────────
+
+  console.log('  Step 1/4  ·  Anthropic API Key');
+  console.log(hr);
+  console.log('  RelayPlane routes requests through your own API key.');
+  console.log('  Your key is stored locally in ~/.relayplane/config.json');
+  console.log('  and is never sent to RelayPlane servers.');
+  console.log('');
+
+  let apiKeyDisplay = '';
+  if (existingApiKey) {
+    const masked = existingApiKey.slice(0, 12) + '****' + existingApiKey.slice(-4);
+    apiKeyDisplay = ` [${masked}]`;
+  }
+
+  const rawApiKey = await prompt(`  ? Anthropic API key (sk-ant-...)${apiKeyDisplay}: `);
+  const apiKey = rawApiKey || existingApiKey;
+
+  if (apiKey && !apiKey.startsWith('sk-ant-') && !apiKey.startsWith('sk-')) {
+    console.log('  ⚠️  Key format looks unexpected (expected sk-ant-... or sk-...). Proceeding anyway.');
+  }
+  console.log('');
+
+  // ── Step 2: Daily Budget ──────────────────────────────────────────────────
+
+  console.log('  Step 2/4  ·  Daily Budget Cap');
+  console.log(hr);
+  console.log('  Set a daily spend limit to protect against runaway costs.');
+  console.log('  RelayPlane can automatically downgrade models when you approach the cap.');
+  console.log('');
+
+  const defaultDaily = existingDailyUsd ?? 10;
+  const rawDaily = await prompt(`  ? Daily budget cap in USD [default: $${defaultDaily.toFixed(2)}]: `);
+
+  let dailyCapUsd: number = defaultDaily;
+  if (rawDaily) {
+    const parsed = parseFloat(rawDaily.replace(/^\$/, ''));
+    if (!isNaN(parsed) && parsed > 0) {
+      dailyCapUsd = parsed;
+    } else {
+      console.log(`  ⚠️  Invalid value, using default $${defaultDaily.toFixed(2)}`);
+    }
+  }
+  console.log('');
+
+  // ── Step 3: Routing Mode ──────────────────────────────────────────────────
+
+  console.log('  Step 3/4  ·  Routing Mode');
+  console.log(hr);
+  console.log('  How should RelayPlane handle budget breaches?');
+  console.log('');
+  console.log('    [1] Smart  — Auto-downgrade to cheaper models (recommended)');
+  console.log('    [2] Strict — Block all requests when daily limit is reached (402)');
+  console.log('    [3] Off    — No budget enforcement');
+  console.log('');
+
+  let defaultMode = '1';
+  if (existingOnBreach === 'block') defaultMode = '2';
+  else if (existingBudget?.['enabled'] === false) defaultMode = '3';
+
+  const rawMode = await prompt(`  ? Your choice [${defaultMode}]: `);
+  const modeChoice = rawMode || defaultMode;
+
+  let onBreach: string;
+  let budgetEnabled: boolean;
+  let modeLabel: string;
+
+  if (modeChoice === '2') {
+    onBreach = 'block';
+    budgetEnabled = true;
+    modeLabel = 'strict (block on breach)';
+  } else if (modeChoice === '3') {
+    onBreach = 'downgrade';
+    budgetEnabled = false;
+    modeLabel = 'off (no enforcement)';
+  } else {
+    onBreach = 'downgrade';
+    budgetEnabled = true;
+    modeLabel = 'smart (auto-downgrade)';
+  }
+  console.log('');
+
+  // ── Step 4: Summary + confirm ─────────────────────────────────────────────
+
+  console.log('  Step 4/4  ·  Summary');
+  console.log(hr);
+  if (apiKey) {
+    const masked = apiKey.slice(0, 12) + '****' + apiKey.slice(-4);
+    console.log(`  API Key:     ${masked}`);
+  } else {
+    console.log('  API Key:     (none — will use ANTHROPIC_API_KEY env var)');
+  }
+  console.log(`  Daily cap:   $${dailyCapUsd.toFixed(2)}`);
+  console.log(`  Routing:     ${modeLabel}`);
+  console.log(`  Config:      ${configPath}`);
+  console.log('');
+
+  const confirm = await prompt('  ? Write config and finish? [Y/n]: ');
+  rl.close();
+
+  if (confirm.toLowerCase() === 'n') {
+    console.log('');
+    console.log('  Aborted — no changes written.');
+    console.log('');
+    return;
+  }
+
+  // ── Step 5 (internal): Write config ─────────────────────────────────────
+
+  // Ensure base RelayPlane config exists (device_id, telemetry, etc.)
+  const baseConfig = loadConfig();
+  // loadConfig() already wrote a config.json with base fields; now read it back as raw JSON
+  // so we can safely merge in provider + budget fields without losing anything.
+  try {
+    rawConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
+  } catch {
+    rawConfig = {};
+  }
+
+  // Write provider API key if provided
+  if (apiKey) {
+    const providers = (rawConfig['providers'] as Record<string, unknown>) ?? {};
+    const anthropic = (providers['anthropic'] as Record<string, unknown>) ?? {};
+    const accounts = (anthropic['accounts'] as Array<Record<string, unknown>>) ?? [];
+
+    if (accounts.length > 0) {
+      // Update first account's key
+      accounts[0]!['apiKey'] = apiKey;
+      accounts[0]!['label'] = accounts[0]!['label'] ?? 'default';
+    } else {
+      accounts.push({ label: 'default', apiKey });
+    }
+
+    anthropic['accounts'] = accounts;
+    providers['anthropic'] = anthropic;
+    rawConfig['providers'] = providers;
+  }
+
+  // Write budget config
+  const budget = (rawConfig['budget'] as Record<string, unknown>) ?? {};
+  budget['enabled'] = budgetEnabled;
+  budget['dailyUsd'] = dailyCapUsd;
+  budget['onBreach'] = onBreach;
+  rawConfig['budget'] = budget;
+
+  // Atomic write
+  if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
+  writeFileSync(configPath + '.tmp', JSON.stringify(rawConfig, null, 2) + '\n');
+  const { renameSync } = require('fs');
+  renameSync(configPath + '.tmp', configPath);
+
+  // ── Done ──────────────────────────────────────────────────────────────────
+
+  console.log('');
+  console.log('  ✅ RelayPlane configured!');
+  console.log('');
+  console.log('  Next steps:');
+  console.log('    1. Start the proxy:');
+  console.log('         relayplane start');
+  console.log('');
+  console.log('    2. Point your AI agent at the proxy:');
+  console.log('         export ANTHROPIC_BASE_URL=http://localhost:4100');
+  console.log('         export OPENAI_BASE_URL=http://localhost:4100');
+  console.log('');
+  console.log('    3. Check your costs:');
+  console.log('         relayplane stats');
+  console.log('         relayplane budget status');
+  console.log('');
+
+  void baseConfig; // suppress unused warning
 }
 
 function handleBudgetCommand(args: string[]): void {
