@@ -188,4 +188,28 @@ describe('Config Resilience', () => {
     const { hasValidCredentials } = await getConfig();
     expect(hasValidCredentials()).toBe(false);
   });
+
+  it('v2→v3 migration: disables mesh for existing configs that had it enabled', async () => {
+    // Simulate a v2 config with mesh enabled (pre-v1.9.5 install)
+    const v2Config = {
+      device_id: 'anon_test123',
+      config_version: 2,
+      telemetry_enabled: false,
+      mesh: {
+        enabled: true,
+        endpoint: 'https://osmosis-mesh-dev.fly.dev',
+        contribute: true,
+      },
+    };
+    fs.writeFileSync(configFile, JSON.stringify(v2Config));
+
+    vi.resetModules();
+    const { loadConfig } = await getConfig();
+    const config = loadConfig();
+
+    expect(config.config_version).toBe(3);
+    expect(config.mesh?.enabled).toBe(false);
+    // Other mesh fields preserved
+    expect(config.mesh?.endpoint).toBe('https://osmosis-mesh-dev.fly.dev');
+  });
 });

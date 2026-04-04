@@ -201,7 +201,7 @@ export interface TracesConfig {
   maxDiskMb: number;
 }
 
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 
 /**
  * Resolve the base RelayPlane config directory.
@@ -320,6 +320,22 @@ export function loadConfig(): ProxyConfig {
       // Bump config_version for any remaining v1 config (telemetry already false or explicitly set)
       if (config.config_version === 1) {
         config.config_version = 2;
+        saveConfig(config);
+      }
+
+      // v2 → v3 migration: disable mesh for existing configs that have it enabled.
+      // Mesh defaulted to enabled in early v1.9 builds; it was never intentionally opted in by most users.
+      // Run `relayplane mesh on` to re-enable after upgrading.
+      if (config.config_version === 2 && config.mesh?.enabled === true) {
+        config.mesh = { ...config.mesh, enabled: false };
+        config.config_version = 3;
+        saveConfig(config);
+        console.log('[RelayPlane] Mesh sync has been disabled by default as of v1.9.5. Run `relayplane mesh on` to re-enable.');
+      }
+
+      // Bump config_version for any remaining v2 config (mesh already off or not set)
+      if (config.config_version === 2) {
+        config.config_version = 3;
         saveConfig(config);
       }
 
