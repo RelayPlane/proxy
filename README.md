@@ -41,6 +41,29 @@ relayplane start
 
 Works with any agent framework that talks to OpenAI or Anthropic APIs. Point your client at `http://localhost:4100` (set `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`) and the proxy handles the rest.
 
+### Auto-start with Claude Code
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "relayplane ensure-running"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+RelayPlane will start automatically when Claude Code opens. If it's already running (multiple sessions), the hook exits immediately. No duplicate processes.
+
 ## What's New in v1.8.35
 
 **Recent additions:**
@@ -656,6 +679,7 @@ relayplane [command] [options]
 | `mesh status\|on\|off\|sync\|contribute` | Manage Osmosis mesh |
 | `service install\|uninstall\|status` | System service management |
 | `autostart on\|off\|status` | Legacy autostart (systemd) |
+| `ensure-running` | Start proxy if not running (idempotent, safe for hooks) |
 
 **Server options:**
 

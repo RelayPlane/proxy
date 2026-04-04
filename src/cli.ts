@@ -16,7 +16,8 @@
  *   telemetry [on|off|status]  Manage telemetry settings
  *   stats                  Show usage statistics
  *   config                 Show configuration
- * 
+ *   ensure-running         Start proxy if not running (idempotent, safe for hooks)
+ *
  * Options:
  *   --port <number>    Port to listen on (default: 4100)
  *   --host <string>    Host to bind to (default: 127.0.0.1)
@@ -59,8 +60,11 @@ import {
 } from './telemetry.js';
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
+import { unlinkSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { homedir } from 'os';
+import * as net from 'net';
+import { spawn } from 'child_process';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager } from './budget.js';
 import { getAlertManager } from './alerts.js';
@@ -440,6 +444,71 @@ async function handleCloudStatusCommand(): Promise<void> {
   console.log('');
 }
 
+/**
+ * Singleton guard: start the proxy if not already running on :4100, exit immediately if it is.
+ * Designed for use in Claude Code SessionStart hooks — fast, idempotent, no duplicate processes.
+ */
+async function handleEnsureRunning(): Promise<void> {
+  const PORT = 4100;
+  const HOST = '127.0.0.1';
+  const relayDir = join(homedir(), '.relayplane');
+  const pidFile = join(relayDir, 'proxy.pid');
+  const logFile = join(relayDir, 'proxy.log');
+
+  function isPortListening(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const sock = net.connect({ port: PORT, host: HOST });
+      sock.once('connect', () => { sock.destroy(); resolve(true); });
+      sock.once('error', () => { sock.destroy(); resolve(false); });
+    });
+  }
+
+  // Fast path: already running
+  if (await isPortListening()) {
+    console.log(`RelayPlane already running on :${PORT}`);
+    return;
+  }
+
+  // Clean up stale PID file
+  if (existsSync(pidFile)) {
+    try {
+      const stalePid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+      if (!isNaN(stalePid)) {
+        try { process.kill(stalePid, 0); } catch { unlinkSync(pidFile); }
+      }
+    } catch { /* best-effort */ }
+  }
+
+  // Ensure ~/.relayplane exists
+  if (!existsSync(relayDir)) {
+    mkdirSync(relayDir, { recursive: true });
+  }
+
+  // Spawn proxy as detached daemon
+  const child = spawn(process.execPath, [process.argv[1]!], {
+    detached: true,
+    stdio: ['ignore', 'ignore', 'ignore'],
+    env: process.env,
+  });
+  child.unref();
+
+  const pid = child.pid!;
+  writeFileSync(pidFile, String(pid));
+
+  // Poll for port to come up (up to 3s)
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (await isPortListening()) {
+      console.log(`RelayPlane started (pid: ${pid})`);
+      return;
+    }
+  }
+
+  process.stderr.write(`Error: RelayPlane did not start within 3s (pid: ${pid}, log: ${logFile})\n`);
+  process.exit(1);
+}
+
 function printHelp(): void {
   console.log(`
 RelayPlane Proxy - Intelligent AI Model Routing
@@ -467,6 +536,7 @@ Commands:
   service [install|uninstall|status]  Manage system service (systemd/launchd)
   autostart [on|off|status]  Manage autostart on boot (systemd, legacy)
   mesh [status|on|off|sync|contribute]  Mesh learning layer management
+  ensure-running         Start proxy if not running (idempotent, safe for hooks)
 
 Options:
   --port <number>    Port to listen on (default: 4100)
@@ -1415,6 +1485,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
+    'ensure-running',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1495,6 +1566,11 @@ async function main(): Promise<void> {
 
   if (command === 'disable') {
     handleEnableDisableCommand(false);
+    process.exit(0);
+  }
+
+  if (command === 'ensure-running') {
+    await handleEnsureRunning();
     process.exit(0);
   }
 
