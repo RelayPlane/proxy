@@ -67,6 +67,40 @@ describe('thinking stripping for Haiku models', () => {
   });
 });
 
+describe('effort / output_config.effort stripping for Haiku models', () => {
+  it('strips top-level effort when model is Haiku', () => {
+    const content = getDistContent();
+    // The stripping logic must check isHaikuModel and reference effort
+    expect(content).toMatch(/isHaikuModel.*effort|effort.*isHaikuModel/s);
+  });
+
+  it('strips output_config.effort when model is Haiku', () => {
+    const content = getDistContent();
+    expect(content).toContain('output_config');
+    // Must reference effort inside output_config handling near isHaikuModel
+    expect(content).toMatch(/output_config.*effort.*isHaikuModel|isHaikuModel[\s\S]*?output_config[\s\S]*?effort/);
+  });
+
+  it('logs when output_config.effort is stripped', () => {
+    const content = getDistContent();
+    expect(content).toContain('output_config.effort');
+    expect(content).toContain('Haiku does not support effort');
+  });
+});
+
+describe('context-1m beta header stripping for non-Opus models', () => {
+  it('strips context-1m for non-Opus models (not just Sonnet)', () => {
+    const content = getDistContent();
+    // The condition must use !...includes("opus"), not includes("sonnet")
+    expect(content).toMatch(/!targetModel\.includes\(['"]opus['"]\).*context-1m/);
+  });
+
+  it('strips context-1m in cascade handler for non-Opus models', () => {
+    const content = getDistContent();
+    expect(content).toMatch(/!resolved\.model\.includes\(['"]opus['"]\).*context-1m/);
+  });
+});
+
 describe('OAT beta flag stripping in header builders', () => {
   it('filters OAT_UNSUPPORTED_BETA_FLAGS in buildAnthropicHeadersWithAuth', () => {
     const content = getDistContent();

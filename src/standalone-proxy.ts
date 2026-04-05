@@ -5360,11 +5360,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       }
 
-      // Strip 1M context beta header when routing to Sonnet.
-      // Sonnet 1M requires "extra usage" on Max plan; without it Anthropic rejects the request.
-      // Opus 1M is included in Max plan. Stripping the beta falls back to Sonnet's 200K window.
+      // Strip 1M context beta header when routing to non-Opus models.
+      // Only Opus supports 1M context on Max plan; Sonnet/Haiku reject the beta header.
       let effectiveCtx = ctx;
-      if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
+      if (!targetModel.includes('opus') && ctx.betaHeaders?.includes('context-1m')) {
         effectiveCtx = {
           ...ctx,
           betaHeaders: ctx.betaHeaders
@@ -5373,7 +5372,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             .filter(b => !b.startsWith('context-1m'))
             .join(',') || undefined,
         };
-        log(`Stripped 1M context beta from Sonnet request (requires extra usage on Max plan)`);
+        log(`Stripped 1M context beta from ${targetModel} request (only Opus supports 1M context)`);
       }
 
       if (
@@ -5571,22 +5570,53 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 _strippedThinking = true;
                 log(`Stripped thinking from request (${resolved.model} does not support extended thinking, originally requested: ${requestedModel})`);
               }
+              if (isHaikuModel(resolved.model)) {
+                if ('effort' in attemptBody) {
+                  delete attemptBody.effort;
+                  log(`Stripped effort param from ${resolved.model} request (Haiku does not support effort)`);
+                }
+                // Copy-on-write: don't mutate the shared nested object so cascade
+                // escalation to Sonnet/Opus still sees the original output_config.
+                const cascOutputConfig = attemptBody['output_config'] as Record<string, unknown> | undefined;
+                if (cascOutputConfig && 'effort' in cascOutputConfig) {
+                  const { effort: _e, ...restConfig } = cascOutputConfig;
+                  if (Object.keys(restConfig).length === 0) {
+                    delete attemptBody['output_config'];
+                  } else {
+                    attemptBody['output_config'] = restConfig;
+                  }
+                  log(`Stripped output_config.effort from ${resolved.model} cascade request (Haiku does not support effort)`);
+                }
+              }
+              // Strip 1M context beta for non-Opus models in cascade
+              let cascadeCtx = ctx;
+              if (!resolved.model.includes('opus') && ctx.betaHeaders?.includes('context-1m')) {
+                cascadeCtx = {
+                  ...ctx,
+                  betaHeaders: ctx.betaHeaders
+                    .split(',')
+                    .map(b => b.trim())
+                    .filter(b => !b.startsWith('context-1m'))
+                    .join(',') || undefined,
+                };
+                log(`Stripped 1M context beta from ${resolved.model} cascade request (only Opus supports 1M context)`);
+              }
               // Hybrid auth: use MAX token for Opus models, API key for others
               const modelAuth = getAuthForModel(resolved.model, proxyConfig.auth, useAnthropicEnvKey);
               if (modelAuth.isMax) {
                 log(`Using MAX token for ${resolved.model}`);
               }
               // Log OAT beta flag stripping if applicable
-              const cascadeEffectiveToken = ctx.authHeader?.replace(/^Bearer\s+/i, '') ?? ctx.apiKeyHeader ?? modelAuth.apiKey ?? '';
-              const cascadeLocalStrippedBeta = cascadeEffectiveToken.startsWith('sk-ant-oat') && ctx.betaHeaders
-                ? ctx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
+              const cascadeEffectiveToken = cascadeCtx.authHeader?.replace(/^Bearer\s+/i, '') ?? cascadeCtx.apiKeyHeader ?? modelAuth.apiKey ?? '';
+              const cascadeLocalStrippedBeta = cascadeEffectiveToken.startsWith('sk-ant-oat') && cascadeCtx.betaHeaders
+                ? cascadeCtx.betaHeaders.split(',').map(b => b.trim()).filter(b => OAT_UNSUPPORTED_BETA_FLAGS.has(b))
                 : [];
               if (cascadeLocalStrippedBeta.length > 0) {
                 _strippedBetaFlags = cascadeLocalStrippedBeta;
                 log(`Stripped OAT-unsupported beta flags from request: ${cascadeLocalStrippedBeta.join(', ')}`);
               }
               const isCascadeRerouted = resolved.model !== originalModel;
-              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
+              const providerResponse = await forwardNativeAnthropicRequest(attemptBody, cascadeCtx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
                 if (proxyConfig.reliability?.cooldowns?.enabled) {
@@ -5642,6 +5672,20 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             _nativeReqBody = rest;
             _strippedThinking = true;
             log(`Stripped thinking from request (${finalModel} does not support extended thinking, originally requested: ${requestedModel})`);
+          }
+          if (isHaikuModel(finalModel)) {
+            if ('effort' in _nativeReqBody) {
+              delete _nativeReqBody.effort;
+              log(`Stripped effort param from ${finalModel} request (Haiku does not support effort)`);
+            }
+            const outputConfig = _nativeReqBody['output_config'] as Record<string, unknown> | undefined;
+            if (outputConfig && 'effort' in outputConfig) {
+              delete outputConfig.effort;
+              if (Object.keys(outputConfig).length === 0) {
+                delete _nativeReqBody['output_config'];
+              }
+              log(`Stripped output_config.effort from ${finalModel} request (Haiku does not support effort)`);
+            }
           }
 
           // Log OAT beta flag stripping if applicable
@@ -6480,9 +6524,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
-    // Strip 1M context beta header when routing to Sonnet (same as native handler above)
+    // Strip 1M context beta header when routing to non-Opus models (same as native handler above)
     let effectiveCtx = ctx;
-    if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
+    if (!targetModel.includes('opus') && ctx.betaHeaders?.includes('context-1m')) {
       effectiveCtx = {
         ...ctx,
         betaHeaders: ctx.betaHeaders
@@ -6491,7 +6535,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           .filter(b => !b.startsWith('context-1m'))
           .join(',') || undefined,
       };
-      log(`Stripped 1M context beta from Sonnet request (requires extra usage on Max plan)`);
+      log(`Stripped 1M context beta from ${targetModel} request (only Opus supports 1M context)`);
     }
 
     // ── Ollama routing: intercept before cloud dispatch ──
