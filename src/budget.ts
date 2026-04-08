@@ -11,6 +11,36 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 
+// ─── Model Pricing Constants ──────────────────────────────────────────
+
+/** Per-million token pricing for known Claude models (USD). */
+export const MODEL_PRICING: Record<string, { inputPer1M: number; outputPer1M: number }> = {
+  'claude-opus-4-6':              { inputPer1M: 5.00,  outputPer1M: 25.00 },
+  'claude-opus-4-5':              { inputPer1M: 5.00,  outputPer1M: 25.00 },
+  'claude-sonnet-4-6':            { inputPer1M: 3.00,  outputPer1M: 15.00 },
+  'claude-sonnet-4-5':            { inputPer1M: 3.00,  outputPer1M: 15.00 },
+  'claude-haiku-4-5':             { inputPer1M: 0.80,  outputPer1M: 4.00  },
+  'claude-haiku-4-5-20251001':    { inputPer1M: 0.80,  outputPer1M: 4.00  },
+  'claude-3-5-sonnet-20241022':   { inputPer1M: 3.00,  outputPer1M: 15.00 },
+  'claude-3-5-haiku-20241022':    { inputPer1M: 0.80,  outputPer1M: 4.00  },
+  'claude-3-opus-20240229':       { inputPer1M: 15.00, outputPer1M: 75.00 },
+};
+
+/**
+ * Estimate cost in USD for a completed request given token counts.
+ * Returns 0 if the model is not in MODEL_PRICING.
+ */
+export function estimateCostFromTokens(
+  model: string,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const pricing = MODEL_PRICING[model];
+  if (!pricing) return 0;
+  return (inputTokens / 1_000_000) * pricing.inputPer1M
+       + (outputTokens / 1_000_000) * pricing.outputPer1M;
+}
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface BudgetConfig {
@@ -33,6 +63,17 @@ export interface BudgetConfig {
   sessionCapUsd: number;
   /** Model downgrade ladder — when a session exceeds 80% of its cap, downgrade to the next rung */
   modelLadder: string[];
+  /**
+   * Simple daily cap in USD used by BudgetTracker.
+   * When set, all requests are blocked once this amount is reached today.
+   * null / undefined = unlimited.
+   */
+  dailyCapUSD?: number;
+  /**
+   * Warning threshold as a fraction of dailyCapUSD (0–1). Default: 0.8.
+   * When daily spend / dailyCapUSD >= warningThreshold, a warning header is added.
+   */
+  warningThreshold?: number;
 }
 
 // ─── Session Budget Types ────────────────────────────────────────────
@@ -624,5 +665,244 @@ export function resetBudgetManager(): void {
   if (_instance) {
     _instance.close();
     _instance = null;
+  }
+}
+
+// ─── BudgetTracker ──────────────────────────────────────────────────
+//
+// Simpler daily cap tracker, separate from BudgetManager.
+// Keyed off config.budget.dailyCapUSD / config.budget.warningThreshold.
+// Uses its own `daily_cap_log` table inside ~/.relayplane/budget.db.
+
+export interface BudgetCapConfig {
+  /** Daily spend cap in USD. Undefined / null = unlimited (no enforcement). */
+  dailyCapUSD?: number;
+  /** Warning threshold as a fraction of the cap (0–1). Default: 0.8 */
+  warningThreshold?: number;
+}
+
+export interface DailySpendRecord {
+  date: string;        // YYYY-MM-DD
+  totalSpend: number;  // USD
+  byModel: Record<string, number>;
+}
+
+export interface BudgetCapCheckResult {
+  allowed: boolean;
+  warn: boolean;
+  spent: number;
+  cap: number | null;
+  warningThreshold: number;
+}
+
+export class BudgetTracker {
+  private dailyCapUSD: number | null;
+  private warningThreshold: number;
+  private db: SqliteDb | null = null;
+  private _initialized = false;
+
+  // In-memory daily spend cache
+  private dailySpend: number = 0;
+  private cachedDay: string = '';
+
+  // Pending async writes
+  private pendingWrites: Array<{ amount: number; model: string; dailyWindow: string; timestamp: number }> = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+
+  constructor(config?: BudgetCapConfig) {
+    this.dailyCapUSD = config?.dailyCapUSD ?? null;
+    this.warningThreshold = config?.warningThreshold ?? 0.8;
+  }
+
+  /** Initialize SQLite storage. Safe to call multiple times. */
+  init(): void {
+    if (this._initialized) return;
+    this._initialized = true;
+    if (this.dailyCapUSD === null) return; // unlimited — no persistence needed
+
+    const budgetDir = path.join(os.homedir(), '.relayplane');
+    fs.mkdirSync(budgetDir, { recursive: true });
+
+    try {
+      const dbPath = path.join(budgetDir, 'budget.db');
+      this.db = openDatabase(dbPath);
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS daily_cap_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          amount REAL NOT NULL,
+          model TEXT NOT NULL,
+          daily_window TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dcl_daily_window ON daily_cap_log(daily_window);
+      `);
+      this._refreshDay();
+    } catch (err) {
+      console.warn('[RelayPlane BudgetTracker] SQLite unavailable, memory-only mode:', (err as Error).message);
+      this.db = null;
+    }
+  }
+
+  /** Update cap / threshold at runtime (e.g. on config reload). */
+  updateConfig(config: BudgetCapConfig): void {
+    if ('dailyCapUSD' in config) {
+      const newCap = config.dailyCapUSD ?? null;
+      if (newCap !== this.dailyCapUSD) {
+        this.dailyCapUSD = newCap;
+        // If cap just became active and DB not open yet, re-init
+        if (newCap !== null && !this.db && this._initialized) {
+          this._initialized = false;
+          this.init();
+        }
+      }
+    }
+    if (config.warningThreshold !== undefined) {
+      this.warningThreshold = config.warningThreshold;
+    }
+  }
+
+  /**
+   * Pre-request check. Always <5ms — reads in-memory cache only.
+   * Call `init()` before first use.
+   */
+  check(): BudgetCapCheckResult {
+    if (this.dailyCapUSD === null) {
+      return { allowed: true, warn: false, spent: 0, cap: null, warningThreshold: this.warningThreshold };
+    }
+    this._ensureDay();
+    const cap = this.dailyCapUSD;
+    const spent = this.dailySpend;
+    const allowed = spent < cap;
+    const warn = allowed && cap > 0 && (spent / cap) >= this.warningThreshold;
+    return { allowed, warn, spent, cap, warningThreshold: this.warningThreshold };
+  }
+
+  /**
+   * Record actual spend after a request completes.
+   * Updates in-memory cache immediately; SQLite write is async.
+   */
+  record(amount: number, model: string): void {
+    if (this.dailyCapUSD === null || amount <= 0) return;
+    this._ensureDay();
+    this.dailySpend += amount;
+    this.pendingWrites.push({ amount, model, dailyWindow: this.cachedDay, timestamp: Date.now() });
+    this._scheduleFlush();
+  }
+
+  /**
+   * Return daily spend history for the last `days` calendar days.
+   * Requires SQLite; falls back to today's in-memory total only.
+   */
+  getHistory(days = 30): DailySpendRecord[] {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+    if (this.db) {
+      const rows = this.db.prepare(`
+        SELECT daily_window, model, SUM(amount) as total
+        FROM daily_cap_log
+        WHERE daily_window >= ?
+        GROUP BY daily_window, model
+        ORDER BY daily_window DESC
+      `).all(cutoffStr) as Array<{ daily_window: string; model: string; total: number }>;
+
+      const byDate = new Map<string, DailySpendRecord>();
+      for (const row of rows) {
+        if (!byDate.has(row.daily_window)) {
+          byDate.set(row.daily_window, { date: row.daily_window, totalSpend: 0, byModel: {} });
+        }
+        const rec = byDate.get(row.daily_window)!;
+        rec.byModel[row.model] = (rec.byModel[row.model] ?? 0) + row.total;
+        rec.totalSpend += row.total;
+      }
+      return Array.from(byDate.values()).sort((a, b) => b.date.localeCompare(a.date));
+    }
+
+    // Memory-only fallback
+    if (this.dailySpend > 0 && this.cachedDay >= cutoffStr) {
+      return [{ date: this.cachedDay, totalSpend: this.dailySpend, byModel: {} }];
+    }
+    return [];
+  }
+
+  /** Today's total spend (USD). */
+  getDailySpend(): number {
+    this._ensureDay();
+    return this.dailySpend;
+  }
+
+  /** Configured daily cap (null = unlimited). */
+  getCap(): number | null {
+    return this.dailyCapUSD;
+  }
+
+  /** Flush pending writes and close SQLite. */
+  close(): void {
+    this._flushPendingWrites();
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = null; }
+    if (this.db) { this.db.close(); this.db = null; }
+  }
+
+  // ─── Private ──────────────────────────────────────────────────────
+
+  private _ensureDay(): void {
+    const today = getDailyWindow();
+    if (today !== this.cachedDay) {
+      this.cachedDay = today;
+      this.dailySpend = 0;
+      if (this.db) {
+        const row = this.db.prepare(
+          'SELECT COALESCE(SUM(amount), 0) as total FROM daily_cap_log WHERE daily_window = ?'
+        ).get(today) as { total: number } | undefined;
+        this.dailySpend = row?.total ?? 0;
+      }
+    }
+  }
+
+  private _refreshDay(): void {
+    this.cachedDay = '';
+    this._ensureDay();
+  }
+
+  private _scheduleFlush(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this._flushPendingWrites();
+    }, 1000);
+  }
+
+  private _flushPendingWrites(): void {
+    if (!this.db || this.pendingWrites.length === 0) return;
+    const writes = this.pendingWrites.splice(0);
+    try {
+      const stmt = this.db.prepare(
+        'INSERT INTO daily_cap_log (amount, model, daily_window, timestamp) VALUES (?, ?, ?, ?)'
+      );
+      for (const w of writes) {
+        stmt.run(w.amount, w.model, w.dailyWindow, w.timestamp);
+      }
+    } catch (err) {
+      console.warn('[RelayPlane BudgetTracker] SQLite flush failed:', (err as Error).message);
+    }
+  }
+}
+
+// ─── BudgetTracker Singleton ─────────────────────────────────────────
+
+let _trackerInstance: BudgetTracker | null = null;
+
+export function getBudgetTracker(config?: BudgetCapConfig): BudgetTracker {
+  if (!_trackerInstance) {
+    _trackerInstance = new BudgetTracker(config);
+  }
+  return _trackerInstance;
+}
+
+export function resetBudgetTracker(): void {
+  if (_trackerInstance) {
+    _trackerInstance.close();
+    _trackerInstance = null;
   }
 }

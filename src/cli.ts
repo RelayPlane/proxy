@@ -67,7 +67,7 @@ import * as net from 'net';
 import * as readline from 'readline';
 import { spawn } from 'child_process';
 import { getResponseCache } from './response-cache.js';
-import { getBudgetManager } from './budget.js';
+import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
 
 // __dirname is available natively in CJS
@@ -1973,6 +1973,7 @@ async function handleInitWizard(): Promise<void> {
   const budget = (rawConfig['budget'] as Record<string, unknown>) ?? {};
   budget['enabled'] = budgetEnabled;
   budget['dailyUsd'] = dailyCapUsd;
+  budget['dailyCapUSD'] = dailyCapUsd;
   budget['onBreach'] = onBreach;
   rawConfig['budget'] = budget;
 
@@ -2011,9 +2012,20 @@ function handleBudgetCommand(args: string[]): void {
     try { budget.init(); } catch { /* ok */ }
     const status = budget.getStatus();
     const config = budget.getConfig();
+    const tracker = getBudgetTracker();
+    try { tracker.init(); } catch { /* ok */ }
+    const cap = tracker.getCap();
+    const todaySpend = tracker.getDailySpend();
     console.log('');
     console.log('💰 Budget Status');
     console.log(`   Enabled:     ${config.enabled ? '✅' : '❌'}`);
+    if (cap !== null) {
+      const pct = cap > 0 ? (todaySpend / cap) * 100 : 0;
+      const bar = pct >= 100 ? '🚫 BLOCKED' : pct >= 80 ? '⚠️  warning' : '✅ ok';
+      console.log(`   Daily cap:   $${todaySpend.toFixed(4)} / $${cap.toFixed(2)} (${pct.toFixed(1)}%) ${bar}`);
+    } else {
+      console.log(`   Daily cap:   $${todaySpend.toFixed(4)} / unlimited`);
+    }
     console.log(`   Daily:       $${status.dailySpend.toFixed(4)} / $${status.dailyLimit} (${status.dailyPercent.toFixed(1)}%)`);
     console.log(`   Hourly:      $${status.hourlySpend.toFixed(4)} / $${status.hourlyLimit} (${status.hourlyPercent.toFixed(1)}%)`);
     console.log(`   Per-request: max $${config.perRequestUsd}`);
@@ -2022,6 +2034,7 @@ function handleBudgetCommand(args: string[]): void {
       console.log(`   ⚠️  BREACHED: ${status.breachType}`);
     }
     console.log('');
+    tracker.close();
     budget.close();
     return;
   }
@@ -2046,8 +2059,38 @@ function handleBudgetCommand(args: string[]): void {
     return;
   }
 
-  console.log('Usage: relayplane budget [status|set|reset]');
+  if (sub === 'history') {
+    const daysArg = parseInt(args[1] ?? '7', 10);
+    const days = isNaN(daysArg) ? 7 : daysArg;
+    const tracker = getBudgetTracker();
+    try { tracker.init(); } catch { /* ok */ }
+    const history = tracker.getHistory(days);
+    const cap = tracker.getCap();
+    console.log('');
+    console.log(`📅 Budget History (last ${days} days)`);
+    if (cap !== null) {
+      console.log(`   Daily cap: $${cap.toFixed(2)}`);
+    }
+    if (history.length === 0) {
+      console.log('   No spend recorded.');
+    } else {
+      for (const day of history) {
+        const pct = cap !== null && cap > 0 ? ` (${((day.totalSpend / cap) * 100).toFixed(1)}%)` : '';
+        console.log(`   ${day.date}  $${day.totalSpend.toFixed(4)}${pct}`);
+        for (const [model, amt] of Object.entries(day.byModel)) {
+          console.log(`     ↳ ${model}: $${amt.toFixed(4)}`);
+        }
+      }
+    }
+    console.log('');
+    tracker.close();
+    budget.close();
+    return;
+  }
+
+  console.log('Usage: relayplane budget [status|set|reset|history]');
   console.log('  set --daily <usd> --hourly <usd> --per-request <usd>');
+  console.log('  history [days]   Show daily spend history (default: 7 days)');
   budget.close();
 }
 

@@ -62,7 +62,7 @@ import {
   type CrossProviderCascadeConfig,
   type CascadeHop,
 } from './cross-provider-cascade.js';
-import { getBudgetManager, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
+import { getBudgetManager, getBudgetTracker, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
@@ -3843,6 +3843,21 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   }
 
+  // Initialize budget tracker (dailyCapUSD enforcement)
+  const budgetTracker = getBudgetTracker(
+    proxyConfig.budget?.dailyCapUSD !== undefined
+      ? { dailyCapUSD: proxyConfig.budget.dailyCapUSD, warningThreshold: proxyConfig.budget.warningThreshold }
+      : undefined
+  );
+  try {
+    budgetTracker.init();
+    if (proxyConfig.budget?.dailyCapUSD !== undefined) {
+      log(`Budget tracker initialized: dailyCapUSD=$${proxyConfig.budget.dailyCapUSD}`);
+    }
+  } catch (err) {
+    log(`Budget tracker init failed: ${err}`);
+  }
+
   // Initialize anomaly detector
   const anomalyDetector = getAnomalyDetector(proxyConfig.anomaly);
 
@@ -3925,6 +3940,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
+    // BudgetTracker: enforce dailyCapUSD
+    const trackerResult = budgetTracker.check();
+    if (!trackerResult.allowed) {
+      headers['x-relayplane-budget-exceeded'] = 'daily-cap';
+      return { blocked: true, model: finalModel, headers, downgraded: false };
+    }
+    if (trackerResult.warn && trackerResult.cap !== null) {
+      headers['x-relayplane-budget-warning'] =
+        `${((trackerResult.spent / trackerResult.cap) * 100).toFixed(1)}% of daily cap $${trackerResult.cap}`;
+    }
+
     return { blocked: false, model: finalModel, headers, downgraded };
   }
 
@@ -3939,6 +3965,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   ): void {
     // Record spend
     budgetManager.recordSpend(costUsd, model);
+    budgetTracker.record(costUsd, model);
 
     // Anomaly detection
     const anomalyResult = anomalyDetector.recordAndAnalyze({
@@ -3972,6 +3999,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     proxyConfig = await loadProxyConfig(configPath, log);
     cooldownManager.updateConfig(getCooldownConfig(proxyConfig));
     budgetManager.updateConfig({ ...budgetManager.getConfig(), ...(proxyConfig.budget ?? {}) });
+    budgetTracker.updateConfig({
+      dailyCapUSD: proxyConfig.budget?.dailyCapUSD,
+      warningThreshold: proxyConfig.budget?.warningThreshold,
+    });
     anomalyDetector.updateConfig({ ...anomalyDetector.getConfig(), ...(proxyConfig.anomaly ?? {}) });
     alertManager.updateConfig({ ...alertManager.getConfig(), ...(proxyConfig.alerts ?? {}) });
     downgradeConfig = { ...DEFAULT_DOWNGRADE_CONFIG, ...(proxyConfig.downgrade ?? {}) };
