@@ -126,6 +126,15 @@ export interface ProxyConfig {
   
   /** Telemetry enabled state */
   telemetry_enabled: boolean;
+
+  /** Exclude this device from telemetry (for devbox) */
+  telemetry_exclude?: boolean;
+  
+  /** ISO timestamp of the last daily startup ping */
+  last_ping_date?: string;
+
+  /** ISO timestamp of the last hourly dashboard ping */
+  last_dashboard_ping?: string;
   
   /** Whether first run disclosure has been shown */
   first_run_complete: boolean;

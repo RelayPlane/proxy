@@ -67,10 +67,13 @@ import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
+import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
+import { loadPolicy, resolvePolicy, POLICY_FILE } from './agent-policy.js';
 import { getVersionStatus } from './utils/version-status.js';
 import { initNudge, checkAndShowNudge } from './signup-nudge.js';
 import { initStarNudge, checkAndShowStarNudge } from './star-nudge.js';
 import { handleEstimateRequest, checkEstimateRateLimit, purgeExpiredRateLimitEntries, type EstimateRateLimitEntry } from './estimate.js';
+import { sendPing } from './telemetryPinger.js';
 
 // Per-IP rate limit state for /v1/estimate (60 req/min per IP)
 const estimateRateMap = new Map<string, EstimateRateLimitEntry>();
@@ -1386,10 +1389,12 @@ interface ChatRequest {
 function extractPromptText(messages: ChatRequest['messages']): string {
   if (!messages || !Array.isArray(messages)) return '';
   return messages
+    .filter((msg): msg is NonNullable<typeof msg> => Boolean(msg))
     .map((msg) => {
       if (typeof msg.content === 'string') return msg.content;
       if (Array.isArray(msg.content)) {
         return msg.content
+          .filter((c): c is NonNullable<typeof c> => Boolean(c))
           .map((c: unknown) => {
             const part = c as { type?: string; text?: string };
             return part.type === 'text' ? (part.text ?? '') : '';
@@ -1401,13 +1406,15 @@ function extractPromptText(messages: ChatRequest['messages']): string {
     .join('\n');
 }
 
-function extractMessageText(messages: Array<{ content?: unknown }>): string {
+function extractMessageText(messages: Array<{ content?: unknown } | null | undefined>): string {
   return messages
+    .filter((msg): msg is { content?: unknown } => Boolean(msg))
     .map((msg) => {
       const content = msg.content;
       if (typeof content === 'string') return content;
       if (Array.isArray(content)) {
         return content
+          .filter((c): c is NonNullable<typeof c> => Boolean(c))
           .map((c: unknown) => {
             const part = c as { type?: string; text?: string };
             return part.type === 'text' ? (part.text ?? '') : '';
@@ -3219,6 +3226,25 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .rename-btn{background:none;border:none;cursor:pointer;font-size:.75rem;opacity:.5;padding:2px}.rename-btn:hover{opacity:1}
 </style></head><body>
 <div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span><span id="vstat" class="vstat unavailable">Unable to check</span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
+<div id="policy-nudge" style="display:none;background:#1a1a2e;border:1px solid #4a9eff;border-radius:6px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;font-family:monospace;font-size:13px;color:#e0e0e0"><span>You've routed <strong id="nudge-reqs">0</strong> requests across <strong id="nudge-agents">0</strong> detected agent<span id="nudge-plural">s</span>. Run <code>relayplane policy auto</code> to optimize routing. Estimated savings: ~<strong id="nudge-savings">$0</strong>/mo.</span><div style="display:flex;gap:8px;margin-left:16px"><button onclick="fetch('/v1/policy-auto',{method:'POST'}).then(()=>location.reload())" style="background:#4a9eff;color:#000;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">Run now</button><button onclick="document.getElementById('policy-nudge').style.display='none';localStorage.setItem('nudge-dismissed','1')" style="background:transparent;color:#888;border:1px solid #444;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:12px">Dismiss</button></div></div>
+<script>
+(async function(){
+  if(localStorage.getItem('nudge-dismissed'))return;
+  try{
+    const n=await fetch('/v1/policy-nudge').then(r=>r.json());
+    if(n.show){
+      const el=document.getElementById('policy-nudge');
+      if(el){
+        el.style.display='flex';
+        document.getElementById('nudge-reqs').textContent=n.requestCount;
+        document.getElementById('nudge-agents').textContent=n.agentCount;
+        document.getElementById('nudge-plural').textContent=n.agentCount===1?'':'s';
+        document.getElementById('nudge-savings').textContent='$'+n.estimatedMonthlySavings;
+      }
+    }
+  }catch(e){}
+})();
+</script>
 <div class="cards">
   <div class="card"><div class="label">Requests (7d window, max 10k)</div><div class="value" id="totalReq">—</div><div id="totalReqDetail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
@@ -4095,6 +4121,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     if (req.method === 'GET' && pathname === '/v1/version-status') {
+      // This endpoint is hit by the dashboard, so trigger the dashboard ping.
+      sendPing('dashboard');
+      
       const latest = await getLatestProxyVersion();
       const status = getVersionStatus(PROXY_VERSION, latest);
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' });
@@ -4761,6 +4790,63 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         routeWhen: _activeOllamaConfig?.routeWhen ?? null,
         configuredModels: _activeOllamaConfig?.models ?? [],
       }));
+      return;
+    }
+
+    // === Policy nudge endpoint ===
+    if (req.method === 'GET' && pathname === '/v1/policy-nudge') {
+      const log = getRoutingLog({ limit: 100 });
+      const agentCount = new Set(log.map(e => e.agentFingerprint).filter(Boolean)).size;
+      const policy = loadPolicy();
+      const policyActive = Object.keys(policy.agents ?? {}).length > 0;
+      const show = log.length >= 10 && !policyActive;
+      const totalCost = Object.values(getAgentRegistry()).reduce((sum, a) => sum + a.totalCost, 0);
+      const estimatedMonthlySavings = show ? Math.round(totalCost * 0.4 * 30) : 0;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ show, requestCount: log.length, agentCount, estimatedMonthlySavings, policyActive }));
+      return;
+    }
+
+    // === Policy auto endpoint (from dashboard "Run now" button) ===
+    if (req.method === 'POST' && pathname === '/v1/policy-auto') {
+      try {
+        const { analyzeTraffic } = await import('./policy-analyzer.js');
+        const { detectAvailableProviders, suggestPolicies } = await import('./policy-suggestions.js');
+        const { dump: yamlDumpLocal } = await import('js-yaml');
+        const analyses = await analyzeTraffic({ lookbackDays: 7 });
+        if (analyses.length === 0) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'No traffic data found' }));
+          return;
+        }
+        const providers = detectAvailableProviders();
+        const suggestions = suggestPolicies(analyses, providers);
+        const isoDate = new Date().toISOString().slice(0, 10);
+        const header = `# RelayPlane routing policy\n# Generated by dashboard on ${isoDate}\n# Edit manually or re-run \`relayplane policy auto\` to regenerate.\n\n`;
+        const agents: Record<string, Record<string, unknown>> = {};
+        for (let i = 0; i < analyses.length; i++) {
+          const a = analyses[i]!;
+          const s = suggestions[i]!;
+          if (s.noSuggestion) continue;
+          const entry: Record<string, unknown> = { fingerprint: a.fingerprint, preferred: s.suggestedModel };
+          if (s.escalateTo) entry['escalateTo'] = s.escalateTo;
+          if (s.escalateOn) entry['escalateOn'] = s.escalateOn;
+          if (s.neverDowngrade) entry['neverDowngrade'] = true;
+          agents[a.name] = entry;
+        }
+        const body = yamlDumpLocal({ version: 1, agents }, { lineWidth: 120 });
+        fs.mkdirSync(path.dirname(POLICY_FILE), { recursive: true });
+        const tmp = POLICY_FILE + '.tmp';
+        fs.writeFileSync(tmp, header + body, 'utf-8');
+        fs.renameSync(tmp, POLICY_FILE);
+        const agentsConfigured = Object.keys(agents).length;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, agentsConfigured }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: msg }));
+      }
       return;
     }
 
@@ -6958,6 +7044,30 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       console.log(`  Streaming: ✅ Enabled`);
       startWatchdog();
       log('Health watchdog started (30s interval, sd_notify enabled)');
+      
+      // Fire startup ping.
+      // Use setImmediate to ensure it runs after startup logs are printed.
+      setImmediate(() => sendPing('startup'));
+
+      // Policy nudge — check once, 5 seconds after startup, only if nudge conditions met
+      setTimeout(async () => {
+        try {
+          const nudgeLog = getRoutingLog({ limit: 100 });
+          const nudgePolicy = loadPolicy();
+          const nudgePolicyActive = Object.keys(nudgePolicy.agents ?? {}).length > 0;
+          if (nudgeLog.length >= 10 && !nudgePolicyActive) {
+            const agentCount = new Set(nudgeLog.map(e => e.agentFingerprint).filter(Boolean)).size;
+            const totalCost = Object.values(getAgentRegistry()).reduce((s, a) => s + a.totalCost, 0);
+            const savings = Math.round(totalCost * 0.4 * 30);
+            console.log('');
+            console.log('  ─────────────────────────────────────────────────────');
+            console.log(`  💡 ${nudgeLog.length} requests routed across ${agentCount} agent${agentCount !== 1 ? 's' : ''}.`);
+            console.log(`     Run \`relayplane policy auto\` to optimize routing (~$${savings}/mo savings estimated).`);
+            console.log('  ─────────────────────────────────────────────────────');
+            console.log('');
+          }
+        } catch { /* non-critical */ }
+      }, 5000);
       resolve(server);
     });
   });

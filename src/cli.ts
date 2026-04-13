@@ -59,13 +59,22 @@ import {
   getTelemetryPath,
 } from './telemetry.js';
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
-import { unlinkSync } from 'fs';
-import { join, dirname, resolve } from 'path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync, unlinkSync } from 'fs';
+import { join, dirname, resolve, basename } from 'path';
 import { homedir } from 'os';
+import { loadPolicy, POLICY_FILE, type RoutingPolicy, type AgentPolicy } from './agent-policy.js';
+import { load as yamlLoad, dump as yamlDump } from 'js-yaml';
 import * as net from 'net';
 import * as readline from 'readline';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import * as os from 'node:os';
+import { analyzeTraffic, estimateDailyCost } from './policy-analyzer.js';
+import { detectAvailableProviders, suggestPolicies } from './policy-suggestions.js';
+import type { AgentAnalysis } from './policy-analyzer.js';
+import type { PolicySuggestion } from './policy-suggestions.js';
+import { getAgentRegistry, loadAgentRegistry, flushAgentRegistry, renameAgent } from './agent-tracker.js';
+import { getRoutingLog } from './routing-log.js';
+import { resolvePolicy } from './agent-policy.js';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
@@ -1454,7 +1463,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
-    'ensure-running',
+    'ensure-running', 'agents', 'policy', 'setup',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1540,6 +1549,21 @@ async function main(): Promise<void> {
 
   if (command === 'ensure-running') {
     await handleEnsureRunning();
+    process.exit(0);
+  }
+
+  if (command === 'agents') {
+    handleAgentsCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'setup') {
+    await handleSetupCommand();
+    process.exit(0);
+  }
+
+  if (command === 'policy') {
+    await handlePolicyCommand(args.slice(1));
     process.exit(0);
   }
 
@@ -2161,6 +2185,788 @@ function handleCacheCommand(args: string[]): void {
   }
 
   console.log('Usage: relayplane cache [status|clear|stats|on|off]');
+}
+
+// ─── agents commands ──────────────────────────────────────────────────────────
+
+function handleAgentsCommand(subArgs: string[]): void {
+  const sub = subArgs[0];
+  if (sub !== 'list') {
+    console.log('Usage: relayplane agents list');
+    return;
+  }
+
+  const registryFile = join(homedir(), '.relayplane', 'agents.json');
+  if (!existsSync(registryFile)) {
+    console.log('No agents found. Run the proxy to start tracking agents.');
+    return;
+  }
+
+  let registry: Record<string, { name: string; fingerprint: string; lastSeen: string; totalRequests: number; totalCost: number }>;
+  try {
+    registry = JSON.parse(readFileSync(registryFile, 'utf-8'));
+  } catch {
+    console.error('Failed to read agents registry');
+    return;
+  }
+
+  const entries = Object.values(registry);
+  if (entries.length === 0) {
+    console.log('No agents found.');
+    return;
+  }
+
+  // Format relative time
+  function relTime(iso: string): string {
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min${mins > 1 ? 's' : ''} ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs} hour${hrs > 1 ? 's' : ''} ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days} day${days > 1 ? 's' : ''} ago`;
+  }
+
+  const fpLen = 18;
+  const nameLen = 16;
+  const lastLen = 18;
+  const reqLen = 10;
+  const costLen = 10;
+
+  const header =
+    'FINGERPRINT'.padEnd(fpLen) +
+    'NAME'.padEnd(nameLen) +
+    'LAST SEEN'.padEnd(lastLen) +
+    'REQUESTS'.padEnd(reqLen) +
+    'COST'.padEnd(costLen);
+  console.log('');
+  console.log(header);
+  console.log('-'.repeat(fpLen + nameLen + lastLen + reqLen + costLen));
+  for (const e of entries) {
+    const row =
+      (e.fingerprint ?? '—').padEnd(fpLen) +
+      (e.name ?? '—').padEnd(nameLen) +
+      relTime(e.lastSeen ?? '').padEnd(lastLen) +
+      (e.totalRequests?.toLocaleString() ?? '0').padEnd(reqLen) +
+      ('$' + (e.totalCost ?? 0).toFixed(2)).padEnd(costLen);
+    console.log(row);
+  }
+  console.log('');
+}
+
+// ─── policy commands ──────────────────────────────────────────────────────────
+
+async function handlePolicyCommand(subArgs: string[]): Promise<void> {
+  const sub = subArgs[0];
+
+  if (sub === 'show') {
+    if (!existsSync(POLICY_FILE)) {
+      console.log("No policy file found. Run 'relayplane policy init' to create one.");
+      return;
+    }
+    const policy = loadPolicy();
+    console.log('');
+    console.log('Policy file:', POLICY_FILE);
+    console.log(`Version: ${policy.version}`);
+    if (policy.agents && Object.keys(policy.agents).length > 0) {
+      console.log('');
+      console.log('Agent rules:');
+      for (const [name, agent] of Object.entries(policy.agents)) {
+        let line = `  ${name}: preferred=${agent.preferred}`;
+        if (agent.escalateTo) line += ` escalateTo=${agent.escalateTo}`;
+        if (agent.neverDowngrade) line += ' neverDowngrade=true';
+        if (agent.budgetPerDay !== undefined) line += ` budgetPerDay=$${agent.budgetPerDay}`;
+        console.log(line);
+      }
+    }
+    if (policy.tasks && Object.keys(policy.tasks).length > 0) {
+      console.log('');
+      console.log('Task rules:');
+      for (const [taskType, task] of Object.entries(policy.tasks)) {
+        let line = `  ${taskType}: preferred=${task.preferred}`;
+        if (task.escalateTo) line += ` escalateTo=${task.escalateTo}`;
+        if (task.neverDowngrade) line += ' neverDowngrade=true';
+        console.log(line);
+      }
+    }
+    console.log('');
+    return;
+  }
+
+  if (sub === 'init') {
+    const force = subArgs.includes('--force');
+    if (existsSync(POLICY_FILE) && !force) {
+      console.error("policy.yaml already exists. Use --force to overwrite.");
+      process.exit(1);
+    }
+
+    const registryFile = join(homedir(), '.relayplane', 'agents.json');
+    let registry: Record<string, { name: string; fingerprint: string; totalRequests: number; totalCost: number }> = {};
+    if (existsSync(registryFile)) {
+      try {
+        registry = JSON.parse(readFileSync(registryFile, 'utf-8'));
+      } catch {
+        // use empty registry
+      }
+    }
+
+    const agents: Record<string, {
+      fingerprint: string;
+      preferred: string;
+    }> = {};
+
+    for (const [fp, entry] of Object.entries(registry)) {
+      const avgCost = entry.totalRequests > 0 ? entry.totalCost / entry.totalRequests : 0;
+      const preferred = avgCost > 0.01 ? 'anthropic/claude-sonnet-4-6' : 'cheapest-capable';
+      agents[entry.name] = {
+        fingerprint: fp,
+        preferred,
+      };
+    }
+
+    const policy = { version: 1, agents: Object.keys(agents).length > 0 ? agents : undefined };
+    const yaml = yamlDump(policy, { lineWidth: 120 });
+
+    mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+    writeFileSync(POLICY_FILE, yaml, 'utf-8');
+    const count = Object.keys(agents).length;
+    console.log(`Wrote ${POLICY_FILE} with ${count} agent${count !== 1 ? 's' : ''}. Edit to customize, then restart the proxy.`);
+    return;
+  }
+
+  if (sub === 'set-agent') {
+    const name = subArgs[1];
+    if (!name) {
+      console.error('Usage: relayplane policy set-agent <name> --preferred <model> [--escalate <model>] [--budget <amount>]');
+      process.exit(1);
+    }
+
+    // Parse options
+    let preferred: string | undefined;
+    let escalateTo: string | undefined;
+    let budget: number | undefined;
+
+    for (let i = 2; i < subArgs.length; i++) {
+      if (subArgs[i] === '--preferred' && subArgs[i + 1]) {
+        preferred = subArgs[i + 1];
+        i++;
+      } else if (subArgs[i] === '--escalate' && subArgs[i + 1]) {
+        escalateTo = subArgs[i + 1];
+        i++;
+      } else if (subArgs[i] === '--budget' && subArgs[i + 1]) {
+        budget = parseFloat(subArgs[i + 1]!);
+        i++;
+      }
+    }
+
+    if (!preferred) {
+      console.error('--preferred is required');
+      process.exit(1);
+    }
+
+    // Load or create policy
+    let rawPolicy: Record<string, unknown> = { version: 1 };
+    if (existsSync(POLICY_FILE)) {
+      try {
+        rawPolicy = (yamlLoad(readFileSync(POLICY_FILE, 'utf-8')) as Record<string, unknown>) ?? { version: 1 };
+      } catch {
+        rawPolicy = { version: 1 };
+      }
+    }
+
+    if (!rawPolicy.agents || typeof rawPolicy.agents !== 'object') {
+      rawPolicy.agents = {};
+    }
+    const agentsObj = rawPolicy.agents as Record<string, Record<string, unknown>>;
+    const existing = agentsObj[name] ?? {};
+    const updated: Record<string, unknown> = { ...existing, preferred };
+    if (escalateTo) updated['escalateTo'] = escalateTo;
+    if (budget !== undefined && !isNaN(budget)) updated['budgetPerDay'] = budget;
+    agentsObj[name] = updated;
+
+    // Atomic write via tmp + rename
+    mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+    const tmp = POLICY_FILE + '.tmp';
+    writeFileSync(tmp, yamlDump(rawPolicy, { lineWidth: 120 }), 'utf-8');
+    renameSync(tmp, POLICY_FILE);
+    console.log(`Updated policy for agent "${name}": preferred=${preferred}${escalateTo ? ` escalateTo=${escalateTo}` : ''}${budget !== undefined ? ` budgetPerDay=$${budget}` : ''}`);
+    return;
+  }
+
+  // ── policy auto ──────────────────────────────────────────────────────────
+
+  if (sub === 'auto') {
+    const yesFlag = subArgs.includes('--yes') || subArgs.includes('-y');
+    let lookbackDays = 7;
+    const lookbackIdx = subArgs.indexOf('--lookback');
+    if (lookbackIdx !== -1 && subArgs[lookbackIdx + 1]) {
+      lookbackDays = parseInt(subArgs[lookbackIdx + 1]!, 10) || 7;
+    }
+
+    process.stdout.write(`Analyzing ${lookbackDays} days of traffic...`);
+    const analyses = await analyzeTraffic({ lookbackDays });
+    process.stdout.write('\n');
+
+    if (analyses.length === 0) {
+      console.log('');
+      console.log('  No traffic data found.');
+      console.log('  Run RelayPlane for at least a day and try again.');
+      console.log('  (or use --lookback 30 to look further back)');
+      console.log('');
+      return;
+    }
+
+    const availableProviders = detectAvailableProviders();
+    await _runPolicyAutoDisplay(analyses, availableProviders, yesFlag, true);
+    return;
+  }
+
+  // ── policy suggest ────────────────────────────────────────────────────────
+
+  if (sub === 'suggest') {
+    let lookbackDays = 7;
+    const lookbackIdx = subArgs.indexOf('--lookback');
+    if (lookbackIdx !== -1 && subArgs[lookbackIdx + 1]) {
+      lookbackDays = parseInt(subArgs[lookbackIdx + 1]!, 10) || 7;
+    }
+
+    process.stdout.write(`Analyzing ${lookbackDays} days of traffic...`);
+    const analyses = await analyzeTraffic({ lookbackDays });
+    process.stdout.write('\n');
+
+    if (analyses.length === 0) {
+      console.log('');
+      console.log('  No traffic data found.');
+      console.log('  Run RelayPlane for at least a day and try again.');
+      console.log('');
+      return;
+    }
+
+    const availableProviders = detectAvailableProviders();
+    await _runPolicyAutoDisplay(analyses, availableProviders, false, false);
+    return;
+  }
+
+  // ── policy test ───────────────────────────────────────────────────────────
+
+  if (sub === 'test') {
+    let requestCount = 50;
+    let policyPath: string | undefined;
+    for (let i = 1; i < subArgs.length; i++) {
+      if (subArgs[i] === '--requests' && subArgs[i + 1]) {
+        requestCount = parseInt(subArgs[i + 1]!, 10) || 50;
+        i++;
+      } else if (subArgs[i] === '--policy' && subArgs[i + 1]) {
+        policyPath = subArgs[i + 1];
+        i++;
+      }
+    }
+
+    const entries = getRoutingLog({ limit: requestCount });
+    if (entries.length === 0) {
+      console.log('No routing log entries found. Run RelayPlane first to generate traffic.');
+      return;
+    }
+
+    let testPolicy: RoutingPolicy;
+    let policySource: string;
+
+    if (policyPath) {
+      const raw = readFileSync(policyPath, 'utf-8');
+      testPolicy = yamlLoad(raw) as RoutingPolicy;
+      policySource = basename(policyPath);
+    } else if (existsSync(POLICY_FILE)) {
+      testPolicy = loadPolicy();
+      policySource = 'policy.yaml';
+    } else {
+      const analyses = await analyzeTraffic({ lookbackDays: 7 });
+      const providers = detectAvailableProviders();
+      const suggestions = suggestPolicies(analyses, providers);
+      testPolicy = _buildPolicyFromSuggestions(analyses, suggestions);
+      policySource = 'proposed policy';
+    }
+
+    console.log(`Replaying last ${entries.length} requests against ${policySource}...`);
+    console.log('');
+
+    const changes: Array<{ fingerprint: string; taskType: string; from: string; to: string; savedCost: number }> = [];
+    for (const entry of entries) {
+      const resolution = resolvePolicy(
+        testPolicy,
+        entry.agentFingerprint ?? undefined,
+        entry.agentName ?? undefined,
+        entry.taskType,
+        entry.complexity as 'simple' | 'moderate' | 'complex',
+        entry.resolvedModel,
+      );
+      if (resolution.model !== entry.resolvedModel) {
+        const savedCost =
+          estimateDailyCost(entry.inputTokens ?? 1000, entry.outputTokens ?? 200, 1, entry.resolvedModel) -
+          estimateDailyCost(entry.inputTokens ?? 1000, entry.outputTokens ?? 200, 1, resolution.model);
+        changes.push({
+          fingerprint: (entry.agentFingerprint ?? 'unknown').slice(0, 8),
+          taskType: entry.taskType,
+          from: entry.resolvedModel,
+          to: resolution.model,
+          savedCost,
+        });
+      }
+    }
+
+    const total = entries.length;
+    const changed = changes.length;
+    const same = total - changed;
+
+    if (changed === 0) {
+      console.log(`  All ${total} requests would route identically. No savings from this policy.`);
+    } else {
+      console.log(`  ${changed}/${total} would route differently`);
+      console.log(`  ${same}/${total} would route identically`);
+      console.log('');
+      console.log('Changes:');
+      for (const c of changes) {
+        console.log(`  ${c.fingerprint} / ${c.taskType}:  ${c.from} → ${c.to}`);
+      }
+    }
+
+    const totalSavings = Math.max(0, changes.reduce((sum, c) => sum + c.savedCost, 0));
+    console.log('');
+    console.log(`Estimated savings across these ${total} requests: $${totalSavings.toFixed(4)}`);
+
+    // Only prompt if testing proposed policy (not existing or --policy flag)
+    if (!policyPath && !existsSync(POLICY_FILE) && changes.length > 0) {
+      console.log('');
+      process.stdout.write('Apply this policy now? (y/n) ');
+      const answer = await _promptLine();
+      if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
+        const analyses = await analyzeTraffic({ lookbackDays: 7 });
+        const providers = detectAvailableProviders();
+        const suggestions = suggestPolicies(analyses, providers);
+        const yaml = _buildPolicyYaml(analyses, suggestions);
+        mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+        const tmp = POLICY_FILE + '.tmp';
+        writeFileSync(tmp, yaml, 'utf-8');
+        renameSync(tmp, POLICY_FILE);
+        const n = analyses.length;
+        console.log(`\nPolicy applied. Routing active for ${n} agent${n !== 1 ? 's' : ''}.`);
+      } else {
+        console.log('Discarded. No changes made.');
+      }
+    }
+    return;
+  }
+
+  // ── policy rename ─────────────────────────────────────────────────────────
+
+  if (sub === 'rename') {
+    const arg = subArgs[1];
+    const newName = subArgs[2];
+    if (!arg || !newName) {
+      console.error('Usage: relayplane policy rename <fingerprint-or-name> <new-name>');
+      process.exit(1);
+    }
+
+    loadAgentRegistry();
+    const registry = getAgentRegistry();
+
+    // Find by fingerprint (exact) or name (case-insensitive)
+    let foundFp: string | undefined;
+    let oldName: string | undefined;
+    for (const [fp, entry] of Object.entries(registry)) {
+      if (fp === arg || entry.name.toLowerCase() === arg.toLowerCase()) {
+        foundFp = fp;
+        oldName = entry.name;
+        break;
+      }
+    }
+
+    if (!foundFp || !oldName) {
+      console.error(`Error: No agent found with fingerprint or name "${arg}".`);
+      process.exit(1);
+    }
+
+    renameAgent(foundFp, newName);
+    flushAgentRegistry();
+
+    // Update POLICY_FILE if it exists
+    if (existsSync(POLICY_FILE)) {
+      try {
+        let rawPolicy = yamlLoad(readFileSync(POLICY_FILE, 'utf-8')) as Record<string, unknown>;
+        if (!rawPolicy) rawPolicy = { version: 1 };
+        const agents = rawPolicy['agents'] as Record<string, unknown> | undefined;
+        if (agents && agents[oldName] !== undefined) {
+          agents[newName] = agents[oldName];
+          delete agents[oldName];
+          const tmp = POLICY_FILE + '.tmp';
+          writeFileSync(tmp, yamlDump(rawPolicy, { lineWidth: 120 }), 'utf-8');
+          renameSync(tmp, POLICY_FILE);
+        }
+      } catch {
+        // Best-effort — don't fail rename if policy update fails
+      }
+    }
+
+    console.log(`Renamed: ${oldName} → ${newName} (${foundFp})`);
+    return;
+  }
+
+  // ── policy reset ──────────────────────────────────────────────────────────
+
+  if (sub === 'reset') {
+    const confirm = subArgs.includes('--confirm');
+
+    if (!confirm) {
+      const existingPolicy = loadPolicy();
+      const agentCount = Object.keys(existingPolicy.agents ?? {}).length;
+      console.log('This will remove your routing policy and return to passthrough mode.');
+      console.log(`All ${agentCount} agent rule${agentCount !== 1 ? 's' : ''} will be deleted.`);
+      console.log('Run again with --confirm to proceed: relayplane policy reset --confirm');
+      return;
+    }
+
+    if (!existsSync(POLICY_FILE)) {
+      console.log('No policy file found — already in passthrough mode.');
+      return;
+    }
+
+    renameSync(POLICY_FILE, POLICY_FILE + '.bak');
+    console.log('Policy reset. RelayPlane is now in passthrough mode.');
+    console.log(`Backup saved at: ${POLICY_FILE}.bak`);
+    return;
+  }
+
+  console.log('Usage: relayplane policy [auto|suggest|test|rename|reset|init|show|set-agent]');
+}
+
+// ─── Policy auto helpers ───────────────────────────────────────────────────────
+
+function _promptLine(): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+    rl.once('line', (line) => {
+      rl.close();
+      resolve(line.trim());
+    });
+    rl.once('close', () => resolve(''));
+  });
+}
+
+function _buildPolicyFromSuggestions(
+  analyses: AgentAnalysis[],
+  suggestions: PolicySuggestion[],
+): RoutingPolicy {
+  const agents: Record<string, AgentPolicy> = {};
+  for (let i = 0; i < analyses.length; i++) {
+    const a = analyses[i]!;
+    const s = suggestions[i]!;
+    if (s.noSuggestion) continue;
+    const entry: AgentPolicy = {
+      fingerprint: a.fingerprint,
+      preferred: s.suggestedModel,
+    };
+    if (s.escalateTo) entry.escalateTo = s.escalateTo;
+    if (s.escalateOn) entry.escalateOn = s.escalateOn;
+    if (s.neverDowngrade) entry.neverDowngrade = true;
+    agents[a.name] = entry;
+  }
+  return { version: 1, agents };
+}
+
+function _buildPolicyYaml(analyses: AgentAnalysis[], suggestions: PolicySuggestion[]): string {
+  const isoDate = new Date().toISOString().slice(0, 10);
+  const header = [
+    '# RelayPlane routing policy',
+    `# Generated by \`relayplane policy auto\` on ${isoDate}`,
+    '# Edit manually or re-run `relayplane policy auto` to regenerate.',
+    '# Reset to passthrough: `relayplane policy reset`',
+    '',
+  ].join('\n');
+
+  const agents: Record<string, Record<string, unknown>> = {};
+  for (let i = 0; i < analyses.length; i++) {
+    const a = analyses[i]!;
+    const s = suggestions[i]!;
+    if (s.noSuggestion) continue;
+    const entry: Record<string, unknown> = {
+      fingerprint: a.fingerprint,
+      preferred: s.suggestedModel,
+    };
+    if (s.escalateTo) entry['escalateTo'] = s.escalateTo;
+    if (s.escalateOn) entry['escalateOn'] = s.escalateOn;
+    if (s.neverDowngrade) entry['neverDowngrade'] = true;
+    agents[a.name] = entry;
+  }
+
+  const body = yamlDump({ version: 1, agents }, { lineWidth: 120 });
+  return header + body;
+}
+
+async function _runPolicyAutoDisplay(
+  analyses: AgentAnalysis[],
+  availableProviders: string[],
+  autoApply: boolean,
+  interactive: boolean,
+): Promise<void> {
+  const suggestions = suggestPolicies(analyses, availableProviders);
+
+  // Phase 2 — Agent display
+  const n = analyses.length;
+  console.log('');
+  console.log(`Detected ${n} agent${n !== 1 ? 's' : ''}:`);
+  console.log('');
+
+  const maxNameLen = Math.max(...analyses.map(a => a.name.length)) + 2;
+  const lowDataAgents: string[] = [];
+
+  for (const a of analyses) {
+    const fpShort = a.fingerprint.slice(0, 8);
+    const namePad = a.name.padEnd(maxNameLen);
+    const pct = Math.round((a.taskDistribution[a.dominantTask] ?? 0) * 100);
+    const avgK = Math.round(a.avgTotalTokens / 1000);
+    const estFlag = a.tokensAreEstimated ? ' ~' : '';
+    const cost = a.costPerDay.toFixed(2);
+    console.log(`  ${fpShort}  →  "${namePad}"  (${pct}% ${a.dominantTask} tasks, avg ${avgK}K tokens${estFlag}, $${cost}/day)`);
+    if (a.totalRequests < 3) {
+      lowDataAgents.push(a.name);
+    }
+  }
+
+  if (lowDataAgents.length > 0) {
+    console.log('');
+    for (const name of lowDataAgents) {
+      const a = analyses.find(x => x.name === name)!;
+      console.log(`  ⚠ ${name}: only ${a.totalRequests} requests — suggestions may be inaccurate`);
+    }
+  }
+
+  // Phase 3 — Suggestions
+  console.log('');
+  console.log('Suggested policy (based on task patterns + your available keys):');
+  console.log('');
+
+  const maxSuggestNameLen = Math.max(...analyses.map(a => a.name.length)) + 2;
+  let totalMonthlySavings = 0;
+
+  for (const s of suggestions) {
+    const namePad = s.agentName.padEnd(maxSuggestNameLen);
+    if (s.noSuggestion) {
+      console.log(`  ${namePad}  →  ${s.currentModel}  (already optimal)`);
+    } else {
+      const escNote = s.escalateTo ? `  (escalate to ${s.escalateTo} on complexity)` : '';
+      const savingsNote = s.estimatedDailySavings > 0.01
+        ? `saves ~$${s.estimatedDailySavings.toFixed(2)}/day`
+        : '(no change)';
+      console.log(`  ${namePad}  →  ${s.suggestedModel}${escNote}  ${savingsNote}`);
+      totalMonthlySavings += s.estimatedMonthlySavings;
+    }
+  }
+
+  console.log('');
+  console.log(`Projected monthly savings: ~$${Math.round(totalMonthlySavings)}`);
+  console.log('');
+
+  if (!interactive) {
+    // policy suggest — print CTA and exit
+    console.log('To apply this policy, run: relayplane policy auto');
+    return;
+  }
+
+  // Phase 4 — Confirmation
+  if (existsSync(POLICY_FILE)) {
+    const existingPolicy = loadPolicy();
+    const existingAgents = Object.keys(existingPolicy.agents ?? {}).join(', ');
+    console.log(`⚠ Existing policy will be replaced. Previous: ${existingAgents || 'no agents'}.`);
+    console.log('');
+  }
+
+  let answer: string;
+  if (autoApply) {
+    answer = 'y';
+  } else {
+    process.stdout.write('Apply this policy? (y/n/edit) ');
+    answer = await _promptLine();
+  }
+
+  if (answer === 'edit' || answer === 'e') {
+    const tmpPath = join(os.tmpdir(), `relayplane-policy-${Date.now()}.yaml`);
+    const proposedYaml = _buildPolicyYaml(analyses, suggestions);
+    writeFileSync(tmpPath, proposedYaml, 'utf-8');
+
+    const editor = process.env['EDITOR'] ?? process.env['VISUAL'] ?? 'nano';
+    try {
+      spawnSync(editor, [tmpPath], { stdio: 'inherit' });
+    } catch {
+      spawnSync('vi', [tmpPath], { stdio: 'inherit' });
+    }
+
+    const editedYaml = readFileSync(tmpPath, 'utf-8');
+    try { unlinkSync(tmpPath); } catch { /* ok */ }
+
+    // Validate the edited YAML
+    const parsed = yamlLoad(editedYaml) as { version?: number } | null;
+    if (!parsed || parsed.version !== 1) {
+      console.error('Invalid policy YAML (must have version: 1). Discarded.');
+      return;
+    }
+
+    mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+    const tmp = POLICY_FILE + '.tmp';
+    writeFileSync(tmp, editedYaml, 'utf-8');
+    renameSync(tmp, POLICY_FILE);
+    console.log('\nPolicy applied (edited version).');
+    return;
+  }
+
+  if (answer === '' || answer.toLowerCase() === 'n' || answer.toLowerCase() === 'no') {
+    console.log('Discarded. No changes made.');
+    return;
+  }
+
+  // Phase 5 — Write
+  const yaml = _buildPolicyYaml(analyses, suggestions);
+  mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+  const tmp = POLICY_FILE + '.tmp';
+  writeFileSync(tmp, yaml, 'utf-8');
+  renameSync(tmp, POLICY_FILE);
+  const agentCount = analyses.filter((_, i) => !suggestions[i]?.noSuggestion).length;
+  console.log('');
+  console.log(`Policy applied. Routing active for ${agentCount} agent${agentCount !== 1 ? 's' : ''}.`);
+  console.log('Run `relayplane policy show` to review.');
+}
+
+// ─── setup command ─────────────────────────────────────────────────────────────
+
+async function handleSetupCommand(): Promise<void> {
+  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
+
+  console.log('Welcome to RelayPlane.');
+  console.log('Cost intelligence for AI agents.');
+  console.log('');
+
+  // Step 1 — Provider detection
+  console.log('Step 1/3 — Providers');
+  console.log('  Which AI providers do you have API keys for?');
+  console.log('');
+
+  const detectedProviders = detectAvailableProviders();
+  const allProviders: Array<{ name: string; displayName: string; detected: boolean; detectedEnv?: string; isLocal?: boolean }> = [
+    { name: 'anthropic',  displayName: 'Anthropic',     detected: detectedProviders.includes('anthropic'), detectedEnv: process.env['ANTHROPIC_API_KEY'] ? 'ANTHROPIC_API_KEY' : undefined },
+    { name: 'openai',     displayName: 'OpenAI',        detected: detectedProviders.includes('openai'),    detectedEnv: process.env['OPENAI_API_KEY'] ? 'OPENAI_API_KEY' : undefined },
+    { name: 'google',     displayName: 'Google Gemini', detected: detectedProviders.includes('google'),    detectedEnv: process.env['GEMINI_API_KEY'] ? 'GEMINI_API_KEY' : (process.env['GOOGLE_API_KEY'] ? 'GOOGLE_API_KEY' : undefined) },
+    { name: 'groq',       displayName: 'Groq',          detected: detectedProviders.includes('groq'),      detectedEnv: process.env['GROQ_API_KEY'] ? 'GROQ_API_KEY' : undefined },
+    { name: 'openrouter', displayName: 'OpenRouter',    detected: detectedProviders.includes('openrouter'), detectedEnv: process.env['OPENROUTER_API_KEY'] ? 'OPENROUTER_API_KEY' : undefined },
+    { name: 'ollama',     displayName: 'Ollama',        detected: false, isLocal: true },
+  ];
+
+  for (const p of allProviders) {
+    const checkbox = p.detected ? '[x]' : '[ ]';
+    const detectedNote = p.detected && p.detectedEnv ? ` (detected: ${p.detectedEnv})` : '';
+    const localNote = p.isLocal ? '  (local)' : '';
+    console.log(`  ${checkbox} ${p.displayName}${detectedNote}${localNote}`);
+  }
+  console.log('');
+
+  let confirmedProviders = [...detectedProviders];
+
+  if (!isTTY) {
+    // Non-TTY fast path
+    if (confirmedProviders.length === 0) {
+      console.log('  ⚠ No provider keys detected. RelayPlane will run in passthrough/observe mode.');
+      console.log('  You can add keys later: relayplane config set-key');
+    }
+    console.log('');
+    console.log('Step 2/3 — Routing mode');
+    console.log('  Auto mode selected (non-interactive).');
+    console.log('');
+    console.log('Step 3/3 — Done');
+    console.log('');
+    console.log('  RelayPlane is ready.');
+    console.log('');
+    console.log('  Proxy:        http://localhost:4100');
+    console.log('  Configure:    ANTHROPIC_BASE_URL=http://localhost:4100');
+    console.log('');
+    console.log('  Next: run RelayPlane for a day, then:');
+    console.log('    relayplane policy auto    # auto-configure routing');
+    console.log('    relayplane policy suggest  # preview recommendations');
+    console.log('');
+    console.log('  Docs: https://relayplane.com/docs');
+    console.log('');
+    return;
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const prompt = (q: string): Promise<string> =>
+    new Promise(resolve => rl.question(q, ans => resolve(ans.trim())));
+
+  const addInput = await prompt('Press Enter to confirm, or list provider names to add (comma-separated): ');
+  if (addInput) {
+    const extras = addInput.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    for (const e of extras) {
+      if (!confirmedProviders.includes(e)) confirmedProviders.push(e);
+    }
+  }
+
+  if (confirmedProviders.length === 0) {
+    console.log('  ⚠ No provider keys detected. RelayPlane will run in passthrough/observe mode.');
+    console.log('  You can add keys later: relayplane config set-key');
+  }
+
+  // Step 2 — Routing mode
+  console.log('');
+  console.log('Step 2/3 — Routing mode');
+  console.log('  How should RelayPlane route your requests?');
+  console.log('');
+  console.log('  1. Auto (recommended) — route by task complexity, cheapest capable model');
+  console.log('  2. Manual — I\'ll configure routing rules myself');
+  console.log('  3. Passthrough — just observe costs, no routing changes');
+  console.log('');
+
+  const modeInput = await prompt('Choice [1]: ');
+  let routingMode: 'auto' | 'manual' | 'passthrough' = 'auto';
+  if (modeInput === '2' || modeInput.toLowerCase() === 'manual') routingMode = 'manual';
+  else if (modeInput === '3' || modeInput.toLowerCase() === 'passthrough') routingMode = 'passthrough';
+
+  rl.close();
+
+  mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
+
+  if (routingMode === 'auto') {
+    if (existsSync(POLICY_FILE)) {
+      console.log('  (Existing policy preserved — run `relayplane policy auto` to update it)');
+    } else {
+      const autoYaml = [
+        '# RelayPlane routing policy',
+        '# Run `relayplane policy auto` after a day of traffic to auto-configure.',
+        '# Auto mode: suggestions will be based on your actual traffic patterns.',
+        '',
+        'version: 1',
+        '',
+        '# agents will be added here by `relayplane policy auto`',
+        '',
+      ].join('\n');
+      writeFileSync(POLICY_FILE, autoYaml, 'utf-8');
+    }
+  } else if (routingMode === 'manual') {
+    console.log('  Run `relayplane policy init` to scaffold a policy template.');
+  }
+  // passthrough: do not write any policy file
+
+  // Step 3 — Done
+  console.log('');
+  console.log('Step 3/3 — Done');
+  console.log('');
+  console.log('  RelayPlane is ready.');
+  console.log('');
+  console.log('  Proxy:        http://localhost:4100');
+  console.log('  Configure:    ANTHROPIC_BASE_URL=http://localhost:4100');
+  console.log('');
+  console.log('  Next: run RelayPlane for a day, then:');
+  console.log('    relayplane policy auto    # auto-configure routing');
+  console.log('    relayplane policy suggest  # preview recommendations');
+  console.log('');
+  console.log('  Docs: https://relayplane.com/docs');
+  console.log('');
 }
 
 main();
