@@ -404,8 +404,12 @@ export class ProxyServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
 
-    // CORS headers
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // CORS headers — restrict to localhost origins to prevent cross-site data exfiltration
+    const origin = req.headers.origin as string | undefined;
+    const allowedOrigins = ['http://localhost:4100', 'http://localhost:3000', 'http://127.0.0.1:4100', 'http://127.0.0.1:3000'];
+    if (origin && allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-RelayPlane-Workspace, X-RelayPlane-Agent, X-RelayPlane-Session, X-RelayPlane-Automated');
 
@@ -1370,13 +1374,25 @@ export class ProxyServer {
     );
   }
 
+  /** Maximum request body size (1 MB) */
+  private static readonly MAX_BODY_SIZE = 1_048_576;
+
   /**
-   * Read request body
+   * Read request body with size limit to prevent memory exhaustion from oversized payloads.
    */
   private readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = '';
-      req.on('data', (chunk) => (body += chunk));
+      let size = 0;
+      req.on('data', (chunk: Buffer | string) => {
+        size += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
+        if (size > ProxyServer.MAX_BODY_SIZE) {
+          req.destroy();
+          reject(new Error('Request body exceeds 1 MB size limit'));
+          return;
+        }
+        body += chunk;
+      });
       req.on('end', () => resolve(body));
       req.on('error', reject);
     });
