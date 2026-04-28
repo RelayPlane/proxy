@@ -3257,7 +3257,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 <table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section collapsible collapsed"><h2>Learning</h2><div id="learning-panel" style="display:flex;flex-direction:column;gap:12px"><div id="learning-stats" style="display:flex;gap:12px;flex-wrap:wrap"></div><div id="learning-recent"></div></div></div>
-<div class="section collapsible" id="sessions-section"><h2>Sessions <span id="sessionsLabel" style="font-size:.75rem;color:#64748b;font-weight:400">(last 7d)</span></h2>
+<div class="section collapsible collapsed" id="sessions-section"><h2>Sessions <span id="sessionsLabel" style="font-size:.75rem;color:#64748b;font-weight:400">(last 7d)</span></h2>
 <table><thead><tr><th>Session ID</th><th>Source</th><th>Started</th><th>Duration</th><th>Requests</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Models</th><th>Status</th></tr></thead><tbody id="sessions"></tbody></table>
 </div>
 <div class="section collapsible collapsed" id="token-pool-section"><h2>Token Pool</h2><div id="token-pool-panel"></div></div>
