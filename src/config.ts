@@ -262,7 +262,7 @@ function generateDeviceId(): string {
  */
 function ensureConfigDir(): void {
   if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
 }
 
@@ -432,9 +432,9 @@ export function saveConfig(config: ProxyConfig): void {
     }
   }
   
-  // Atomic write: write to tmp, then rename
+  // Atomic write: write to tmp with restricted permissions, then rename
   const data = JSON.stringify(config, null, 2);
-  fs.writeFileSync(CONFIG_TMP, data);
+  fs.writeFileSync(CONFIG_TMP, data, { mode: 0o600 });
   fs.renameSync(CONFIG_TMP, CONFIG_FILE);
 }
 
@@ -524,7 +524,7 @@ export function setApiKey(key: string): void {
       creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
     }
     creds.apiKey = key;
-    fs.writeFileSync(credPath, JSON.stringify(creds, null, 2));
+    fs.writeFileSync(credPath, JSON.stringify(creds, null, 2), { mode: 0o600 });
   } catch {}
 }
 
