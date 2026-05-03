@@ -14,6 +14,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeSaveRecommendation,
   formatSaveRecommendationTip,
+  toYamlPatch,
   type SaveRecommendation,
 } from '../src/save-recommendation.js';
 import type { RoutingLogEntry } from '../src/routing-log.js';
@@ -220,5 +221,53 @@ describe('formatSaveRecommendationTip — format', () => {
     expect(tip).toMatch(/^TIP:/);
     // When savings unknown, no $ amount or shows $0.00
     expect(tip).toMatch(/\$0\.00\/day|cheaper route/i);
+  });
+});
+
+// ─── toYamlPatch ──────────────────────────────────────────────────────────────
+
+describe('toYamlPatch — output format', () => {
+  const rec: SaveRecommendation = {
+    opusCount: 14,
+    avgComplexityScore: 0.3,
+    sonnetThresholdScore: 0.4,
+    estimatedDailySavings: 3.42,
+    windowSize: 20,
+  };
+
+  it('returns a string', () => {
+    expect(typeof toYamlPatch(rec)).toBe('string');
+  });
+
+  it('contains routing: key', () => {
+    expect(toYamlPatch(rec)).toMatch(/^routing:/m);
+  });
+
+  it('contains default_model set to a sonnet model', () => {
+    expect(toYamlPatch(rec)).toMatch(/default_model:\s*claude-sonnet/);
+  });
+
+  it('contains routing_mode: complexity', () => {
+    expect(toYamlPatch(rec)).toMatch(/routing_mode:\s*complexity/);
+  });
+
+  it('includes estimated weekly savings comment', () => {
+    // estimatedDailySavings * 7 = 23.94
+    const patch = toYamlPatch(rec);
+    expect(patch).toMatch(/weekly|savings/i);
+    expect(patch).toMatch(/\$23\.9[0-9]/);
+  });
+
+  it('includes a safety/reason comment explaining why it is safe', () => {
+    const patch = toYamlPatch(rec);
+    // Should explain that tasks were classified as simple/moderate
+    expect(patch).toMatch(/simple|moderate|safe|complexity/i);
+  });
+
+  it('returns non-empty string for recommendation with zero savings', () => {
+    const zeroRec: SaveRecommendation = { ...rec, estimatedDailySavings: 0 };
+    const patch = toYamlPatch(zeroRec);
+    expect(patch.length).toBeGreaterThan(0);
+    expect(patch).toMatch(/routing:/);
   });
 });

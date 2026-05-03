@@ -9,7 +9,7 @@
  *   - byDay breakdown matches actual call timestamps
  *   - Two tenants A and B have fully isolated cost views
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -111,47 +111,65 @@ describe('CostLedger — per-tenant isolation', () => {
   });
 
   it('byDay breakdown matches actual call timestamps', () => {
-    const ledger = new CostLedger();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-26T12:00:00Z'));
+    try {
+      const ledger = new CostLedger();
 
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.01, requestCount: 1, timestamp: new Date('2026-04-24T09:00:00Z') });
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.02, requestCount: 1, timestamp: new Date('2026-04-25T12:00:00Z') });
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.03, requestCount: 1, timestamp: new Date('2026-04-26T08:00:00Z') });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.01, requestCount: 1, timestamp: new Date('2026-04-24T09:00:00Z') });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.02, requestCount: 1, timestamp: new Date('2026-04-25T12:00:00Z') });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.03, requestCount: 1, timestamp: new Date('2026-04-26T08:00:00Z') });
 
-    const result = ledger.query('tenant-a', '7d');
+      const result = ledger.query('tenant-a', '7d');
 
-    expect(result.byDay['2026-04-24']).toBeCloseTo(0.01, 6);
-    expect(result.byDay['2026-04-25']).toBeCloseTo(0.02, 6);
-    expect(result.byDay['2026-04-26']).toBeCloseTo(0.03, 6);
+      expect(result.byDay['2026-04-24']).toBeCloseTo(0.01, 6);
+      expect(result.byDay['2026-04-25']).toBeCloseTo(0.02, 6);
+      expect(result.byDay['2026-04-26']).toBeCloseTo(0.03, 6);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('range=7d excludes records older than 7 days', () => {
-    const ledger = new CostLedger();
     const now = new Date('2026-04-26T10:00:00Z');
-    const eightDaysAgo = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
-    const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const ledger = new CostLedger();
+      const eightDaysAgo = new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000);
+      const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
 
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.5, requestCount: 1, timestamp: eightDaysAgo });
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.1, requestCount: 1, timestamp: threeDaysAgo });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.5, requestCount: 1, timestamp: eightDaysAgo });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.1, requestCount: 1, timestamp: threeDaysAgo });
 
-    const result = ledger.query('tenant-a', '7d');
+      const result = ledger.query('tenant-a', '7d');
 
-    expect(result.totalUsd).toBeCloseTo(0.1, 6);
-    expect(result.requestCount).toBe(1);
+      expect(result.totalUsd).toBeCloseTo(0.1, 6);
+      expect(result.requestCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('range=30d excludes records older than 30 days', () => {
-    const ledger = new CostLedger();
     const now = new Date('2026-04-26T10:00:00Z');
-    const thirtyOneDaysAgo = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
-    const fifteenDaysAgo = new Date(now.getTime() - 15 * 24 * 60 * 60 * 1000);
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const ledger = new CostLedger();
+      const thirtyOneDaysAgo = new Date(now.getTime() - 31 * 24 * 60 * 60 * 1000);
+      const fifteenDaysAgo = new Date(now.getTime() - 15 * 24 * 60 * 60 * 1000);
 
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.5, requestCount: 1, timestamp: thirtyOneDaysAgo });
-    ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.2, requestCount: 1, timestamp: fifteenDaysAgo });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.5, requestCount: 1, timestamp: thirtyOneDaysAgo });
+      ledger.record({ tenantId: 'tenant-a', model: 'claude-sonnet-4-6', costUsd: 0.2, requestCount: 1, timestamp: fifteenDaysAgo });
 
-    const result = ledger.query('tenant-a', '30d');
+      const result = ledger.query('tenant-a', '30d');
 
-    expect(result.totalUsd).toBeCloseTo(0.2, 6);
-    expect(result.requestCount).toBe(1);
+      expect(result.totalUsd).toBeCloseTo(0.2, 6);
+      expect(result.requestCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('unknown tenant returns zeroed result', () => {
