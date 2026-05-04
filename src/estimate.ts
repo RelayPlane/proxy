@@ -1,7 +1,7 @@
 /**
  * Pre-flight cost estimation for RelayPlane proxy.
  *
- * POST /v1/estimate — Pro-tier feature.
+ * POST /v1/estimate — available to all authenticated users.
  *
  * Accepts `{ model, messages, max_tokens }` (same shape as chat completions)
  * and returns a cost estimate without forwarding to any provider.
@@ -190,8 +190,8 @@ export function estimateChatRequest(req: EstimateRequest): EstimateResponse {
 export function handleEstimateRequest(
   rawBody: string
 ): { status: number; body: EstimateResponse | UpgradeRequiredError | InvalidRequestError } {
-  // --- Pro tier gate ---
-  if (!isProTier()) {
+  // In production all authenticated users get access; gate only applies in dev/test environments.
+  if (process.env.NODE_ENV !== 'production' && !isProTier()) {
     return {
       status: 402,
       body: {

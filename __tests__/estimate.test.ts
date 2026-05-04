@@ -547,3 +547,69 @@ describe('relayEstimateCost — SSRF validation (Fix #4)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 0 item 2: free-tier access to /v1/estimate (rp-estimate-free-tier)
+// ---------------------------------------------------------------------------
+
+describe('handleEstimateRequest — free-tier access (Phase 0)', () => {
+  it('returns 200 EstimateResponse for free-tier users (no plan, no env override)', () => {
+    // Simulate a free-tier user: clear RELAYPLANE_PRO_ESTIMATE and set NODE_ENV=production
+    // so the env-override bypass path is not taken.  The Pro gate must NOT fire.
+    withEnv('RELAYPLANE_PRO_ESTIMATE', undefined, () => {
+      const origNode = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        const result = handleEstimateRequest(
+          JSON.stringify({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: 'How much will this cost?' }],
+          })
+        );
+        // Must NOT return upgrade_required for free-tier users
+        expect(result.status).toBe(200);
+        expect((result.body as any).note).toBe('estimate only');
+        expect((result.body as any).estimated_cost_usd).toBeGreaterThan(0);
+      } finally {
+        process.env.NODE_ENV = origNode;
+      }
+    });
+  });
+
+  it('free-tier users receive full EstimateResponse shape', () => {
+    withEnv('RELAYPLANE_PRO_ESTIMATE', undefined, () => {
+      const origNode = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        const result = handleEstimateRequest(
+          JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            messages: [{ role: 'user', content: 'Tell me a story' }],
+            max_tokens: 200,
+          })
+        );
+        expect(result.status).toBe(200);
+        const body = result.body as any;
+        expect(body).toHaveProperty('model', 'claude-sonnet-4-6');
+        expect(body).toHaveProperty('estimated_cost_usd');
+        expect(body).toHaveProperty('input_tokens');
+        expect(body).toHaveProperty('estimated_output_tokens', 200);
+        expect(body).toHaveProperty('provider', 'anthropic');
+        expect(body).toHaveProperty('note', 'estimate only');
+      } finally {
+        process.env.NODE_ENV = origNode;
+      }
+    });
+  });
+
+  it('JSDoc no longer describes /v1/estimate as a Pro-tier feature', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const src = fs.readFileSync(
+      path.resolve(__dirname, '../src/estimate.ts'),
+      'utf8'
+    );
+    // The old JSDoc said "Pro-tier feature" — it must be removed
+    expect(src).not.toMatch(/Pro-tier feature/);
+  });
+});
