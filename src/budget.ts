@@ -409,6 +409,9 @@ export class BudgetManager {
    * Called only when X-Claude-Code-Session-Id header is present.
    */
   checkSessionBudget(sessionId: string, requestedModel: string): SessionBudgetCheckResult {
+    if (!this.config.enabled) {
+      return { allowed: true, model: requestedModel, spent: 0, cap: 0 };
+    }
     const record = this._getOrCreateSessionRecord(sessionId, this.config.sessionCapUsd);
     const spent = record.spentUsd;
     const cap = record.capUsd;

@@ -170,6 +170,25 @@ describe('Session Budget', () => {
     });
   });
 
+  describe('disabled mode', () => {
+    it('allows session requests when enabled: false, even above $1 default cap', () => {
+      const disabledMgr = new BudgetManager({ enabled: false });
+      const result = disabledMgr.checkSessionBudget('session-1', 'claude-opus-4-5');
+      expect(result.allowed).toBe(true);
+      expect(result.spent).toBe(0);
+      expect(result.cap).toBe(0);
+      disabledMgr.close();
+    });
+
+    it('allows session even after large spend accumulation when enabled: false', () => {
+      const disabledMgr = new BudgetManager({ enabled: false });
+      disabledMgr.updateSessionBudget('session-1', 5.00, 'claude-opus-4-5');
+      const result = disabledMgr.checkSessionBudget('session-1', 'claude-opus-4-5');
+      expect(result.allowed).toBe(true);
+      disabledMgr.close();
+    });
+  });
+
   describe('config defaults', () => {
     it('uses sessionCapUsd from config', () => {
       const mgr = new BudgetManager({
