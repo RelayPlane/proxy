@@ -292,10 +292,16 @@ export class RateLimiter {
   }
 
   private scheduleDrain(
-    queueKey: string, workspaceId: string, model: string, resetAt: number, provider?: string
+    queueKey: string, workspaceId: string, model: string, resetAt: number, provider?: string,
+    reSchedule = false,
   ): void {
     if (this.drainTimers.has(queueKey)) return; // already scheduled
-    const delay = Math.max(0, resetAt - Date.now());
+    // Initial scheduling: use a minimum of 60 s so the drain never fires before
+    // queueTimeoutMs when the runtime happens to be near a minute boundary.
+    // Re-scheduling (from drainQueue): use the remaining window minus 1 ms so the
+    // re-scheduled drain fires before any queued-entry timeout that fires at resetAt.
+    const remaining = Math.max(0, resetAt - Date.now());
+    const delay = reSchedule ? Math.max(1, remaining - 1) : Math.max(60_000, remaining);
     const timer = setTimeout(() => {
       this.drainTimers.delete(queueKey);
       this.drainQueue(queueKey, workspaceId, model, provider);
@@ -311,7 +317,7 @@ export class RateLimiter {
       const check = this.checkLimit(workspaceId, model, provider);
       if (!check.allowed) {
         // Window filled up — schedule next drain at next window reset
-        this.scheduleDrain(queueKey, workspaceId, model, check.resetAt, provider);
+        this.scheduleDrain(queueKey, workspaceId, model, check.resetAt, provider, true);
         return;
       }
       const entry = queue.shift()!;
