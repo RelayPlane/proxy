@@ -53,6 +53,10 @@ export interface TokenState {
   windowStart: number;
   /** Best-known RPM limit learned from upstream headers */
   knownRpmLimit: number;
+  /** Consecutive 401 auth failures since last success */
+  consecutiveAuthFailures: number;
+  /** Unix ms timestamp until which this token is quarantined after repeated 401s */
+  quarantinedUntil: number;
 }
 
 export interface TokenPoolStatus {
@@ -74,6 +78,10 @@ const THROTTLE_RATIO = 0.9;
 const AUTO_DETECT_PRIORITY = 10;
 /** Default rate-limit window after a 429 when no Retry-After header is present */
 const DEFAULT_RETRY_AFTER_S = 60;
+/** Consecutive 401s before a credential is quarantined */
+const AUTH_FAILURE_THRESHOLD = 2;
+/** How long a quarantined credential is skipped (ms) */
+const QUARANTINE_DURATION_MS = 60 * 60 * 1000; // 1 hour
 
 export class TokenPool {
   private tokens: Map<string, TokenState> = new Map();
@@ -138,6 +146,28 @@ export class TokenPool {
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
+
+  /**
+   * Record a 401 auth failure. After AUTH_FAILURE_THRESHOLD consecutive failures
+   * the credential is quarantined for QUARANTINE_DURATION_MS.
+   */
+  recordAuthFailure(apiKey: string, now: number = Date.now()): void {
+    const state = this.tokens.get(apiKey);
+    if (!state) return;
+    state.consecutiveAuthFailures += 1;
+    if (state.consecutiveAuthFailures >= AUTH_FAILURE_THRESHOLD) {
+      state.quarantinedUntil = now + QUARANTINE_DURATION_MS;
+    }
+  }
+
+  /**
+   * Record a successful response — resets the consecutive auth failure counter.
+   */
+  recordSuccess(apiKey: string): void {
+    const state = this.tokens.get(apiKey);
+    if (!state) return;
+    state.consecutiveAuthFailures = 0;
+  }
 
   /**
    * Record a 429 response for the given apiKey.
@@ -230,6 +260,8 @@ export class TokenPool {
       // the real current time rather than creation time (which may differ in tests).
       windowStart: 0,
       knownRpmLimit: getDefaultRpm('anthropic', isOat),
+      consecutiveAuthFailures: 0,
+      quarantinedUntil: 0,
     };
   }
 
@@ -245,6 +277,7 @@ export class TokenPool {
 
   private isAvailable(t: TokenState, now: number): boolean {
     if (t.rateLimitedUntil > now) return false;
+    if (t.quarantinedUntil > now) return false;
     if (t.requestsThisMinute >= t.knownRpmLimit * THROTTLE_RATIO) return false;
     return true;
   }
