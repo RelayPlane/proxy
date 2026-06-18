@@ -1,5 +1,40 @@
 # Changelog
 
+## Fork: native-protocol delegation (phucpnt)
+
+**Native /v1/messages delegation to Anthropic-compatible providers.** Forward
+native Claude Code requests for non-Anthropic `vendor/model` slugs (e.g.
+`minimax/minimax-m3`) to a third-party endpoint that speaks the Anthropic
+Messages API (OpenRouter by default). The request body is forwarded verbatim —
+no Anthropic↔OpenAI translation — so a Claude Code subagent configured with
+`model: minimax/minimax-m3` is served natively by MiniMax while `claude-*`
+models continue to Anthropic.
+
+- Works with no config: any `vendor/model` (vendor ≠ `anthropic`) or
+  `openrouter/...` slug routes to OpenRouter using `OPENROUTER_API_KEY`.
+- The Claude subscription/OAuth token is **never** forwarded to the delegate;
+  the delegate is authenticated only with its own provider key.
+- Streaming (SSE) and non-streaming both supported.
+- Configurable via the optional `nativeDelegate` section (see below) to target
+  MiniMax-direct, DeepSeek, or any other Anthropic-compatible endpoint.
+
+```json
+{
+  "nativeDelegate": {
+    "enabled": true,
+    "baseUrl": "https://openrouter.ai/api/v1/messages",
+    "apiKeyEnv": "OPENROUTER_API_KEY",
+    "stripPrefix": "openrouter/"
+  }
+}
+```
+
+Implementation: `resolveNativeDelegate()` + a 3-line branch in
+`forwardNativeAnthropicRequest()` and the passthrough gate in
+`src/standalone-proxy.ts`.
+
+---
+
 ## v1.9.0 (2026-04-02)
 
 ### Features

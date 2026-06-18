@@ -805,6 +805,19 @@ interface RelayPlaneProxyConfigFile {
    */
   crossProviderCascade?: Partial<CrossProviderCascadeConfig>;
   /**
+   * Native-protocol delegation. Forwards native /v1/messages requests for
+   * non-Anthropic "vendor/model" slugs (e.g. "minimax/minimax-m3") to an
+   * Anthropic-COMPATIBLE third-party endpoint. Defaults to OpenRouter using
+   * OPENROUTER_API_KEY, so it works with no config. The Claude subscription
+   * token is never forwarded to the delegate.
+   *
+   * Example (route MiniMax direct instead of OpenRouter):
+   * ```json
+   * { "nativeDelegate": { "baseUrl": "https://api.minimax.io/anthropic/v1/messages", "apiKeyEnv": "MINIMAX_API_KEY", "stripPrefix": "" } }
+   * ```
+   */
+  nativeDelegate?: NativeDelegateConfig;
+  /**
    * Ollama local model provider configuration.
    *
    * Example:
@@ -1696,6 +1709,57 @@ async function forwardToAnthropicStream(
 }
 
 /**
+ * RelayPlane patch — native-protocol delegation to an Anthropic-COMPATIBLE
+ * third-party endpoint (e.g. OpenRouter).
+ *
+ * Claude Code talks the native Anthropic Messages API on /v1/messages. Some
+ * third parties (OpenRouter) expose that exact same API, so a request can be
+ * forwarded VERBATIM — only the base URL and auth header change. No
+ * Anthropic<->OpenAI translation is involved.
+ *
+ * Trigger: a "vendor/model" slug whose vendor is not "anthropic"
+ * (e.g. "minimax/minimax-m3"), or an explicit "openrouter/..." prefix.
+ * Requires OPENROUTER_API_KEY in the environment. The user's Claude
+ * subscription token is NEVER forwarded to the delegate.
+ */
+/**
+ * Native-delegate configuration (optional `nativeDelegate` section in
+ * ~/.relayplane/config.json). Defaults target OpenRouter's Anthropic-compatible
+ * endpoint using OPENROUTER_API_KEY, so the feature works with no config.
+ */
+interface NativeDelegateConfig {
+  /** Set false to disable delegation entirely (default: on when a token exists). */
+  enabled?: boolean;
+  /** Anthropic-compatible Messages endpoint to forward to. */
+  baseUrl?: string;
+  /** Env var holding the bearer token for the delegate provider. */
+  apiKeyEnv?: string;
+  /** Prefix stripped from the model name before forwarding (e.g. "openrouter/"). */
+  stripPrefix?: string;
+}
+
+/** Snapshot refreshed on every proxy config (re)load — avoids per-request disk reads. */
+let nativeDelegateConfig: NativeDelegateConfig = {};
+function applyNativeDelegateConfig(cfg: { nativeDelegate?: NativeDelegateConfig } | undefined): void {
+  nativeDelegateConfig = cfg?.nativeDelegate ?? {};
+}
+
+function resolveNativeDelegate(
+  model: string
+): { url: string; token: string; model: string } | null {
+  const cfg = nativeDelegateConfig;
+  if (cfg.enabled === false) return null;
+  const token = process.env[cfg.apiKeyEnv || 'OPENROUTER_API_KEY'];
+  if (!token) return null;
+  let slug = model;
+  const stripPrefix = cfg.stripPrefix ?? 'openrouter/';
+  if (stripPrefix && slug.startsWith(stripPrefix)) slug = slug.slice(stripPrefix.length);
+  if (!slug.includes('/')) return null;            // not a vendor/model slug
+  if (slug.split('/')[0]?.toLowerCase() === 'anthropic') return null; // native Anthropic stays native
+  return { url: cfg.baseUrl || 'https://openrouter.ai/api/v1/messages', token, model: slug };
+}
+
+/**
  * Forward native Anthropic /v1/messages request (passthrough with routing)
  * Used for Claude Code direct integration
  */
@@ -1706,6 +1770,21 @@ async function forwardNativeAnthropicRequest(
   isMaxToken?: boolean,
   isRerouted?: boolean
 ): Promise<Response> {
+  // RelayPlane patch: route delegated (non-Anthropic) models to an
+  // Anthropic-compatible third party with that provider's own key.
+  const delegate = resolveNativeDelegate(String(body['model'] ?? ''));
+  if (delegate) {
+    return fetch(delegate.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': ctx.versionHeader || '2023-06-01',
+        'Authorization': `Bearer ${delegate.token}`,
+      },
+      body: JSON.stringify({ ...body, model: delegate.model }),
+    });
+  }
+
   const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -3656,6 +3735,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const configPath = getProxyConfigPath();
   let proxyConfig = await loadProxyConfig(configPath, log);
+  applyNativeDelegateConfig(proxyConfig);
 
   // ── Deterministic Traces: initialise TraceWriter with loaded config ──
   TraceWriter.getInstance({
@@ -4023,6 +4103,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const reloadConfig = async () => {
     proxyConfig = await loadProxyConfig(configPath, log);
+    applyNativeDelegateConfig(proxyConfig);
     cooldownManager.updateConfig(getCooldownConfig(proxyConfig));
     budgetManager.updateConfig({ ...budgetManager.getConfig(), ...(proxyConfig.budget ?? {}) });
     budgetTracker.updateConfig({
@@ -5418,19 +5499,27 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       if (routingMode === 'passthrough') {
-        const resolved = resolveExplicitModel(requestedModel);
-        if (!resolved) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(buildModelNotFoundError(requestedModel, getAvailableModelNames())));
-          return;
+        // RelayPlane patch: accept delegated (non-Anthropic) models served
+        // over an Anthropic-compatible endpoint (e.g. minimax/minimax-m3).
+        const nativeDelegate = resolveNativeDelegate(requestedModel);
+        if (nativeDelegate) {
+          targetProvider = 'openrouter';
+          targetModel = nativeDelegate.model;
+        } else {
+          const resolved = resolveExplicitModel(requestedModel);
+          if (!resolved) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(buildModelNotFoundError(requestedModel, getAvailableModelNames())));
+            return;
+          }
+          if (resolved.provider !== 'anthropic') {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Native /v1/messages only supports Anthropic models.' }));
+            return;
+          }
+          targetProvider = resolved.provider;
+          targetModel = resolved.model;
         }
-        if (resolved.provider !== 'anthropic') {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Native /v1/messages only supports Anthropic models.' }));
-          return;
-        }
-        targetProvider = resolved.provider;
-        targetModel = resolved.model;
       } else if (!useCascade) {
         let selectedModel: string | null = null;
         if (routingMode === 'cost') {
