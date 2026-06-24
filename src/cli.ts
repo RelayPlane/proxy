@@ -78,6 +78,7 @@ import type { PolicySuggestion } from './policy-suggestions.js';
 import { getAgentRegistry, loadAgentRegistry, flushAgentRegistry, renameAgent } from './agent-tracker.js';
 import { getRoutingLog } from './routing-log.js';
 import { resolvePolicy } from './agent-policy.js';
+import { handleCcCommand } from './cc-setup.js';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
@@ -557,6 +558,7 @@ Usage:
 
 Commands:
   (default)              Start the proxy server
+  cc up|down|status      Set up Claude Code for GLM/MiniMax subagents (--global | --project)
   init                   Interactive setup wizard (API key, budget cap, routing mode)
   login                  Log in to RelayPlane (opens browser)
   logout                 Clear stored credentials
@@ -1501,7 +1503,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'lifecycle', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
-    'ensure-running', 'agents', 'policy', 'setup',
+    'ensure-running', 'agents', 'policy', 'setup', 'cc',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1602,6 +1604,11 @@ async function main(): Promise<void> {
 
   if (command === 'setup') {
     await handleSetupCommand();
+    process.exit(0);
+  }
+
+  if (command === 'cc') {
+    await handleCcCommand(args.slice(1));
     process.exit(0);
   }
 

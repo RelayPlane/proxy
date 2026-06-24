@@ -1,5 +1,35 @@
 # Changelog
 
+## Fork: `relayplane cc` Claude Code setup command (phucpnt)
+
+**One-command setup + lifecycle for Claude Code + GLM/MiniMax subagents.**
+
+```
+relayplane cc up      [--global | --project [path]] [--foreground]
+relayplane cc down    [--global | --project [path]]
+relayplane cc status
+```
+
+`up` wires three things and starts the proxy as a background daemon:
+- `~/.relayplane/config.json` — nativeDelegate providers (zai + minimax),
+  `routing.mode=standard`, `first_run_complete=true`, cache off.
+- `<scope>/.claude/settings.json` — `env.ANTHROPIC_BASE_URL` → the proxy.
+- `<scope>/.claude/agents/{glm,minimax}.md` — the delegating subagents.
+
+`--global` wires `~/.claude` for all projects; `--project` scopes the wiring
+and agents to one repo (the proxy/config stay global — one process, one port).
+
+Auth: the main agent uses Claude Code's normal OAuth session (passthrough). The
+command never sets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so OAuth is left
+intact; if a turn fails auth the user simply re-logs-in Claude Code. Provider
+keys are prompted (hidden) and stored only in `~/.relayplane/.env` (chmod 600),
+injected into the proxy process on start. `down` un-wires and stops the daemon;
+`status` reports proxy health and what is wired where.
+
+Implementation: `src/cc-setup.ts` + a `cc` branch in `src/cli.ts`.
+
+---
+
 ## Fork: per-vendor native delegation (phucpnt)
 
 **Per-vendor routing for native delegation.** The `nativeDelegate` section now
