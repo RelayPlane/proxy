@@ -811,10 +811,23 @@ interface RelayPlaneProxyConfigFile {
    * OPENROUTER_API_KEY, so it works with no config. The Claude subscription
    * token is never forwarded to the delegate.
    *
-   * Example (route MiniMax direct instead of OpenRouter):
+   * Single-delegate form (every non-Anthropic slug → one endpoint, e.g. MiniMax):
    * ```json
    * { "nativeDelegate": { "baseUrl": "https://api.minimax.io/anthropic/v1/messages", "apiKeyEnv": "MINIMAX_API_KEY", "stripPrefix": "" } }
    * ```
+   *
+   * Per-vendor form (route each "vendor/model" slug to its own provider — e.g.
+   * GLM direct to z.ai AND MiniMax direct, simultaneously). The slug's vendor
+   * prefix selects the provider; `stripVendor` drops "vendor/" so z.ai receives
+   * a bare "glm-4.6", and `modelMap` allows explicit slug→model rewrites:
+   * ```json
+   * { "nativeDelegate": { "providers": {
+   *     "zai":     { "baseUrl": "https://api.z.ai/api/anthropic/v1/messages", "apiKeyEnv": "ZAI_API_KEY", "stripVendor": true },
+   *     "minimax": { "baseUrl": "https://api.minimax.io/anthropic/v1/messages", "apiKeyEnv": "MINIMAX_API_KEY" }
+   * } } }
+   * ```
+   * A matching `providers` entry takes precedence; vendors with no entry fall
+   * back to the single-delegate (OpenRouter) default.
    */
   nativeDelegate?: NativeDelegateConfig;
   /**
@@ -1727,15 +1740,32 @@ async function forwardToAnthropicStream(
  * ~/.relayplane/config.json). Defaults target OpenRouter's Anthropic-compatible
  * endpoint using OPENROUTER_API_KEY, so the feature works with no config.
  */
+interface NativeDelegateProvider {
+  /** Set false to disable just this vendor (default: on when its token exists). */
+  enabled?: boolean;
+  /** Anthropic-compatible Messages endpoint for this vendor. */
+  baseUrl: string;
+  /** Env var holding the bearer token for this vendor. */
+  apiKeyEnv: string;
+  /** Drop the leading "vendor/" so the provider receives a bare model name. */
+  stripVendor?: boolean;
+  /** Prefix stripped from the slug before forwarding (alternative to stripVendor). */
+  stripPrefix?: string;
+  /** Explicit incoming-slug → outgoing-model rewrites (highest precedence). */
+  modelMap?: Record<string, string>;
+}
+
 interface NativeDelegateConfig {
   /** Set false to disable delegation entirely (default: on when a token exists). */
   enabled?: boolean;
-  /** Anthropic-compatible Messages endpoint to forward to. */
+  /** Anthropic-compatible Messages endpoint to forward to (single-delegate form). */
   baseUrl?: string;
   /** Env var holding the bearer token for the delegate provider. */
   apiKeyEnv?: string;
   /** Prefix stripped from the model name before forwarding (e.g. "openrouter/"). */
   stripPrefix?: string;
+  /** Per-vendor routing keyed by the slug's lowercase vendor prefix (e.g. "zai"). */
+  providers?: Record<string, NativeDelegateProvider>;
 }
 
 /** Snapshot refreshed on every proxy config (re)load — avoids per-request disk reads. */
@@ -1749,13 +1779,37 @@ function resolveNativeDelegate(
 ): { url: string; token: string; model: string } | null {
   const cfg = nativeDelegateConfig;
   if (cfg.enabled === false) return null;
+  if (!model.includes('/')) return null;                              // not a vendor/model slug
+  const vendor = model.split('/')[0]?.toLowerCase() ?? '';
+  if (vendor === 'anthropic') return null;                           // native Anthropic stays native
+
+  // Per-vendor providers map (Option C): the vendor prefix selects the
+  // endpoint, so distinct vendors (e.g. zai, minimax) route to distinct
+  // providers in the same proxy. A matching entry takes precedence.
+  const provider = cfg.providers?.[vendor];
+  if (provider) {
+    if (provider.enabled === false) return null;
+    const token = process.env[provider.apiKeyEnv];
+    if (!token) return null;
+    let outModel = model;
+    if (provider.modelMap && provider.modelMap[model]) {
+      outModel = provider.modelMap[model];
+    } else if (provider.stripVendor) {
+      outModel = model.slice(vendor.length + 1);                     // drop "vendor/"
+    } else if (provider.stripPrefix && model.startsWith(provider.stripPrefix)) {
+      outModel = model.slice(provider.stripPrefix.length);
+    }
+    return { url: provider.baseUrl, token, model: outModel };
+  }
+
+  // Fallback: single-delegate (OpenRouter) default — backward compatible.
   const token = process.env[cfg.apiKeyEnv || 'OPENROUTER_API_KEY'];
   if (!token) return null;
   let slug = model;
   const stripPrefix = cfg.stripPrefix ?? 'openrouter/';
   if (stripPrefix && slug.startsWith(stripPrefix)) slug = slug.slice(stripPrefix.length);
-  if (!slug.includes('/')) return null;            // not a vendor/model slug
-  if (slug.split('/')[0]?.toLowerCase() === 'anthropic') return null; // native Anthropic stays native
+  if (!slug.includes('/')) return null;                              // nothing left to route
+  if (slug.split('/')[0]?.toLowerCase() === 'anthropic') return null; // stripped down to Anthropic
   return { url: cfg.baseUrl || 'https://openrouter.ai/api/v1/messages', token, model: slug };
 }
 
@@ -5501,10 +5555,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (routingMode === 'passthrough') {
         // RelayPlane patch: accept delegated (non-Anthropic) models served
         // over an Anthropic-compatible endpoint (e.g. minimax/minimax-m3).
+        // Keep the ORIGINAL vendor slug in targetModel — forwardNativeAnthropicRequest
+        // is the single point that resolves+strips+forwards. Pre-stripping here would
+        // make that downstream resolution fail for stripVendor/modelMap providers
+        // (the stripped name has no vendor prefix), silently falling back to Anthropic.
         const nativeDelegate = resolveNativeDelegate(requestedModel);
         if (nativeDelegate) {
           targetProvider = 'openrouter';
-          targetModel = nativeDelegate.model;
+          targetModel = requestedModel;
         } else {
           const resolved = resolveExplicitModel(requestedModel);
           if (!resolved) {

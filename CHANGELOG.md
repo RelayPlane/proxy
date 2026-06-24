@@ -1,5 +1,38 @@
 # Changelog
 
+## Fork: per-vendor native delegation (phucpnt)
+
+**Per-vendor routing for native delegation.** The `nativeDelegate` section now
+accepts a `providers` map keyed by the slug's vendor prefix, so distinct
+`vendor/model` slugs route to distinct Anthropic-compatible endpoints in the
+same proxy — e.g. GLM direct to z.ai **and** MiniMax direct, simultaneously.
+
+- A matching `providers[vendor]` entry takes precedence; vendors with no entry
+  fall back to the single-delegate (OpenRouter) default — fully backward
+  compatible with existing config.
+- `stripVendor: true` drops the `vendor/` prefix so a provider receives a bare
+  model name (e.g. `zai/glm-4.6` → `glm-4.6` for z.ai).
+- `modelMap` allows explicit incoming-slug → outgoing-model rewrites.
+- Fail-closed: if a provider entry's key env var is unset, the request is not
+  silently leaked to the OpenRouter fallback.
+
+```json
+{
+  "nativeDelegate": {
+    "providers": {
+      "zai":     { "baseUrl": "https://api.z.ai/api/anthropic/v1/messages",   "apiKeyEnv": "ZAI_API_KEY", "stripVendor": true },
+      "minimax": { "baseUrl": "https://api.minimax.io/anthropic/v1/messages", "apiKeyEnv": "MINIMAX_API_KEY" }
+    }
+  }
+}
+```
+
+Implementation: extended `resolveNativeDelegate()` + `NativeDelegateConfig`
+(new `NativeDelegateProvider` type) in `src/standalone-proxy.ts`. Call sites
+unchanged.
+
+---
+
 ## Fork: native-protocol delegation (phucpnt)
 
 **Native /v1/messages delegation to Anthropic-compatible providers.** Forward
