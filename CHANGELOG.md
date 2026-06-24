@@ -1,5 +1,30 @@
 # Changelog
 
+## Fork: gateway resilience — clean auto-recovery after rate-limit (phucpnt)
+
+Fixes a loop where, after a Claude usage-quota recovery, the gateway kept
+returning errors (and a cryptic `500 Provider error: Unexpected token '<'`) until
+a manual proxy restart. Three changes in `src/standalone-proxy.ts`:
+
+1. **Defensive upstream parsing** (`readUpstreamJson`): upstream bodies are read
+   as text and JSON-parsed in a try/catch. A non-JSON body (HTML 5xx edge page,
+   empty, plain text) no longer throws `Unexpected token '<'` → hard 500; instead
+   the real upstream status is passed through with a clean Anthropic-shaped error.
+2. **Quota (429) never trips the breaker** (`CooldownManager.recordFailure`): a
+   429 is forwarded to the client (Claude Code backs off via retry-after) and is
+   not counted as a provider-health failure.
+3. **Half-open single-probe recovery** (`CooldownManager.isAvailable`): when a
+   cooldown elapses, exactly one probe is allowed through; everyone else keeps
+   short-circuiting until it resolves. Success closes the breaker; failure
+   re-arms it. This kills the retry-storm re-trip where a burst of Claude Code
+   retries all flooded through at once and re-cooled the provider.
+
+Net: after the upstream recovers, the gateway self-heals within ~one request —
+no manual restart, no self-inflicted lockout. New `probeTimeoutMs` (default
+15000) bounds the half-open probe window.
+
+---
+
 ## Fork: `relayplane cc` Claude Code setup command (phucpnt)
 
 **One-command setup + lifecycle for Claude Code + GLM/MiniMax subagents.**

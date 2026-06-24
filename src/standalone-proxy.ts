@@ -506,11 +506,15 @@ interface CooldownConfig {
   allowedFails: number;
   windowSeconds: number;
   cooldownSeconds: number;
+  /** Half-open window (ms): after cooldown elapses, how long a single probe holds the gate. */
+  probeTimeoutMs?: number;
 }
 
 interface ProviderHealth {
   failures: { timestamp: number; error: string }[];
   cooledUntil: number | null;
+  /** Half-open: when a single probe request is in flight, others wait until this time. */
+  probeUntil?: number | null;
 }
 
 interface CascadeConfig {
@@ -705,43 +709,62 @@ class CooldownManager {
     this.config = config;
   }
   
-  recordFailure(provider: string, error: string): void {
+  recordFailure(provider: string, error: string, status?: number): void {
     const h = this.getOrCreateHealth(provider);
     const now = Date.now();
-    
+
+    // #2: A 429 is "you're rate-limited", not "provider is unhealthy". Forward it
+    // (Claude Code backs off using retry-after) — never let quota trip the breaker.
+    if (status === 429) return;
+
+    // #3: half-open probe failed (cooldown had elapsed and this request was the
+    // single probe) → re-arm the cooldown without accumulating a storm of fails.
+    if (h.cooledUntil && now > h.cooledUntil) {
+      h.cooledUntil = now + this.config.cooldownSeconds * 1000;
+      h.probeUntil = null;
+      h.failures = [];
+      console.log(`[RelayPlane] Provider ${provider} probe failed — cooled down again for ${this.config.cooldownSeconds}s`);
+      return;
+    }
+
     h.failures = h.failures.filter(
       (f) => now - f.timestamp < this.config.windowSeconds * 1000
     );
-    
+
     h.failures.push({ timestamp: now, error });
-    
+
     if (h.failures.length >= this.config.allowedFails) {
       h.cooledUntil = now + this.config.cooldownSeconds * 1000;
+      h.probeUntil = null;
       console.log(
         `[RelayPlane] Provider ${provider} cooled down for ${this.config.cooldownSeconds}s`
       );
     }
   }
-  
+
   recordSuccess(provider: string): void {
     const h = this.health.get(provider);
     if (h) {
       h.failures = [];
       h.cooledUntil = null;
+      h.probeUntil = null;
     }
   }
-  
+
   isAvailable(provider: string): boolean {
     const h = this.health.get(provider);
     if (!h?.cooledUntil) return true;
-    
-    if (Date.now() > h.cooledUntil) {
-      h.cooledUntil = null;
-      h.failures = [];
-      return true;
-    }
-    
-    return false;
+
+    const now = Date.now();
+    if (now <= h.cooledUntil) return false;          // still cooling down
+
+    // #3: cooldown elapsed → half-open. Allow exactly ONE probe through at a
+    // time; everyone else keeps short-circuiting until the probe resolves
+    // (recordSuccess clears, recordFailure re-arms). Prevents the retry-storm
+    // re-trip where a burst of Claude Code retries all flood through at once.
+    if (h.probeUntil && now < h.probeUntil) return false;
+    h.probeUntil = now + (this.config.probeTimeoutMs ?? 15_000);
+    return true;
   }
   
   private getOrCreateHealth(provider: string): ProviderHealth {
@@ -1250,6 +1273,7 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
       allowedFails: 3,
       windowSeconds: 60,
       cooldownSeconds: 120,
+      probeTimeoutMs: 15000,
     },
   },
 };
@@ -1811,6 +1835,41 @@ function resolveNativeDelegate(
   if (!slug.includes('/')) return null;                              // nothing left to route
   if (slug.split('/')[0]?.toLowerCase() === 'anthropic') return null; // stripped down to Anthropic
   return { url: cfg.baseUrl || 'https://openrouter.ai/api/v1/messages', token, model: slug };
+}
+
+/**
+ * RelayPlane patch (#1): read an upstream Response body once, safely.
+ *
+ * Providers (and their CDN/edge) sometimes return a non-JSON body — an HTML
+ * error page on a 5xx, an empty body, or plain text. The old code called
+ * `await response.json()` directly, which throws `Unexpected token '<'` on HTML
+ * and gets surfaced as a misleading hard 500. This reads the body as text and
+ * parses defensively: on non-JSON it synthesises an Anthropic-shaped error so
+ * downstream code and the client get a clean payload, and `parsed=false` lets
+ * callers know it was a non-JSON (transient) upstream response.
+ */
+async function readUpstreamJson(
+  response: Response
+): Promise<{ json: Record<string, unknown>; parsed: boolean }> {
+  let raw = '';
+  try { raw = await response.text(); } catch { raw = ''; }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === 'object') return { json: parsed as Record<string, unknown>, parsed: true };
+    return { json: { value: parsed }, parsed: true };
+  } catch {
+    const snippet = raw.replace(/\s+/g, ' ').trim().slice(0, 200);
+    return {
+      json: {
+        type: 'error',
+        error: {
+          type: response.status >= 500 ? 'api_error' : 'invalid_request_error',
+          message: `Upstream returned a non-JSON ${response.status} response${snippet ? `: ${snippet}` : ''}`,
+        },
+      },
+      parsed: false,
+    };
+  }
 }
 
 /**
@@ -3246,6 +3305,7 @@ function getCooldownConfig(config: RelayPlaneProxyConfigFile): CooldownConfig {
     allowedFails: 3,
     windowSeconds: 60,
     cooldownSeconds: 120,
+    probeTimeoutMs: 15000,
   };
   return { ...defaults, ...config.reliability?.cooldowns };
 }
@@ -5873,10 +5933,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               }
               const isCascadeRerouted = resolved.model !== originalModel;
               const providerResponse = await forwardNativeAnthropicRequest(attemptBody, ctx, modelAuth.apiKey, modelAuth.isMax, isCascadeRerouted);
-              const responseData = (await providerResponse.json()) as Record<string, unknown>;
+              const { json: responseData } = await readUpstreamJson(providerResponse);
               if (!providerResponse.ok) {
                 if (proxyConfig.reliability?.cooldowns?.enabled) {
-                  cooldownManager.recordFailure(resolved.provider, JSON.stringify(responseData));
+                  cooldownManager.recordFailure(resolved.provider, JSON.stringify(responseData), providerResponse.status);
                 }
                 throw new ProviderResponseError(providerResponse.status, responseData);
               }
@@ -5983,9 +6043,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           }
 
           if (!providerResponse.ok) {
-            const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
+            const { json: errorPayload } = await readUpstreamJson(providerResponse);
             if (proxyConfig.reliability?.cooldowns?.enabled) {
-              cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
+              cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload), providerResponse.status);
             }
 
             // ── Cross-provider cascade for /v1/messages path (GH #38) ──
@@ -6163,7 +6223,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             nativeResponseData = { usage: { input_tokens: streamTokensIn, output_tokens: streamTokensOut, cache_creation_input_tokens: streamCacheCreation, cache_read_input_tokens: streamCacheRead } } as Record<string, unknown>;
             res.end();
           } else {
-            nativeResponseData = await providerResponse.json() as Record<string, unknown>;
+            nativeResponseData = (await readUpstreamJson(providerResponse)).json;
             const nativeRespModel = checkResponseModelMismatch(nativeResponseData, targetModel || requestedModel, targetProvider, log);
             const nativeRpHeaders = buildRelayPlaneResponseHeaders(
               targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
@@ -7383,9 +7443,9 @@ async function handleStreamingRequest(
     }
 
     if (!providerResponse.ok) {
-      const errorData = await providerResponse.json() as Record<string, unknown>;
+      const { json: errorData } = await readUpstreamJson(providerResponse);
       if (cooldownsEnabled) {
-        cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData));
+        cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData), providerResponse.status);
       }
       const durationMs = Date.now() - startTime;
       const streamErrMsg = extractProviderErrorMessage(errorData, providerResponse.status);
