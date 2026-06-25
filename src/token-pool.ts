@@ -108,9 +108,16 @@ export class TokenPool {
   /**
    * Auto-register a token seen in an incoming Authorization header.
    * No-op if the token is already registered (from config or previous request).
+   *
+   * OAuth (`sk-ant-oat`) tokens are intentionally NOT auto-pooled: a single
+   * client's OAuth credential rotates frequently, so accumulating past copies
+   * and letting selectToken() pick an arbitrary one would serve a stale/expired
+   * token and 401 an otherwise-valid passthrough request. Rotating OAuth is
+   * always used fresh from the incoming request, never pooled.
    */
   autoDetect(apiKey: string): void {
     if (!apiKey || this.tokens.has(apiKey)) return;
+    if (apiKey.startsWith('sk-ant-oat')) return;
     const label = `auto-${apiKey.slice(-8)}`;
     const state = this.makeState(
       { label, apiKey, priority: AUTO_DETECT_PRIORITY },
@@ -239,6 +246,19 @@ export class TokenPool {
   /** How many tokens are registered? */
   size(): number {
     return this.tokens.size;
+  }
+
+  /**
+   * Does the pool contain at least one explicitly-configured account?
+   * The pool only overrides a request's own auth for genuine multi-account
+   * setups (providers.anthropic.accounts[]). Auto-detected tokens alone must
+   * never override a fresh incoming passthrough token.
+   */
+  hasConfigAccounts(): boolean {
+    for (const t of this.tokens.values()) {
+      if (t.source === 'config') return true;
+    }
+    return false;
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────

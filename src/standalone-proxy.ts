@@ -5350,11 +5350,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // Determine which Anthropic auth to use based on mode.
-    // When the token pool has registered accounts, select the best token from
-    // the pool and use it as the effective key (overrides env and passthrough).
+    // The token pool overrides the request's own auth ONLY for genuine
+    // multi-account setups (providers.anthropic.accounts[]). A pool consisting
+    // solely of auto-detected tokens must never override a fresh incoming
+    // passthrough token — a single client's OAuth credential rotates, so a
+    // pooled copy is likely stale and would 401 a valid request.
     let useAnthropicEnvKey: string | undefined;
     let _poolSelectedToken: string | undefined; // tracks the token chosen from the pool for this request
-    if (getTokenPool().size() > 0) {
+    if (getTokenPool().hasConfigAccounts()) {
       const poolToken = getTokenPool().selectToken();
       if (poolToken) {
         _poolSelectedToken = poolToken.apiKey;

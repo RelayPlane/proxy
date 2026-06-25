@@ -1,5 +1,31 @@
 # Changelog
 
+## Fork: token pool no longer poisons single-user OAuth passthrough (phucpnt)
+
+Fixes intermittent `401` failures through the proxy for a Claude Code session
+whose OAuth credentials are valid (the same session can talk to Anthropic
+directly). Root cause: the v1.9.0 multi-account token pool **auto-detected every
+incoming `Authorization: Bearer` token and let `selectToken()` override the
+request's own auth**. Claude Code's OAuth (`sk-ant-oat`) credential rotates, so
+the pool accumulated several stale copies (plus any stray non-OAT test token);
+`selectToken()` — ties broken by insertion order — then served an expired pooled
+token instead of the fresh incoming one → fast `401`. Successes only slipped
+through while the bad token was briefly quarantined, producing a ✓/✗ flap.
+
+Two surgical changes in `src/token-pool.ts` + `src/standalone-proxy.ts`:
+
+1. **`autoDetect()` skips `sk-ant-oat` tokens.** Rotating OAuth is always used
+   fresh from the incoming request, never pooled — pooling a rotating credential
+   only accumulates expired copies.
+2. **The pool overrides request auth only when explicit config accounts exist**
+   (`providers.anthropic.accounts[]`, via new `hasConfigAccounts()`). A pool of
+   auto-detected tokens alone never overrides a fresh passthrough token.
+
+Net: genuine multi-account pooling (configured keys) is unchanged; single-user
+OAuth passthrough now forwards the live token verbatim and stops flapping.
+
+---
+
 ## Fork: gateway resilience — clean auto-recovery after rate-limit (phucpnt)
 
 Fixes a loop where, after a Claude usage-quota recovery, the gateway kept
