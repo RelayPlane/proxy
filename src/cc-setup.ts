@@ -9,12 +9,12 @@
  * Wires three things (proxy config is always global; the other two are scoped):
  *   - ~/.relayplane/config.json   nativeDelegate providers + routing.mode=standard
  *   - <scope>/.claude/settings.json   env.ANTHROPIC_BASE_URL → the proxy
- *   - <scope>/.claude/agents/{glm,minimax}.md   the delegating subagents
+ *   - <scope>/.claude/agents/{glm,minimax,deepseek-pro,deepseek-flash}.md  subagents
  *
  * Auth model: the main agent uses Claude Code's normal OAuth session
  * (passthrough). We never set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, so the
  * OAuth session is left intact; if a turn ever fails auth, the user just
- * re-authorizes Claude Code. Provider keys (ZAI/MINIMAX) live only in
+ * re-authorizes Claude Code. Provider keys (ZAI/MINIMAX/BYTEPLUS) live only in
  * ~/.relayplane/.env (chmod 600) and are injected into the proxy on start.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, unlinkSync } from 'fs';
@@ -34,11 +34,25 @@ type Json = Record<string, unknown>;
 const PROVIDERS: Json = {
   zai: { baseUrl: 'https://api.z.ai/api/anthropic/v1/messages', apiKeyEnv: 'ZAI_API_KEY', stripVendor: true },
   minimax: { baseUrl: 'https://api.minimax.io/anthropic/v1/messages', apiKeyEnv: 'MINIMAX_API_KEY', stripVendor: true },
+  // BytePlus ModelArk coding plan (Anthropic-compatible). Friendly slugs are
+  // pinned to concrete date-versioned checkpoints via modelMap:
+  //   byteplus/deepseek-pro   → deepseek-v4-pro-260425
+  //   byteplus/deepseek-flash → deepseek-v4-flash-260425
+  byteplus: {
+    baseUrl: 'https://ark.ap-southeast.bytepluses.com/api/coding/v1/messages',
+    apiKeyEnv: 'BYTEPLUS_API_KEY',
+    stripVendor: true,
+    modelMap: {
+      'byteplus/deepseek-pro': 'deepseek-v4-pro-260425',
+      'byteplus/deepseek-flash': 'deepseek-v4-flash-260425',
+    },
+  },
 };
 
 const KEY_SPECS = [
   { env: 'ZAI_API_KEY', label: 'z.ai (GLM) API key' },
   { env: 'MINIMAX_API_KEY', label: 'MiniMax API key' },
+  { env: 'BYTEPLUS_API_KEY', label: 'BytePlus ModelArk (DeepSeek) API key' },
 ];
 
 const AGENTS: Record<string, string> = {
@@ -61,6 +75,26 @@ model: minimax/MiniMax-M3
 You are a careful reasoning assistant running on the MiniMax-M3 model.
 Think through the problem step by step, then give a clear, actionable answer.
 When editing code, make minimal, surgical changes and match the surrounding style.
+`,
+  'deepseek-pro.md': `---
+name: deepseek-pro
+description: Capable coding helper that runs on DeepSeek-V4-Pro (deepseek-v4-pro-260425) via RelayPlane native delegation to BytePlus ModelArk. Use for substantial coding, refactoring, and analysis tasks.
+model: byteplus/deepseek-pro
+---
+
+You are a capable engineering assistant running on the DeepSeek-V4-Pro model.
+Answer directly and precisely. When editing code, make minimal, surgical changes
+and match the surrounding style.
+`,
+  'deepseek-flash.md': `---
+name: deepseek-flash
+description: Fast, low-cost coding helper that runs on DeepSeek-V4-Flash (deepseek-v4-flash-260425) via RelayPlane native delegation to BytePlus ModelArk. Use for quick edits, summaries, and routine tasks where speed matters.
+model: byteplus/deepseek-flash
+---
+
+You are a fast engineering assistant running on the DeepSeek-V4-Flash model.
+Answer concisely. When editing code, make minimal, surgical changes and match the
+surrounding style.
 `,
 };
 
@@ -162,6 +196,7 @@ function applyProxyConfig(): { routingChanged: boolean; prevMode?: string } {
   const providers = (nd['providers'] as Json) || {};
   providers['zai'] = PROVIDERS['zai'];
   providers['minimax'] = PROVIDERS['minimax'];
+  providers['byteplus'] = PROVIDERS['byteplus'];
   nd['providers'] = providers;
   cfg['nativeDelegate'] = nd;
   writeJson(configPath(), cfg);
@@ -246,14 +281,14 @@ async function ccUp(args: string[]): Promise<void> {
   console.log(`  ✓ Provider keys saved to ${envFilePath()} (chmod 600)`);
 
   const { routingChanged, prevMode } = applyProxyConfig();
-  console.log(`  ✓ Proxy config: ${configPath()} (zai + minimax delegated, routing.mode=standard, cache off)`);
+  console.log(`  ✓ Proxy config: ${configPath()} (zai + minimax + byteplus delegated, routing.mode=standard, cache off)`);
   if (routingChanged) console.log(`    ⚠️  Changed routing.mode "${prevMode}" → "standard" (delegation needs passthrough).`);
 
   setBaseUrl(scope);
   console.log(`  ✓ Claude Code wiring: ${scope.settingsPath} (ANTHROPIC_BASE_URL=${BASE_URL}; OAuth left intact)`);
 
   writeAgents(scope);
-  console.log(`  ✓ Subagents: ${join(scope.agentsDir, 'glm.md')}, ${join(scope.agentsDir, 'minimax.md')}`);
+  console.log(`  ✓ Subagents: ${Object.keys(AGENTS).map((n) => join(scope.agentsDir, n)).join(', ')}`);
 
   if (foreground) {
     console.log('\n  Setup complete. Start the proxy in this terminal:\n    relayplane start\n');

@@ -1,5 +1,30 @@
 # Changelog
 
+## Fork: BytePlus ModelArk (DeepSeek) subagents (phucpnt)
+
+Adds BytePlus ModelArk's Anthropic-compatible **coding endpoint** as a native
+delegate, with two DeepSeek subagents in the Claude Code library:
+
+- `byteplus/deepseek-pro`  → pinned to `deepseek-v4-pro-260425`
+- `byteplus/deepseek-flash` → pinned to `deepseek-v4-flash-260425`
+
+The friendly slugs are date-pinned via the provider's `modelMap`, so subagents
+reference a stable name while the proxy forwards the concrete checkpoint.
+Endpoint `https://ark.ap-southeast.bytepluses.com/api/coding/v1/messages`, auth
+`Authorization: Bearer $BYTEPLUS_API_KEY` (the Claude token is never forwarded).
+
+Note: the **coding** endpoint (`/api/coding`) accepts these models without
+per-model Ark-Console activation and returns proper Anthropic-shaped responses;
+the raw `/api/v3` endpoint requires activation and returns an empty `200` for
+not-activated models (misleading), so the coding endpoint is the right surface.
+
+`relayplane cc up` now wires the `byteplus` provider, prompts for
+`BYTEPLUS_API_KEY`, and writes `deepseek-pro.md` / `deepseek-flash.md` subagents
+alongside glm/minimax. Implementation: `src/cc-setup.ts` (PROVIDERS, KEY_SPECS,
+AGENTS) + repo `.claude/agents/deepseek-{pro,flash}.md`.
+
+---
+
 ## Fork: token pool no longer poisons single-user OAuth passthrough (phucpnt)
 
 Fixes intermittent `401` failures through the proxy for a Claude Code session
