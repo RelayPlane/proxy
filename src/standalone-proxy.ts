@@ -3176,11 +3176,36 @@ class ProviderResponseError extends Error {
 
 class CooldownError extends Error {
   provider: Provider;
-  
+
   constructor(provider: Provider) {
     super(`Provider ${provider} is in cooldown`);
     this.provider = provider;
   }
+}
+
+/**
+ * Safely emit a JSON error response from a request handler's catch block.
+ *
+ * If the response has already started (streaming/SSE already sent its 200
+ * headers, or the body is finished), calling res.writeHead() again throws
+ * ERR_HTTP_HEADERS_SENT — which, unhandled in the async request handler, would
+ * crash the whole proxy process. In that case we can't change the status, so we
+ * just close the stream. Only write headers when none have been sent yet.
+ */
+function safeWriteError(
+  res: http.ServerResponse,
+  status: number,
+  payload: Record<string, unknown>,
+): void {
+  if (res.writableEnded) return;
+  if (res.headersSent) {
+    try { res.end(); } catch { /* socket already gone */ }
+    return;
+  }
+  try {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(payload));
+  } catch { /* connection closed mid-write — nothing more to do */ }
 }
 
 /**
@@ -3819,6 +3844,19 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   const log = (msg: string) => {
     if (verbose) console.log(`[relayplane] ${msg}`);
   };
+
+  // Last-resort safety net: a stray throw/rejection in an async request handler
+  // (e.g. writing to an already-streamed response) must never take down the whole
+  // gateway. Log and keep serving — individual requests fail, the proxy survives.
+  if (!(globalThis as Record<string, unknown>)['__relayplaneProcessGuards']) {
+    (globalThis as Record<string, unknown>)['__relayplaneProcessGuards'] = true;
+    process.on('uncaughtException', (err) => {
+      console.error(`[RelayPlane] uncaughtException (kept alive): ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
+    });
+    process.on('unhandledRejection', (reason) => {
+      console.error(`[RelayPlane] unhandledRejection (kept alive): ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+    });
+  }
 
   // Resolve smart aliases based on available env vars
   const { aliases: resolvedAliases, via: aliasVia } = buildSmartAliases();
@@ -6412,13 +6450,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           meshCapture(targetModel || requestedModel, targetProvider, taskType, 0, 0, 0, durationMs, false, catchErrMsg);
         }
         if (err instanceof ProviderResponseError) {
-          res.writeHead(err.status, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(err.payload));
+          safeWriteError(res, err.status, err.payload);
           return;
         }
         const errorMsg = err instanceof Error ? err.message : String(err);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+        safeWriteError(res, 500, { error: `Provider error: ${errorMsg}` });
       }
       return;
     }
@@ -7126,13 +7162,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             meshCapture(targetModel || 'unknown', targetProvider, taskType, 0, 0, 0, durationMs, false, cascadeErrMsg);
           }
           if (err instanceof ProviderResponseError) {
-            res.writeHead(err.status, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(err.payload));
+            safeWriteError(res, err.status, err.payload);
             return;
           }
           const errorMsg = err instanceof Error ? err.message : String(err);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+          safeWriteError(res, 500, { error: `Provider error: ${errorMsg}` });
         }
       } else {
         res.setHeader('X-Relay-Trace-Id', chatTraceId);
