@@ -175,7 +175,22 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-2.0-flash': { input: 0.10, output: 0.40 },
   'gemini-2.5-pro': { input: 1.25, output: 10.0 },
-  
+
+  // Delegated native-delegate workers — keyed by the OUTBOUND model id that the
+  // resolver forwards (modelMap value / stripVendor slug), which is what
+  // estimateCost() receives as `targetModel`. Published list prices (USD per 1M
+  // tokens, standard cache-miss tier) as of 2026-06; verify before relying on the
+  // savings figures, as these vendors run frequent promotions.
+  // DeepSeek V4 (BytePlus ModelArk) — official rate after the 2026-05-31 promo
+  // rolled into list price. https://api-docs.deepseek.com/quick_start/pricing
+  'deepseek-v4-pro-260425': { input: 0.435, output: 0.87 },
+  'deepseek-v4-flash-260425': { input: 0.14, output: 0.28 },
+  // MiniMax-M3 — standard tier (<=512k input), "permanent 50% off" list rate.
+  // https://platform.minimax.io/docs/guides/pricing-paygo
+  'MiniMax-M3': { input: 0.30, output: 1.20 },
+  // Zhipu / Z.ai GLM-5.2 — official pay-per-token. https://docs.z.ai/guides/overview/pricing
+  'glm-5.2': { input: 1.40, output: 4.40 },
+
   // Default for unknown models
   'default': { input: 1.0, output: 3.0 },
 };
