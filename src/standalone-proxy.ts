@@ -23,6 +23,7 @@ import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fetch as undiciFetch, Agent as UndiciAgent } from 'undici';
 import { RelayPlane, inferTaskType, getInferenceConfidence } from '@relayplane/core';
 
 // __dirname is available natively in CJS
@@ -1872,6 +1873,73 @@ async function readUpstreamJson(
   }
 }
 
+// Dedicated dispatcher for native-delegate workers. BytePlus AP-Southeast and
+// MiniMax connect/TLS handshakes can legitimately take >10s under load, which
+// trips undici's default 10s connectTimeout and surfaces as a spurious
+// "fetch failed". A 60s connect window (plus generous header/body timeouts for
+// long generations) lets the slow-but-alive handshakes complete.
+let delegateDispatcher: UndiciAgent | undefined;
+function getDelegateDispatcher(): UndiciAgent {
+  if (!delegateDispatcher) {
+    delegateDispatcher = new UndiciAgent({
+      connect: { timeout: 60_000 },
+      headersTimeout: 120_000,
+      bodyTimeout: 600_000,
+    });
+  }
+  return delegateDispatcher;
+}
+
+// Connection-level failure detection. We retry ONLY these — never a returned
+// HTTP response — so a real 4xx/5xx from the worker is surfaced once and the
+// token plan is not double-charged.
+function isDelegateConnError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; code?: string; cause?: { code?: string } };
+  if (e.name === 'TypeError') return true; // undici wraps connect failures here
+  const code = e.code || e.cause?.code;
+  return (
+    !!code &&
+    [
+      'UND_ERR_CONNECT_TIMEOUT',
+      'UND_ERR_SOCKET',
+      'ECONNREFUSED',
+      'ECONNRESET',
+      'ENOTFOUND',
+      'ETIMEDOUT',
+      'EAI_AGAIN',
+    ].includes(code)
+  );
+}
+
+// Forward to a native delegate with a bounded connection-failure retry.
+async function delegateFetch(
+  url: string,
+  init: Record<string, unknown>
+): Promise<Response> {
+  const maxAttempts = 3; // 1 + up to 2 retries
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return (await undiciFetch(url, {
+        ...init,
+        dispatcher: getDelegateDispatcher(),
+      })) as unknown as Response;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts && isDelegateConnError(err)) {
+        console.warn(
+          `[RelayPlane] native-delegate connect failure (attempt ${attempt}/${maxAttempts}), retrying: ${(err as Error)?.message ?? err}`
+        );
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * Forward native Anthropic /v1/messages request (passthrough with routing)
  * Used for Claude Code direct integration
@@ -1887,7 +1955,7 @@ async function forwardNativeAnthropicRequest(
   // Anthropic-compatible third party with that provider's own key.
   const delegate = resolveNativeDelegate(String(body['model'] ?? ''));
   if (delegate) {
-    return fetch(delegate.url, {
+    return delegateFetch(delegate.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

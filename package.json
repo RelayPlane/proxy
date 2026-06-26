@@ -41,10 +41,10 @@
   "license": "MIT",
   "dependencies": {
     "@relayplane/core": "^0.1.4",
-    "fastest-levenshtein": "^1.0.16",
     "@relayplane/learning-engine": "^0.1.0",
-    "better-sqlite3": "^11.10.0",
-    "js-yaml": "^4.1.0"
+    "fastest-levenshtein": "^1.0.16",
+    "js-yaml": "^4.1.0",
+    "undici": "7.18.2"
   },
   "optionalDependencies": {
     "@relayplane/auth-gate": "^0.1.0",
