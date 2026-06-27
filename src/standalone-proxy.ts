@@ -1778,6 +1778,13 @@ interface NativeDelegateProvider {
   stripPrefix?: string;
   /** Explicit incoming-slug → outgoing-model rewrites (highest precedence). */
   modelMap?: Record<string, string>;
+  /**
+   * OpenAI-compatible base for this vendor (no trailing `/chat/completions`).
+   * When set, OpenAI-surface delegation (`/v1/responses`, `/v1/chat/completions`)
+   * forwards here in OpenAI chat format instead of building an Anthropic body.
+   * Vendors without this fall back to the Anthropic `baseUrl` path.
+   */
+  openaiBaseUrl?: string;
 }
 
 interface NativeDelegateConfig {
@@ -1801,7 +1808,7 @@ function applyNativeDelegateConfig(cfg: { nativeDelegate?: NativeDelegateConfig 
 
 function resolveNativeDelegate(
   model: string
-): { url: string; token: string; model: string } | null {
+): { url: string; openaiUrl?: string; token: string; model: string } | null {
   const cfg = nativeDelegateConfig;
   if (cfg.enabled === false) return null;
   if (!model.includes('/')) return null;                              // not a vendor/model slug
@@ -1824,7 +1831,7 @@ function resolveNativeDelegate(
     } else if (provider.stripPrefix && model.startsWith(provider.stripPrefix)) {
       outModel = model.slice(provider.stripPrefix.length);
     }
-    return { url: provider.baseUrl, token, model: outModel };
+    return { url: provider.baseUrl, openaiUrl: provider.openaiBaseUrl, token, model: outModel };
   }
 
   // Fallback: single-delegate (OpenRouter) default — backward compatible.
@@ -2287,6 +2294,394 @@ async function forwardToOpenAICompatibleStream(
   });
 
   return response;
+}
+
+/**
+ * Forward an OpenAI chat request to a native delegate's OpenAI-compatible
+ * `/chat/completions` endpoint (no Anthropic body). Uses the resilient
+ * `delegateFetch` (60s connect, connection-only retry) with the per-vendor
+ * key — BytePlus/MiniMax connects are slow and need the extended dispatcher.
+ * Returns the vendor's chat Response (JSON or SSE body) verbatim.
+ */
+async function forwardDelegateOpenAIChat(
+  request: ChatRequest,
+  delegate: { openaiUrl?: string; token: string; model: string },
+  stream: boolean
+): Promise<Response> {
+  return delegateFetch(`${delegate.openaiUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${delegate.token}`,
+    },
+    body: JSON.stringify({ ...request, model: delegate.model, stream }),
+  });
+}
+
+// ── OpenAI Responses ⇄ Chat Completions bridge (Codex CLI delegation) ─────────
+// Codex 0.135+ speaks the Responses API; delegate vendors speak Chat Completions.
+// These reshape between the two — intra-OpenAI-family, no Anthropic body.
+
+const ID_RE = /-/g;
+function shortId(prefix: string): string {
+  return `${prefix}_${randomUUID().replace(ID_RE, '')}`;
+}
+
+/** Responses request → internal ChatRequest (OpenAI Chat Completions shape). */
+function responsesToChatRequest(body: Record<string, unknown>): ChatRequest {
+  const messages: Array<Record<string, unknown>> = [];
+
+  if (typeof body.instructions === 'string' && body.instructions) {
+    messages.push({ role: 'system', content: body.instructions });
+  }
+
+  const input = body.input;
+  if (typeof input === 'string') {
+    messages.push({ role: 'user', content: input });
+  } else if (Array.isArray(input)) {
+    for (const raw of input) {
+      if (typeof raw === 'string') {
+        messages.push({ role: 'user', content: raw });
+        continue;
+      }
+      const it = (raw ?? {}) as Record<string, unknown>;
+      const type = it.type as string | undefined;
+      if (type === 'function_call') {
+        messages.push({
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: (it.call_id as string) ?? (it.id as string),
+              type: 'function',
+              function: {
+                name: it.name as string,
+                arguments:
+                  typeof it.arguments === 'string'
+                    ? it.arguments
+                    : JSON.stringify(it.arguments ?? {}),
+              },
+            },
+          ],
+        });
+      } else if (type === 'function_call_output') {
+        messages.push({
+          role: 'tool',
+          tool_call_id: it.call_id as string,
+          content:
+            typeof it.output === 'string' ? it.output : JSON.stringify(it.output ?? ''),
+        });
+      } else if (type === 'message' || it.role) {
+        const role = (it.role as string) ?? 'user';
+        const content = it.content;
+        let text = '';
+        if (typeof content === 'string') {
+          text = content;
+        } else if (Array.isArray(content)) {
+          text = content
+            .map((part) => {
+              if (typeof part === 'string') return part;
+              const p = (part ?? {}) as { type?: string; text?: string };
+              return p.type === 'input_text' ||
+                p.type === 'output_text' ||
+                p.type === 'text'
+                ? p.text ?? ''
+                : '';
+            })
+            .join('');
+        }
+        messages.push({ role: role === 'developer' ? 'system' : role, content: text });
+      }
+      // reasoning / other item types are dropped (stateless delegation)
+    }
+  }
+
+  const chatReq: ChatRequest = {
+    model: String(body.model ?? ''),
+    messages: messages as ChatRequest['messages'],
+    stream: body.stream === true,
+  };
+  if (typeof body.max_output_tokens === 'number') chatReq.max_tokens = body.max_output_tokens;
+  if (typeof body.temperature === 'number') chatReq.temperature = body.temperature;
+
+  if (Array.isArray(body.tools)) {
+    // OpenAI-compatible vendors reject any tools[] entry without a `function`
+    // object ("missing tools.function parameter"). Codex advertises built-in
+    // tools (local_shell, web_search, custom/freeform grammar) that the delegate
+    // vendor can't accept — convert function tools, drop everything else.
+    const tools = body.tools.flatMap((t) => {
+      const tt = (t ?? {}) as Record<string, unknown>;
+      if (tt.type === 'function' && typeof tt.name === 'string') {
+        // Responses flat function tool → Chat nested form
+        return [{
+          type: 'function',
+          function: { name: tt.name, description: tt.description, parameters: tt.parameters },
+        }];
+      }
+      if (tt.type === 'function' && tt.function && typeof tt.function === 'object') {
+        return [tt]; // already Chat-shaped function tool
+      }
+      return []; // unsupported (Codex built-in) tool type → drop
+    });
+    if (tools.length > 0) chatReq.tools = tools;
+  }
+  // Only forward tool_choice when function tools survived — a forced/required
+  // choice with no tools would re-trigger a vendor 400.
+  if (body.tool_choice !== undefined && chatReq.tools && chatReq.tools.length > 0) {
+    const tc = body.tool_choice as Record<string, unknown> | string;
+    if (tc && typeof tc === 'object' && tc.type === 'function' && tc.name) {
+      chatReq.tool_choice = { type: 'function', function: { name: tc.name } };
+    } else {
+      chatReq.tool_choice = tc; // 'auto' | 'none' | 'required' passthrough
+    }
+  }
+  return chatReq;
+}
+
+/** Non-streaming Chat Completion → Responses object. */
+function chatResponseToResponses(
+  chat: Record<string, unknown>,
+  fallbackModel: string
+): Record<string, unknown> {
+  const choices = (chat.choices as Array<Record<string, unknown>>) ?? [];
+  const msg = (choices[0]?.message as Record<string, unknown>) ?? {};
+  const text = typeof msg.content === 'string' ? msg.content : '';
+  const output: unknown[] = [];
+
+  if (text) {
+    output.push({
+      type: 'message',
+      id: shortId('msg'),
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text, annotations: [] }],
+    });
+  }
+
+  const toolCalls = (msg.tool_calls as Array<Record<string, unknown>>) ?? [];
+  for (const tc of toolCalls) {
+    const fn = (tc.function as Record<string, unknown>) ?? {};
+    output.push({
+      type: 'function_call',
+      id: shortId('fc'),
+      call_id: tc.id,
+      name: fn.name,
+      arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+      status: 'completed',
+    });
+  }
+
+  const usage = (chat.usage as Record<string, number>) ?? {};
+  const inTok = usage.prompt_tokens ?? 0;
+  const outTok = usage.completion_tokens ?? 0;
+  return {
+    id: shortId('resp'),
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    model: (chat.model as string) ?? fallbackModel,
+    status: 'completed',
+    output,
+    output_text: text,
+    usage: {
+      input_tokens: inTok,
+      output_tokens: outTok,
+      total_tokens: usage.total_tokens ?? inTok + outTok,
+    },
+  };
+}
+
+/**
+ * Stream a vendor's Chat Completions SSE as a Responses event stream.
+ * Emits `response.created` → per-item add/delta/done → `response.completed`,
+ * covering both assistant text and tool (function_call) items.
+ */
+async function* responsesStreamEvents(
+  vendorResponse: Response,
+  model: string
+): AsyncGenerator<string, void, unknown> {
+  let seq = 0;
+  const emit = (type: string, payload: Record<string, unknown>): string => {
+    const data = JSON.stringify({ type, sequence_number: seq++, ...payload });
+    return `event: ${type}\ndata: ${data}\n\n`;
+  };
+
+  const respId = shortId('resp');
+  const createdAt = Math.floor(Date.now() / 1000);
+  const skeleton = (status: string, output: unknown[], usage: unknown): Record<string, unknown> => ({
+    id: respId,
+    object: 'response',
+    created_at: createdAt,
+    model,
+    status,
+    output,
+    usage,
+  });
+
+  yield emit('response.created', { response: skeleton('in_progress', [], null) });
+  yield emit('response.in_progress', { response: skeleton('in_progress', [], null) });
+
+  let outputIndexCounter = 0;
+  const msgId = shortId('msg');
+  let textOpened = false;
+  let textOutputIndex = -1;
+  let accumulatedText = '';
+
+  // index → tool-call accumulation state
+  const toolStates = new Map<
+    number,
+    { fcId: string; callId: string; name: string; args: string; outputIndex: number }
+  >();
+
+  let usage: Record<string, number> | null = null;
+  let buffer = '';
+
+  for await (const chunk of pipeOpenAIStream(vendorResponse)) {
+    buffer += chunk;
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (parsed.usage) usage = parsed.usage as Record<string, number>;
+      const choice = (parsed.choices as Array<Record<string, unknown>>)?.[0];
+      if (!choice) continue;
+      const delta = (choice.delta as Record<string, unknown>) ?? {};
+
+      if (typeof delta.content === 'string' && delta.content.length > 0) {
+        if (!textOpened) {
+          textOpened = true;
+          textOutputIndex = outputIndexCounter++;
+          yield emit('response.output_item.added', {
+            output_index: textOutputIndex,
+            item: { type: 'message', id: msgId, status: 'in_progress', role: 'assistant', content: [] },
+          });
+          yield emit('response.content_part.added', {
+            item_id: msgId,
+            output_index: textOutputIndex,
+            content_index: 0,
+            part: { type: 'output_text', text: '', annotations: [] },
+          });
+        }
+        accumulatedText += delta.content;
+        yield emit('response.output_text.delta', {
+          item_id: msgId,
+          output_index: textOutputIndex,
+          content_index: 0,
+          delta: delta.content,
+        });
+      }
+
+      const toolDeltas = delta.tool_calls as Array<Record<string, unknown>> | undefined;
+      if (Array.isArray(toolDeltas)) {
+        for (const td of toolDeltas) {
+          const idx = (td.index as number) ?? 0;
+          let st = toolStates.get(idx);
+          const fn = (td.function as Record<string, unknown>) ?? {};
+          if (!st) {
+            st = {
+              fcId: shortId('fc'),
+              callId: (td.id as string) ?? shortId('call'),
+              name: (fn.name as string) ?? '',
+              args: '',
+              outputIndex: outputIndexCounter++,
+            };
+            toolStates.set(idx, st);
+            yield emit('response.output_item.added', {
+              output_index: st.outputIndex,
+              item: {
+                type: 'function_call',
+                id: st.fcId,
+                call_id: st.callId,
+                name: st.name,
+                arguments: '',
+                status: 'in_progress',
+              },
+            });
+          }
+          if (td.id) st.callId = td.id as string;
+          if (fn.name) st.name = fn.name as string;
+          if (typeof fn.arguments === 'string' && fn.arguments.length > 0) {
+            st.args += fn.arguments;
+            yield emit('response.function_call_arguments.delta', {
+              item_id: st.fcId,
+              output_index: st.outputIndex,
+              delta: fn.arguments,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const finalByIndex = new Map<number, unknown>();
+
+  if (textOpened) {
+    yield emit('response.output_text.done', {
+      item_id: msgId,
+      output_index: textOutputIndex,
+      content_index: 0,
+      text: accumulatedText,
+    });
+    yield emit('response.content_part.done', {
+      item_id: msgId,
+      output_index: textOutputIndex,
+      content_index: 0,
+      part: { type: 'output_text', text: accumulatedText, annotations: [] },
+    });
+    const msgItem = {
+      type: 'message',
+      id: msgId,
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: accumulatedText, annotations: [] }],
+    };
+    yield emit('response.output_item.done', { output_index: textOutputIndex, item: msgItem });
+    finalByIndex.set(textOutputIndex, msgItem);
+  }
+
+  for (const st of toolStates.values()) {
+    yield emit('response.function_call_arguments.done', {
+      item_id: st.fcId,
+      output_index: st.outputIndex,
+      arguments: st.args,
+    });
+    const fcItem = {
+      type: 'function_call',
+      id: st.fcId,
+      call_id: st.callId,
+      name: st.name,
+      arguments: st.args,
+      status: 'completed',
+    };
+    yield emit('response.output_item.done', { output_index: st.outputIndex, item: fcItem });
+    finalByIndex.set(st.outputIndex, fcItem);
+  }
+
+  const output: unknown[] = [];
+  for (let i = 0; i < outputIndexCounter; i++) {
+    if (finalByIndex.has(i)) output.push(finalByIndex.get(i));
+  }
+
+  const finalUsage = usage
+    ? {
+        input_tokens: usage.prompt_tokens ?? 0,
+        output_tokens: usage.completion_tokens ?? 0,
+        total_tokens:
+          usage.total_tokens ?? (usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0),
+      }
+    : null;
+
+  const completed = skeleton('completed', output, finalUsage);
+  completed.output_text = accumulatedText;
+  yield emit('response.completed', { response: completed });
 }
 
 /**
@@ -6614,10 +7009,127 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === OpenAI Responses endpoint (Codex CLI subagent delegation) ===
+    // Reshapes Responses ⇄ Chat Completions and forwards to the vendor's OpenAI
+    // /chat/completions in OpenAI format (no Anthropic body). Serves only
+    // native-delegate models that declare an `openaiBaseUrl`.
+    if (req.method === 'POST' && url.includes('/v1/responses')) {
+      let respBody: Record<string, unknown>;
+      try {
+        respBody = await readJsonBody(req);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid JSON', type: 'invalid_request_error' } }));
+        return;
+      }
+
+      const chatReq = responsesToChatRequest(respBody);
+      const wantStream = respBody.stream === true;
+      const delegate = resolveNativeDelegate(chatReq.model);
+      if (!delegate || !delegate.openaiUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              message:
+                '/v1/responses serves native-delegate models with an OpenAI endpoint only',
+              type: 'invalid_request_error',
+              param: 'model',
+            },
+          })
+        );
+        return;
+      }
+
+      const startedAt = Date.now();
+      try {
+        const vendorResp = await forwardDelegateOpenAIChat(chatReq, delegate, wantStream);
+        if (!vendorResp.ok) {
+          const errText = await vendorResp.text();
+          logRequest(
+            chatReq.model,
+            delegate.model,
+            'openrouter' as Provider,
+            Date.now() - startedAt,
+            false,
+            'delegate-responses',
+            false,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            errText.slice(0, 200),
+            vendorResp.status
+          );
+          res.writeHead(vendorResp.status, { 'Content-Type': 'application/json' });
+          res.end(errText || JSON.stringify({ error: { message: `Delegate returned ${vendorResp.status}` } }));
+          return;
+        }
+
+        if (wantStream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+          for await (const evt of responsesStreamEvents(vendorResp, delegate.model)) {
+            res.write(evt);
+          }
+          res.end();
+          logRequest(
+            chatReq.model,
+            delegate.model,
+            'openrouter' as Provider,
+            Date.now() - startedAt,
+            true,
+            'delegate-responses-stream'
+          );
+        } else {
+          const chatJson = (await vendorResp.json()) as Record<string, unknown>;
+          const responsesObj = chatResponseToResponses(chatJson, delegate.model);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(responsesObj));
+          logRequest(
+            chatReq.model,
+            delegate.model,
+            'openrouter' as Provider,
+            Date.now() - startedAt,
+            true,
+            'delegate-responses'
+          );
+        }
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        logRequest(
+          chatReq.model,
+          delegate.model,
+          'openrouter' as Provider,
+          Date.now() - startedAt,
+          false,
+          'delegate-responses',
+          false,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          msg.slice(0, 200)
+        );
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({ error: { message: `Delegate forward failed: ${msg}`, type: 'upstream_error' } })
+          );
+        } else {
+          res.end();
+        }
+      }
+      return;
+    }
+
     // === OpenAI-compatible /v1/chat/completions endpoint ===
     if (req.method !== 'POST' || !url.includes('/chat/completions')) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found. Supported: POST /v1/messages, POST /v1/chat/completions, POST /v1/estimate, GET /v1/models' }));
+      res.end(JSON.stringify({ error: 'Not found. Supported: POST /v1/messages, POST /v1/responses, POST /v1/chat/completions, POST /v1/estimate, GET /v1/models' }));
       return;
     }
 
@@ -6637,6 +7149,49 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     const isStreaming = request.stream === true;
+
+    // Native delegate on the OpenAI surface: forward verbatim in OpenAI chat
+    // format to the vendor's /chat/completions (no Anthropic body), sharing the
+    // Responses delegate helper. Bypasses the Anthropic provider switch.
+    {
+      const chatDelegate = resolveNativeDelegate(request.model);
+      if (chatDelegate && chatDelegate.openaiUrl) {
+        const startedAt = Date.now();
+        try {
+          const vendorResp = await forwardDelegateOpenAIChat(request, chatDelegate, isStreaming);
+          if (!vendorResp.ok) {
+            const errText = await vendorResp.text();
+            logRequest(request.model, chatDelegate.model, 'openrouter' as Provider, Date.now() - startedAt, false, 'delegate-chat', false, undefined, undefined, undefined, undefined, errText.slice(0, 200), vendorResp.status);
+            res.writeHead(vendorResp.status, { 'Content-Type': 'application/json' });
+            res.end(errText || JSON.stringify({ error: { message: `Delegate returned ${vendorResp.status}` } }));
+            return;
+          }
+          if (isStreaming) {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+            for await (const chunk of pipeOpenAIStream(vendorResp)) {
+              res.write(chunk);
+            }
+            res.end();
+            logRequest(request.model, chatDelegate.model, 'openrouter' as Provider, Date.now() - startedAt, true, 'delegate-chat-stream');
+          } else {
+            const chatJson = await vendorResp.text();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(chatJson);
+            logRequest(request.model, chatDelegate.model, 'openrouter' as Provider, Date.now() - startedAt, true, 'delegate-chat');
+          }
+        } catch (err) {
+          const msg = (err as Error)?.message ?? String(err);
+          logRequest(request.model, chatDelegate.model, 'openrouter' as Provider, Date.now() - startedAt, false, 'delegate-chat', false, undefined, undefined, undefined, undefined, msg.slice(0, 200));
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: `Delegate forward failed: ${msg}`, type: 'upstream_error' } }));
+          } else {
+            res.end();
+          }
+        }
+        return;
+      }
+    }
 
     // Extract session ID for chat/completions
     const { sessionId: chatSessionId, sessionSource: chatSessionSource } = getSessionId(

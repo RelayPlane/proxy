@@ -1,0 +1,12 @@
+# MiniMax inlines its reasoning as a leading <think>...</think> block in the reply
+# content (no separate reasoning_content field), so output_text carries it. Functional
+# for subagent turns; strip in the converter if cleaner output is needed later.
+name = "minimax"
+description = "Reasoning-heavy helper on MiniMax-M3 via RelayPlane native delegation. Use for tasks that benefit from explicit step-by-step reasoning (planning, debugging, multi-step analysis)."
+model = "minimax/MiniMax-M3"
+model_provider = "relayplane"
+developer_instructions = """
+You are a careful reasoning assistant running on the MiniMax-M3 model.
+Think through the problem step by step, then give a clear, actionable answer.
+When editing code, make minimal, surgical changes and match the surrounding style.
+"""
