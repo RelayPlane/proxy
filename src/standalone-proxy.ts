@@ -1787,6 +1787,21 @@ interface NativeDelegateProvider {
   openaiBaseUrl?: string;
 }
 
+/**
+ * A named pool of interchangeable delegate members fronted by a `switch/<name>`
+ * slug. Members are ordinary `vendor/model` slugs resolved through the existing
+ * per-vendor logic; the proxy fails over between them in the order `selectOrder`
+ * returns (config order for `failover`).
+ */
+interface SwitchGroup {
+  /** Selection strategy. Only `failover` is implemented; others fall back to config order. */
+  strategy?: 'failover' | 'round_robin' | 'weighted' | 'health';
+  /** Ordered delegate slugs to route between (e.g. "deepseek/deepseek-pro"). */
+  members: string[];
+  /** Optional per-member weights (reserved for the future `weighted` strategy). */
+  weights?: number[];
+}
+
 interface NativeDelegateConfig {
   /** Set false to disable delegation entirely (default: on when a token exists). */
   enabled?: boolean;
@@ -1798,7 +1813,12 @@ interface NativeDelegateConfig {
   stripPrefix?: string;
   /** Per-vendor routing keyed by the slug's lowercase vendor prefix (e.g. "zai"). */
   providers?: Record<string, NativeDelegateProvider>;
+  /** Named `switch/<name>` failover pools keyed by group name. */
+  switch?: Record<string, SwitchGroup>;
 }
+
+/** A single resolved delegate target (Anthropic `url` + optional OpenAI `openaiUrl`). */
+type DelegateTarget = { url: string; openaiUrl?: string; token: string; model: string };
 
 /** Snapshot refreshed on every proxy config (re)load — avoids per-request disk reads. */
 let nativeDelegateConfig: NativeDelegateConfig = {};
@@ -1806,14 +1826,19 @@ function applyNativeDelegateConfig(cfg: { nativeDelegate?: NativeDelegateConfig 
   nativeDelegateConfig = cfg?.nativeDelegate ?? {};
 }
 
-function resolveNativeDelegate(
-  model: string
-): { url: string; openaiUrl?: string; token: string; model: string } | null {
+/**
+ * Resolve one ordinary `vendor/model` slug to a single delegate target.
+ * `switch/*` slugs are NOT handled here (they resolve to a pool — see
+ * `resolveDelegateCandidates`); passing one returns null so a switch slug can
+ * never be misrouted through the OpenRouter fallback.
+ */
+function resolveSingleDelegate(model: string): DelegateTarget | null {
   const cfg = nativeDelegateConfig;
   if (cfg.enabled === false) return null;
   if (!model.includes('/')) return null;                              // not a vendor/model slug
   const vendor = model.split('/')[0]?.toLowerCase() ?? '';
   if (vendor === 'anthropic') return null;                           // native Anthropic stays native
+  if (vendor === 'switch') return null;                              // pool slug — not a single target
 
   // Per-vendor providers map (Option C): the vendor prefix selects the
   // endpoint, so distinct vendors (e.g. zai, minimax) route to distinct
@@ -1843,6 +1868,61 @@ function resolveNativeDelegate(
   if (!slug.includes('/')) return null;                              // nothing left to route
   if (slug.split('/')[0]?.toLowerCase() === 'anthropic') return null; // stripped down to Anthropic
   return { url: cfg.baseUrl || 'https://openrouter.ai/api/v1/messages', token, model: slug };
+}
+
+/**
+ * Order a switch group's members for a request. `failover` (and any unset/未
+ * implemented strategy) preserves config order — the array *is* the priority.
+ * round_robin/weighted/health are seams for later and currently return config
+ * order too.
+ */
+function selectOrder(group: SwitchGroup): string[] {
+  const members = Array.isArray(group.members) ? group.members : [];
+  switch (group.strategy) {
+    case 'round_robin': // TODO(strategy): rotate a per-group counter
+    case 'weighted':    // TODO(strategy): bias by group.weights
+    case 'health':      // TODO(strategy): sort by rolling success window
+    case 'failover':
+    default:
+      return members;
+  }
+}
+
+/**
+ * Resolve a model slug to an ordered list of candidate delegate targets.
+ * A `switch/<name>` slug expands to its group's resolved members (dropping any
+ * that don't resolve); every other slug returns its single delegate (or `[]`).
+ */
+function resolveDelegateCandidates(model: string): DelegateTarget[] {
+  const cfg = nativeDelegateConfig;
+  if (cfg.enabled === false) return [];
+  if (typeof model !== 'string' || !model.includes('/')) return [];
+  const vendor = model.split('/')[0]?.toLowerCase() ?? '';
+  if (vendor === 'switch') {
+    const name = model.slice('switch/'.length);
+    const group = cfg.switch?.[name];
+    if (!group || !Array.isArray(group.members) || group.members.length === 0) return [];
+    const seen = new Set<string>();
+    const out: DelegateTarget[] = [];
+    for (const member of selectOrder(group)) {
+      if (typeof member !== 'string' || seen.has(member)) continue; // de-dupe members
+      seen.add(member);
+      const target = resolveSingleDelegate(member);                  // nested switch → null (dropped)
+      if (target) out.push(target);
+    }
+    return out;
+  }
+  const single = resolveSingleDelegate(model);
+  return single ? [single] : [];
+}
+
+/**
+ * Convenience: the first (or only) delegate for a slug. Existing callers that
+ * need a single target are unaffected by switch pools — a normal slug still
+ * yields exactly one delegate, a `switch/*` slug yields its top-priority member.
+ */
+function resolveNativeDelegate(model: string): DelegateTarget | null {
+  return resolveDelegateCandidates(model)[0] ?? null;
 }
 
 /**
@@ -1948,6 +2028,52 @@ async function delegateFetch(
 }
 
 /**
+ * Try an ordered list of delegate candidates until one yields a usable response,
+ * for `switch/<name>` failover pools. `attempt(delegate)` performs the actual
+ * forward for one candidate (each call site supplies its own — Anthropic or
+ * OpenAI). We advance to the next candidate when an attempt throws a
+ * connection-level error OR returns HTTP 429/5xx, and stop on the first response
+ * that is 2xx or a non-retryable 4xx (a real client error must surface, not burn
+ * the pool). Each candidate is tried at most once; the last failure is surfaced
+ * when the pool is exhausted.
+ *
+ * The advance decision reads only `response.status` — before any body is
+ * streamed — so a `stream:true` request commits to the first member that returns
+ * a usable status and never switches mid-stream. For a single-member list (every
+ * non-switch slug) this collapses to exactly one `attempt`, preserving the
+ * existing connection-only, no-double-charge semantics.
+ */
+async function forwardWithFailover(
+  candidates: DelegateTarget[],
+  attempt: (delegate: DelegateTarget) => Promise<Response>
+): Promise<Response> {
+  let lastErr: unknown;
+  let lastResp: Response | undefined;
+  for (let i = 0; i < candidates.length; i++) {
+    const delegate = candidates[i]!;
+    const isLast = i === candidates.length - 1;
+    try {
+      const resp = await attempt(delegate);
+      if (isLast || !(resp.status === 429 || resp.status >= 500)) {
+        return resp; // 2xx, a non-retryable 4xx, or the last member — commit
+      }
+      lastResp = resp;
+      console.warn(
+        `[RelayPlane] switch member ${delegate.model} returned HTTP ${resp.status}, failing over to next member`
+      );
+    } catch (err) {
+      lastErr = err;
+      if (isLast) throw err;
+      console.warn(
+        `[RelayPlane] switch member ${delegate.model} failed (${(err as Error)?.message ?? err}), failing over to next member`
+      );
+    }
+  }
+  if (lastResp) return lastResp;
+  throw lastErr ?? new Error('no delegate candidates');
+}
+
+/**
  * Forward native Anthropic /v1/messages request (passthrough with routing)
  * Used for Claude Code direct integration
  */
@@ -1959,18 +2085,22 @@ async function forwardNativeAnthropicRequest(
   isRerouted?: boolean
 ): Promise<Response> {
   // RelayPlane patch: route delegated (non-Anthropic) models to an
-  // Anthropic-compatible third party with that provider's own key.
-  const delegate = resolveNativeDelegate(String(body['model'] ?? ''));
-  if (delegate) {
-    return delegateFetch(delegate.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'anthropic-version': ctx.versionHeader || '2023-06-01',
-        'Authorization': `Bearer ${delegate.token}`,
-      },
-      body: JSON.stringify({ ...body, model: delegate.model }),
-    });
+  // Anthropic-compatible third party with that provider's own key. A
+  // `switch/<name>` slug expands to a pool and fails over between members; a
+  // normal slug yields a single candidate (unchanged behavior).
+  const candidates = resolveDelegateCandidates(String(body['model'] ?? ''));
+  if (candidates.length > 0) {
+    return forwardWithFailover(candidates, (delegate) =>
+      delegateFetch(delegate.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': ctx.versionHeader || '2023-06-01',
+          'Authorization': `Bearer ${delegate.token}`,
+        },
+        body: JSON.stringify({ ...body, model: delegate.model }),
+      })
+    );
   }
 
   const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
@@ -7025,8 +7155,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       const chatReq = responsesToChatRequest(respBody);
       const wantStream = respBody.stream === true;
-      const delegate = resolveNativeDelegate(chatReq.model);
-      if (!delegate || !delegate.openaiUrl) {
+      // Only members with an OpenAI endpoint can be served here; a switch pool
+      // may mix providers, so filter to the OpenAI-capable candidates.
+      const candidates = resolveDelegateCandidates(chatReq.model).filter((d) => d.openaiUrl);
+      if (candidates.length === 0) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
@@ -7042,8 +7174,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       const startedAt = Date.now();
+      // Track which member actually served the request (for logging/telemetry).
+      let delegate: DelegateTarget = candidates[0]!;
       try {
-        const vendorResp = await forwardDelegateOpenAIChat(chatReq, delegate, wantStream);
+        const vendorResp = await forwardWithFailover(candidates, (d) => {
+          delegate = d;
+          return forwardDelegateOpenAIChat(chatReq, d, wantStream);
+        });
         if (!vendorResp.ok) {
           const errText = await vendorResp.text();
           logRequest(
@@ -7154,11 +7291,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // format to the vendor's /chat/completions (no Anthropic body), sharing the
     // Responses delegate helper. Bypasses the Anthropic provider switch.
     {
-      const chatDelegate = resolveNativeDelegate(request.model);
-      if (chatDelegate && chatDelegate.openaiUrl) {
+      const chatCandidates = resolveDelegateCandidates(request.model).filter((d) => d.openaiUrl);
+      if (chatCandidates.length > 0) {
         const startedAt = Date.now();
+        // Track which member actually served the request (for logging).
+        let chatDelegate: DelegateTarget = chatCandidates[0]!;
         try {
-          const vendorResp = await forwardDelegateOpenAIChat(request, chatDelegate, isStreaming);
+          const vendorResp = await forwardWithFailover(chatCandidates, (d) => {
+            chatDelegate = d;
+            return forwardDelegateOpenAIChat(request, d, isStreaming);
+          });
           if (!vendorResp.ok) {
             const errText = await vendorResp.text();
             logRequest(request.model, chatDelegate.model, 'openrouter' as Provider, Date.now() - startedAt, false, 'delegate-chat', false, undefined, undefined, undefined, undefined, errText.slice(0, 200), vendorResp.status);
