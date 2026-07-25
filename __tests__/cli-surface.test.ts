@@ -1,10 +1,14 @@
-import { describe, expect, it } from 'vitest';
-import { existsSync } from 'node:fs';
+import { afterAll, describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const packageRoot = join(__dirname, '..');
 const cliPath = join(packageRoot, 'dist', 'cli.js');
+const testHome = mkdtempSync(join(tmpdir(), 'relayplane-cli-surface-'));
+
+afterAll(() => rmSync(testHome, { recursive: true, force: true }));
 
 function runCli(args: string[] = []) {
   return spawnSync(process.execPath, [cliPath, ...args], {
@@ -12,7 +16,7 @@ function runCli(args: string[] = []) {
     encoding: 'utf8',
     env: {
       ...process.env,
-      HOME: join(packageRoot, '.test-home-cli'),
+      HOME: testHome,
     },
   });
 }
@@ -29,6 +33,7 @@ describe('CLI command surface', () => {
     expect(res.stdout).toContain('start');
     expect(res.stdout).toContain('budget');
     expect(res.stdout).toContain('alerts');
+    expect(res.stdout).toContain('codex up|down|status');
   });
 
   it('prints version', () => {

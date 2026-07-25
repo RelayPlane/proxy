@@ -79,6 +79,7 @@ import { getAgentRegistry, loadAgentRegistry, flushAgentRegistry, renameAgent } 
 import { getRoutingLog } from './routing-log.js';
 import { resolvePolicy } from './agent-policy.js';
 import { handleCcCommand } from './cc-setup.js';
+import { handleCodexCommand } from './codex-setup.js';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
@@ -559,6 +560,7 @@ Usage:
 Commands:
   (default)              Start the proxy server
   cc up|down|status      Set up Claude Code for GLM/MiniMax subagents (--global | --project)
+  codex up|down|status   Set up Codex CLI for multi-provider subagents (--global | --project)
   init                   Interactive setup wizard (API key, budget cap, routing mode)
   login                  Log in to RelayPlane (opens browser)
   logout                 Clear stored credentials
@@ -1503,7 +1505,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'lifecycle', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
-    'ensure-running', 'agents', 'policy', 'setup', 'cc',
+    'ensure-running', 'agents', 'policy', 'setup', 'cc', 'codex',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1609,6 +1611,11 @@ async function main(): Promise<void> {
 
   if (command === 'cc') {
     await handleCcCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'codex') {
+    await handleCodexCommand(args.slice(1));
     process.exit(0);
   }
 

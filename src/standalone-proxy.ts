@@ -2438,13 +2438,22 @@ async function forwardDelegateOpenAIChat(
   delegate: { openaiUrl?: string; token: string; model: string },
   stream: boolean
 ): Promise<Response> {
+  const body: Record<string, unknown> = { ...request, model: delegate.model, stream };
+  // DeepSeek V4 defaults to thinking mode. Its OpenAI-compatible API requires
+  // `reasoning_content` from every tool-call turn to be replayed verbatim, but
+  // the OpenAI Responses protocol does not expose that vendor-specific field.
+  // Disable thinking on this bridge so Codex's tool loop remains valid instead
+  // of failing on the second turn with a 400 from DeepSeek.
+  if (delegate.openaiUrl && new URL(delegate.openaiUrl).hostname === 'api.deepseek.com') {
+    body['thinking'] = { type: 'disabled' };
+  }
   return delegateFetch(`${delegate.openaiUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${delegate.token}`,
     },
-    body: JSON.stringify({ ...request, model: delegate.model, stream }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -2458,8 +2467,13 @@ function shortId(prefix: string): string {
 }
 
 /** Responses request → internal ChatRequest (OpenAI Chat Completions shape). */
-function responsesToChatRequest(body: Record<string, unknown>): ChatRequest {
+export function responsesToChatRequest(body: Record<string, unknown>): ChatRequest {
   const messages: Array<Record<string, unknown>> = [];
+  const pendingToolCalls: Array<Record<string, unknown>> = [];
+  const flushToolCalls = (): void => {
+    if (pendingToolCalls.length === 0) return;
+    messages.push({ role: 'assistant', content: null, tool_calls: pendingToolCalls.splice(0) });
+  };
 
   if (typeof body.instructions === 'string' && body.instructions) {
     messages.push({ role: 'system', content: body.instructions });
@@ -2471,30 +2485,33 @@ function responsesToChatRequest(body: Record<string, unknown>): ChatRequest {
   } else if (Array.isArray(input)) {
     for (const raw of input) {
       if (typeof raw === 'string') {
+        flushToolCalls();
         messages.push({ role: 'user', content: raw });
         continue;
       }
       const it = (raw ?? {}) as Record<string, unknown>;
       const type = it.type as string | undefined;
       if (type === 'function_call') {
-        messages.push({
-          role: 'assistant',
-          content: null,
-          tool_calls: [
-            {
-              id: (it.call_id as string) ?? (it.id as string),
-              type: 'function',
-              function: {
-                name: it.name as string,
-                arguments:
-                  typeof it.arguments === 'string'
-                    ? it.arguments
-                    : JSON.stringify(it.arguments ?? {}),
-              },
-            },
-          ],
+        // Responses emits one input item per function call. Chat Completions
+        // requires all calls from the same assistant turn to be grouped before
+        // their tool-result messages; otherwise strict OpenAI-compatible APIs
+        // reject the history as having missing tool outputs.
+        pendingToolCalls.push({
+          id: (it.call_id as string) ?? (it.id as string),
+          type: 'function',
+          function: {
+            name: it.name as string,
+            arguments:
+              typeof it.arguments === 'string'
+                ? it.arguments
+                : JSON.stringify(it.arguments ?? {}),
+          },
         });
-      } else if (type === 'function_call_output') {
+        continue;
+      }
+
+      flushToolCalls();
+      if (type === 'function_call_output') {
         messages.push({
           role: 'tool',
           tool_call_id: it.call_id as string,
@@ -2524,6 +2541,7 @@ function responsesToChatRequest(body: Record<string, unknown>): ChatRequest {
       }
       // reasoning / other item types are dropped (stateless delegation)
     }
+    flushToolCalls();
   }
 
   const chatReq: ChatRequest = {

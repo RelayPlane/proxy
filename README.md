@@ -7,7 +7,7 @@ A **Node.js npm LLM proxy** that sits between your AI agents and providers. Drop
 
 **Live savings dashboard:** [relayplane.com/live](https://relayplane.com/live) — see real-time aggregate savings from developers worldwide.
 
-**The npm-native LLM proxy for Node.js developers.** Works with Claude Code, Cursor, OpenClaw, and any tool that supports `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`.
+**The npm-native LLM proxy for Node.js developers.** Works with Codex CLI, Claude Code, Cursor, OpenClaw, and any tool that supports `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`.
 
 **Free, open-source proxy features:**
 - 📊 Per-request cost tracking across 11 providers
@@ -40,6 +40,45 @@ relayplane start
 ```
 
 Works with any agent framework that talks to OpenAI or Anthropic APIs. Point your client at `http://localhost:4100` (set `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`) and the proxy handles the rest.
+
+### Multi-provider subagents in Codex CLI
+
+Keep the primary Codex thread on its normal OpenAI login while selected subagents
+run on GLM, MiniMax, or DeepSeek through RelayPlane:
+
+```bash
+# Configure ~/.codex globally and start the proxy
+relayplane codex up --global
+
+# Or configure only the current repository
+relayplane codex up --project
+```
+
+The setup adds a `relayplane` custom model provider that speaks Codex's Responses
+API and installs custom agent profiles. It does not change the primary `model`,
+`model_provider`, or OpenAI authentication in Codex.
+
+Ask Codex to use a profile explicitly:
+
+```text
+Use the switch-pro subagent for this refactor.
+Delegate the repository scan to switch-flash.
+Have glm summarize these logs and minimax analyze the failure path.
+```
+
+`switch-pro` and `switch-flash` are stable virtual models backed by ordered
+DeepSeek direct → BytePlus failover pools. Provider-specific profiles are also
+installed for `glm`, `minimax`, `deepseek-pro`, `deepseek-flash`,
+`deepseek-direct-pro`, and `deepseek-direct-flash`.
+
+```bash
+relayplane codex status --global
+relayplane codex down --global
+```
+
+Use `--foreground` with `relayplane codex up` to configure files without starting a daemon.
+Provider keys are stored in `~/.relayplane/.env` with mode `0600`; the primary
+Codex credential is never forwarded to delegates.
 
 ### Auto-start with Claude Code
 
@@ -111,7 +150,7 @@ All configuration is optional - sensible defaults are applied for every field. T
 ## Architecture
 
 ```text
-Client (Claude Code / Aider / Cursor)
+Client (Codex CLI / Claude Code / Aider / Cursor)
         |
         |  OpenAI/Anthropic-compatible request
         v
@@ -731,4 +770,3 @@ RelayPlane requires your own provider API keys. Your prompts go directly to LLM 
 ---
 
 [relayplane.com](https://relayplane.com) · [GitHub](https://github.com/RelayPlane/proxy)
-

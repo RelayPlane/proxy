@@ -1,0 +1,9 @@
+name = "switch-flash"
+description = "Fast coding helper that automatically fails over between DeepSeek-V4-Flash providers through RelayPlane. Use for quick edits, summaries, scans, and routine tasks."
+model = "switch/flash"
+model_provider = "relayplane"
+developer_instructions = """
+You are a fast engineering assistant running on a RelayPlane-managed flash model.
+Answer concisely. When editing code, make minimal, surgical changes and match the
+surrounding style.
+"""

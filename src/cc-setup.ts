@@ -25,21 +25,32 @@ import * as readline from 'readline';
 import { spawn } from 'child_process';
 import { openSync } from 'fs';
 
-const PORT = 4100;
-const HOST = '127.0.0.1';
-const BASE_URL = `http://localhost:${PORT}`;
+export const DELEGATE_PORT = 4100;
+export const DELEGATE_HOST = '127.0.0.1';
+export const DELEGATE_BASE_URL = `http://localhost:${DELEGATE_PORT}`;
 
 type Json = Record<string, unknown>;
 
 const PROVIDERS: Json = {
-  zai: { baseUrl: 'https://api.z.ai/api/anthropic/v1/messages', apiKeyEnv: 'ZAI_API_KEY', stripVendor: true },
-  minimax: { baseUrl: 'https://api.minimax.io/anthropic/v1/messages', apiKeyEnv: 'MINIMAX_API_KEY', stripVendor: true },
+  zai: {
+    baseUrl: 'https://api.z.ai/api/anthropic/v1/messages',
+    openaiBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
+    apiKeyEnv: 'ZAI_API_KEY',
+    stripVendor: true,
+  },
+  minimax: {
+    baseUrl: 'https://api.minimax.io/anthropic/v1/messages',
+    openaiBaseUrl: 'https://api.minimax.io/v1',
+    apiKeyEnv: 'MINIMAX_API_KEY',
+    stripVendor: true,
+  },
   // BytePlus ModelArk coding plan (Anthropic-compatible). Friendly slugs are
   // pinned to concrete date-versioned checkpoints via modelMap:
   //   byteplus/deepseek-pro   → deepseek-v4-pro-260425
   //   byteplus/deepseek-flash → deepseek-v4-flash-260425
   byteplus: {
     baseUrl: 'https://ark.ap-southeast.bytepluses.com/api/coding/v1/messages',
+    openaiBaseUrl: 'https://ark.ap-southeast.bytepluses.com/api/coding/v3',
     apiKeyEnv: 'BYTEPLUS_API_KEY',
     stripVendor: true,
     modelMap: {
@@ -47,13 +58,25 @@ const PROVIDERS: Json = {
       'byteplus/deepseek-flash': 'deepseek-v4-flash-260425',
     },
   },
+  deepseek: {
+    baseUrl: 'https://api.deepseek.com/anthropic/v1/messages',
+    openaiBaseUrl: 'https://api.deepseek.com/v1',
+    apiKeyEnv: 'DEEPSEEK_API_KEY',
+    stripVendor: true,
+    modelMap: {
+      'deepseek/deepseek-pro': 'deepseek-v4-pro',
+      'deepseek/deepseek-flash': 'deepseek-v4-flash',
+    },
+  },
 };
 
-const KEY_SPECS = [
+export const DELEGATE_KEY_SPECS = [
   { env: 'ZAI_API_KEY', label: 'z.ai (GLM) API key' },
   { env: 'MINIMAX_API_KEY', label: 'MiniMax API key' },
   { env: 'BYTEPLUS_API_KEY', label: 'BytePlus ModelArk (DeepSeek) API key' },
+  { env: 'DEEPSEEK_API_KEY', label: 'DeepSeek direct API key' },
 ];
+const CLAUDE_CODE_KEY_SPECS = DELEGATE_KEY_SPECS.filter(({ env }) => env !== 'DEEPSEEK_API_KEY');
 
 const AGENTS: Record<string, string> = {
   'glm.md': `---
@@ -100,8 +123,8 @@ surrounding style.
 
 // ── paths ────────────────────────────────────────────────────────────────────
 function relayDir(): string { return join(homedir(), '.relayplane'); }
-function configPath(): string { return process.env['RELAYPLANE_CONFIG_PATH'] || join(relayDir(), 'config.json'); }
-function envFilePath(): string { return join(relayDir(), '.env'); }
+export function delegateConfigPath(): string { return process.env['RELAYPLANE_CONFIG_PATH'] || join(relayDir(), 'config.json'); }
+export function delegateEnvFilePath(): string { return join(relayDir(), '.env'); }
 function pidFilePath(): string { return join(relayDir(), 'proxy.pid'); }
 function logFilePath(): string { return join(relayDir(), 'proxy.log'); }
 
@@ -161,27 +184,29 @@ function writeEnvFile(p: string, kv: Record<string, string>): void {
   try { chmodSync(p, 0o600); } catch { /* best-effort on non-POSIX */ }
 }
 
-async function collectKeys(): Promise<Record<string, string>> {
-  const stored = parseEnvFile(envFilePath());
+export async function collectDelegateKeys(
+  keySpecs: ReadonlyArray<{ env: string; label: string }> = DELEGATE_KEY_SPECS,
+): Promise<Record<string, string>> {
+  const stored = parseEnvFile(delegateEnvFilePath());
   const result: Record<string, string> = { ...stored };
-  for (const { env, label } of KEY_SPECS) {
+  for (const { env, label } of keySpecs) {
     if (process.env[env]) { result[env] = process.env[env]!; continue; }   // env wins
     if (stored[env]) continue;                                              // already saved
     if (!process.stdin.isTTY) {
-      console.error(`  ✗ ${env} not set and no TTY for prompting. Set it in the environment or ${envFilePath()} and retry.`);
+      console.error(`  ✗ ${env} not set and no TTY for prompting. Set it in the environment or ${delegateEnvFilePath()} and retry.`);
       process.exit(1);
     }
     const val = await promptHidden(`  Enter ${label} (${env}): `);
     if (!val) { console.error(`  ✗ ${env} is required.`); process.exit(1); }
     result[env] = val;
   }
-  writeEnvFile(envFilePath(), result);
+  writeEnvFile(delegateEnvFilePath(), result);
   return result;
 }
 
 // ── proxy config ─────────────────────────────────────────────────────────────
-function applyProxyConfig(): { routingChanged: boolean; prevMode?: string } {
-  const cfg = readJson(configPath());
+export function applyDelegateProxyConfig(): { routingChanged: boolean; prevMode?: string } {
+  const cfg = readJson(delegateConfigPath());
   cfg['enabled'] = cfg['enabled'] !== false;
   cfg['first_run_complete'] = true;                       // stop auto-config from rewriting routing.mode
   const routing = (cfg['routing'] as Json) || {};
@@ -197,9 +222,20 @@ function applyProxyConfig(): { routingChanged: boolean; prevMode?: string } {
   providers['zai'] = PROVIDERS['zai'];
   providers['minimax'] = PROVIDERS['minimax'];
   providers['byteplus'] = PROVIDERS['byteplus'];
+  providers['deepseek'] = PROVIDERS['deepseek'];
   nd['providers'] = providers;
+  const switches = (nd['switch'] as Json) || {};
+  switches['pro'] = {
+    strategy: 'failover',
+    members: ['deepseek/deepseek-pro', 'byteplus/deepseek-pro'],
+  };
+  switches['flash'] = {
+    strategy: 'failover',
+    members: ['deepseek/deepseek-flash', 'byteplus/deepseek-flash'],
+  };
+  nd['switch'] = switches;
   cfg['nativeDelegate'] = nd;
-  writeJson(configPath(), cfg);
+  writeJson(delegateConfigPath(), cfg);
   return { routingChanged, prevMode };
 }
 
@@ -207,7 +243,7 @@ function applyProxyConfig(): { routingChanged: boolean; prevMode?: string } {
 function setBaseUrl(scope: Scope): void {
   const s = readJson(scope.settingsPath);
   const env = (s['env'] as Json) || {};
-  env['ANTHROPIC_BASE_URL'] = BASE_URL;                   // do NOT touch ANTHROPIC_API_KEY/AUTH_TOKEN (keep OAuth)
+  env['ANTHROPIC_BASE_URL'] = DELEGATE_BASE_URL;          // do NOT touch ANTHROPIC_API_KEY/AUTH_TOKEN (keep OAuth)
   s['env'] = env;
   writeJson(scope.settingsPath, s);
   if (scope.kind === 'global') {                          // skip Claude Code onboarding gate
@@ -220,7 +256,7 @@ function unsetBaseUrl(scope: Scope): void {
   if (!existsSync(scope.settingsPath)) return;
   const s = readJson(scope.settingsPath);
   const env = s['env'] as Json | undefined;
-  if (env && env['ANTHROPIC_BASE_URL'] === BASE_URL) {
+  if (env && env['ANTHROPIC_BASE_URL'] === DELEGATE_BASE_URL) {
     delete env['ANTHROPIC_BASE_URL'];
     if (Object.keys(env).length === 0) delete s['env'];
     writeJson(scope.settingsPath, s);
@@ -235,18 +271,18 @@ function removeAgents(scope: Scope): void {
 }
 
 // ── proxy daemon lifecycle ───────────────────────────────────────────────────
-function isPortUp(): Promise<boolean> {
+export function isDelegatePortUp(): Promise<boolean> {
   return new Promise((resolve) => {
-    const sock = net.connect({ port: PORT, host: HOST });
+    const sock = net.connect({ port: DELEGATE_PORT, host: DELEGATE_HOST });
     sock.once('connect', () => { sock.destroy(); resolve(true); });
     sock.once('error', () => { sock.destroy(); resolve(false); });
   });
 }
-async function startDaemon(keys: Record<string, string>): Promise<boolean> {
-  if (await isPortUp()) { console.log(`  ✓ Proxy already running on :${PORT}`); return true; }
+export async function startDelegateDaemon(keys: Record<string, string>): Promise<boolean> {
+  if (await isDelegatePortUp()) { console.log(`  ✓ Proxy already running on :${DELEGATE_PORT}`); return true; }
   ensureDir(relayDir());
   const out = openSync(logFilePath(), 'a');
-  const child = spawn(process.execPath, [process.argv[1]!, 'start', '--port', String(PORT)], {
+  const child = spawn(process.execPath, [process.argv[1]!, 'start', '--port', String(DELEGATE_PORT)], {
     detached: true,
     stdio: ['ignore', out, out],
     env: { ...process.env, ...keys },                     // inject provider keys into the proxy process
@@ -256,14 +292,14 @@ async function startDaemon(keys: Record<string, string>): Promise<boolean> {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 200));
-    if (await isPortUp()) { console.log(`  ✓ Proxy started (pid ${child.pid}, log ${logFilePath()})`); return true; }
+    if (await isDelegatePortUp()) { console.log(`  ✓ Proxy started (pid ${child.pid}, log ${logFilePath()})`); return true; }
   }
   console.error(`  ✗ Proxy did not come up within 5s — see ${logFilePath()}`);
   return false;
 }
-function stopDaemon(): void {
+export function stopDelegateDaemon(): void {
   const pf = pidFilePath();
-  if (!existsSync(pf)) { console.log('  ℹ️  No proxy.pid — nothing to stop (it may not be managed by `cc`).'); return; }
+  if (!existsSync(pf)) { console.log('  ℹ️  No proxy.pid — nothing to stop (it may not be managed by RelayPlane setup).'); return; }
   try {
     const pid = parseInt(readFileSync(pf, 'utf-8').trim(), 10);
     if (!isNaN(pid)) { try { process.kill(pid); console.log(`  ✓ Stopped proxy (pid ${pid})`); } catch { console.log('  ℹ️  Proxy process already gone.'); } }
@@ -277,15 +313,15 @@ async function ccUp(args: string[]): Promise<void> {
   const foreground = args.includes('--foreground');
   console.log(`\n  RelayPlane × Claude Code — setup (${scope.kind}${scope.kind === 'project' ? `: ${scope.root}` : ''})\n`);
 
-  const keys = await collectKeys();
-  console.log(`  ✓ Provider keys saved to ${envFilePath()} (chmod 600)`);
+  const keys = await collectDelegateKeys(CLAUDE_CODE_KEY_SPECS);
+  console.log(`  ✓ Provider keys saved to ${delegateEnvFilePath()} (chmod 600)`);
 
-  const { routingChanged, prevMode } = applyProxyConfig();
-  console.log(`  ✓ Proxy config: ${configPath()} (zai + minimax + byteplus delegated, routing.mode=standard, cache off)`);
+  const { routingChanged, prevMode } = applyDelegateProxyConfig();
+  console.log(`  ✓ Proxy config: ${delegateConfigPath()} (zai + minimax + byteplus + deepseek delegated, routing.mode=standard, cache off)`);
   if (routingChanged) console.log(`    ⚠️  Changed routing.mode "${prevMode}" → "standard" (delegation needs passthrough).`);
 
   setBaseUrl(scope);
-  console.log(`  ✓ Claude Code wiring: ${scope.settingsPath} (ANTHROPIC_BASE_URL=${BASE_URL}; OAuth left intact)`);
+  console.log(`  ✓ Claude Code wiring: ${scope.settingsPath} (ANTHROPIC_BASE_URL=${DELEGATE_BASE_URL}; OAuth left intact)`);
 
   writeAgents(scope);
   console.log(`  ✓ Subagents: ${Object.keys(AGENTS).map((n) => join(scope.agentsDir, n)).join(', ')}`);
@@ -294,7 +330,7 @@ async function ccUp(args: string[]): Promise<void> {
     console.log('\n  Setup complete. Start the proxy in this terminal:\n    relayplane start\n');
   } else {
     console.log('');
-    await startDaemon(keys);
+    await startDelegateDaemon(keys);
   }
 
   console.log('\n  Done. Next:');
@@ -311,29 +347,29 @@ function ccDown(args: string[]): void {
   console.log(`  ✓ Removed ANTHROPIC_BASE_URL from ${scope.settingsPath}`);
   removeAgents(scope);
   console.log(`  ✓ Removed glm.md / minimax.md from ${scope.agentsDir}`);
-  stopDaemon();
-  console.log(`\n  Left in place: ${configPath()} and ${envFilePath()} (delete manually to fully reset).\n`);
+  stopDelegateDaemon();
+  console.log(`\n  Left in place: ${delegateConfigPath()} and ${delegateEnvFilePath()} (delete manually to fully reset).\n`);
 }
 
 async function ccStatus(): Promise<void> {
   console.log('\n  RelayPlane × Claude Code — status\n');
-  const up = await isPortUp();
-  console.log(`  Proxy (:${PORT}): ${up ? '🟢 running' : '🔴 not running'}`);
+  const up = await isDelegatePortUp();
+  console.log(`  Proxy (:${DELEGATE_PORT}): ${up ? '🟢 running' : '🔴 not running'}`);
   if (up) {
     try {
-      const r = await fetch(`${BASE_URL}/health`, { signal: AbortSignal.timeout(1500) });
+      const r = await fetch(`${DELEGATE_BASE_URL}/health`, { signal: AbortSignal.timeout(1500) });
       console.log(`  Health: ${r.ok ? 'ok' : 'HTTP ' + r.status}`);
     } catch { console.log('  Health: (port open, /health not reachable)'); }
   }
-  const cfg = readJson(configPath());
+  const cfg = readJson(delegateConfigPath());
   const providers = ((cfg['nativeDelegate'] as Json)?.['providers'] as Json) || {};
   const routing = (cfg['routing'] as Json)?.['mode'] ?? '(unset)';
-  console.log(`  Config: ${configPath()}  routing.mode=${routing}  delegated=[${Object.keys(providers).join(', ') || 'none'}]`);
-  const env = parseEnvFile(envFilePath());
-  console.log(`  Keys (${envFilePath()}): ${KEY_SPECS.map((k) => `${k.env}=${env[k.env] || process.env[k.env] ? 'set' : 'MISSING'}`).join(', ')}`);
+  console.log(`  Config: ${delegateConfigPath()}  routing.mode=${routing}  delegated=[${Object.keys(providers).join(', ') || 'none'}]`);
+  const env = parseEnvFile(delegateEnvFilePath());
+  console.log(`  Keys (${delegateEnvFilePath()}): ${DELEGATE_KEY_SPECS.map((k) => `${k.env}=${env[k.env] || process.env[k.env] ? 'set' : 'MISSING'}`).join(', ')}`);
   for (const scope of [resolveScope(['--global']), resolveScope(['--project'])]) {
     const s = readJson(scope.settingsPath);
-    const wired = ((s['env'] as Json)?.['ANTHROPIC_BASE_URL']) === BASE_URL;
+    const wired = ((s['env'] as Json)?.['ANTHROPIC_BASE_URL']) === DELEGATE_BASE_URL;
     const hasAgents = Object.keys(AGENTS).every((n) => existsSync(join(scope.agentsDir, n)));
     console.log(`  ${scope.kind.padEnd(7)}: base_url=${wired ? '✓' : '✗'}  agents=${hasAgents ? '✓' : '✗'}  (${scope.settingsPath})`);
   }

@@ -1,0 +1,9 @@
+name = "switch-pro"
+description = "Resilient coding helper that automatically fails over between DeepSeek-V4-Pro providers through RelayPlane. Use for substantial coding, refactoring, and analysis when provider availability matters."
+model = "switch/pro"
+model_provider = "relayplane"
+developer_instructions = """
+You are a capable engineering assistant running on a RelayPlane-managed pro model.
+Answer directly and precisely. When editing code, make minimal, surgical changes
+and match the surrounding style.
+"""
