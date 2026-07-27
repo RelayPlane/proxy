@@ -16,12 +16,44 @@ import { StatsCollector } from './stats.js';
 import { StatusReporter, type ProxyStatus } from './status.js';
 import { type Logger, defaultLogger } from './logger.js';
 import { captureAtom } from './osmosis-store.js';
+import { classifyViaSidecar, type SidecarLogger } from './classifier/sidecar_client.js';
+import { loadSidecarConfig, type SidecarConfig } from './classifier/sidecar_setup.js';
 
 function inferTaskType(reqPath: string, body: string): string {
   if (reqPath.includes('/v1/messages') || reqPath.includes('/v1/chat/completions')) return 'chat';
   if (reqPath.includes('/v1/completions')) return 'completion';
   if (body && body.toLowerCase().includes('code')) return 'code';
   return 'unknown';
+}
+
+export interface ClassifyResult {
+  taskType: string;
+  source: 'regex' | 'sidecar';
+  confidence?: number;
+  recommendedModel?: string;
+}
+
+export async function classifyTaskType(
+  reqPath: string,
+  body: string,
+  ctx: { sidecarConfig: SidecarConfig; availableModels?: string[]; logger?: SidecarLogger }
+): Promise<ClassifyResult> {
+  if (!ctx.sidecarConfig.enabled || !ctx.sidecarConfig.url) {
+    return { taskType: inferTaskType(reqPath, body), source: 'regex' };
+  }
+  const result = await classifyViaSidecar(
+    { prompt: body, models: ctx.availableModels ?? [] },
+    { url: ctx.sidecarConfig.url, timeoutMs: ctx.sidecarConfig.timeoutMs, logger: ctx.logger }
+  );
+  if (result && result.confidence >= ctx.sidecarConfig.confidenceThreshold) {
+    return {
+      taskType: result.task_type ?? inferTaskType(reqPath, body),
+      source: 'sidecar',
+      confidence: result.confidence,
+      recommendedModel: result.model,
+    };
+  }
+  return { taskType: inferTaskType(reqPath, body), source: 'regex' };
 }
 
 function extractModel(body: string): string {
@@ -88,6 +120,7 @@ export class RelayPlaneMiddleware {
   private readonly logger: Logger;
   private probeInterval: ReturnType<typeof setInterval> | null = null;
   private processManager: ProcessManager | null = null;
+  private sidecarConfig: SidecarConfig;
 
   constructor(config?: Partial<RelayPlaneConfig>);
   constructor(opts?: MiddlewareOptions);
@@ -112,6 +145,7 @@ export class RelayPlaneMiddleware {
     this.proxyUrl = resolved.proxyUrl;
     this.autoStart = resolved.autoStart;
     this.logger = logger ?? defaultLogger;
+    this.sidecarConfig = loadSidecarConfig();
     this.circuitBreaker = new CircuitBreaker(resolved.circuitBreaker);
     this.stats = new StatsCollector();
 
@@ -184,7 +218,17 @@ export class RelayPlaneMiddleware {
   async route(req: MiddlewareRequest, directSend: DirectSendFn): Promise<MiddlewareResponse> {
     const bodyStr = typeof req.body === 'string' ? req.body : (req.body?.toString() ?? '');
     const model = extractModel(bodyStr);
-    const taskType = inferTaskType(req.path, bodyStr);
+    const classified = await classifyTaskType(req.path, bodyStr, {
+      sidecarConfig: this.sidecarConfig,
+      availableModels: [model],
+      logger: this.logger,
+    });
+    const { taskType } = classified;
+    const classifierMeta = {
+      classifierSource: classified.source,
+      classifierConfidence: classified.confidence,
+      classifierRecommendedModel: classified.recommendedModel,
+    };
 
     if (!this.enabled || !this.circuitBreaker.isHealthy()) {
       const reason = !this.enabled ? 'proxy disabled' : 'circuit breaker OPEN';
@@ -201,12 +245,10 @@ export class RelayPlaneMiddleware {
       });
 
       if (!this.enabled) {
-        // Proxy disabled — capture success for the direct call
         const { inputTokens, outputTokens } = extractTokenUsage(resp.body);
-        captureAtom({ type: 'success', model, taskType, latencyMs, inputTokens, outputTokens, timestamp: Date.now() });
+        captureAtom({ type: 'success', model, taskType, latencyMs, inputTokens, outputTokens, timestamp: Date.now(), ...classifierMeta });
       } else {
-        // Circuit breaker OPEN — capture failure (proxy unavailable)
-        captureAtom({ type: 'failure', model, errorType: 'circuit_open', fallbackTaken: true, timestamp: Date.now() });
+        captureAtom({ type: 'failure', model, errorType: 'circuit_open', fallbackTaken: true, timestamp: Date.now(), ...classifierMeta });
       }
       return resp;
     }
@@ -223,14 +265,14 @@ export class RelayPlaneMiddleware {
         success: true,
       });
       const { inputTokens, outputTokens } = extractTokenUsage(resp.body);
-      captureAtom({ type: 'success', model, taskType, latencyMs, inputTokens, outputTokens, timestamp: Date.now() });
+      captureAtom({ type: 'success', model, taskType, latencyMs, inputTokens, outputTokens, timestamp: Date.now(), ...classifierMeta });
       return resp;
     } catch (err) {
       this.circuitBreaker.recordFailure();
       const errMsg = err instanceof Error ? err.message : String(err);
       this.logger.warn(`Falling back to direct: proxy error (${errMsg})`);
       this.statusReporter.setLastError(errMsg);
-      captureAtom({ type: 'failure', model, errorType: classifyError(errMsg), fallbackTaken: true, timestamp: Date.now() });
+      captureAtom({ type: 'failure', model, errorType: classifyError(errMsg), fallbackTaken: true, timestamp: Date.now(), ...classifierMeta });
 
       const directStart = Date.now();
       const resp = await directSend(req);

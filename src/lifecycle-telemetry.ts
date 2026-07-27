@@ -2,12 +2,12 @@
  * Proxy Lifecycle Telemetry
  *
  * Sends 3 anonymous lifecycle events to the telemetry pipeline:
- *   proxy.activated        — first successful proxied request (once per install)
- *   proxy.session          — daily heartbeat while proxy is running
- *   proxy.dashboard_linked — when user connects their cloud account
+ *   proxy.activated        , first successful proxied request (once per install)
+ *   proxy.session          , daily heartbeat while proxy is running
+ *   proxy.dashboard_linked , when user connects their cloud account
  *
  * Encoded as TelemetryEvent with task_type = event name, model = 'lifecycle',
- * all numeric fields 0.  Fails silently — never crashes the proxy.
+ * all numeric fields 0.  Fails silently , never crashes the proxy.
  *
  * @packageDocumentation
  */
@@ -17,7 +17,7 @@ import * as path from 'path';
 import { getDeviceId, isLifecycleEnabled, getConfigDir } from './config.js';
 
 const MESH_API_URL = process.env.RELAYPLANE_API_URL || 'https://api.relayplane.com';
-const LIFECYCLE_FILE = path.join(getConfigDir(), 'lifecycle.json');
+const LIFECYCLE_FILE = (() => { try { return path.join(getConfigDir(), 'lifecycle.json'); } catch { return ''; } })();
 
 interface LifecycleState {
   activation_sent: boolean;
@@ -43,7 +43,7 @@ function saveLifecycleState(state: LifecycleState): void {
     }
     fs.writeFileSync(LIFECYCLE_FILE, JSON.stringify(state, null, 2));
   } catch {
-    // Silently fail — telemetry must never crash the proxy
+    // Silently fail , telemetry must never crash the proxy
   }
 }
 
@@ -131,7 +131,7 @@ export function maybeSendSessionHeartbeat(): void {
 
 /**
  * Fire proxy.dashboard_linked when the user successfully links their cloud account.
- * Idempotent — safe to call multiple times but only sends once per day to avoid spam.
+ * Idempotent , safe to call multiple times but only sends once per day to avoid spam.
  */
 export function fireDashboardLinked(): void {
   if (!isLifecycleEnabled()) return;

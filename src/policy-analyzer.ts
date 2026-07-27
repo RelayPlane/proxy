@@ -36,6 +36,7 @@ export interface AgentAnalysis {
 // Costs in USD per 1M tokens. Input/output separately.
 // Update when provider pricing changes.
 export const MODEL_COST_PER_1M: Record<string, { input: number; output: number }> = {
+  'anthropic/claude-opus-5':         { input: 5.00,  output: 25.00 },
   'anthropic/claude-opus-4-5':       { input: 15.00, output: 75.00 },
   'anthropic/claude-opus-4':         { input: 15.00, output: 75.00 },
   'anthropic/claude-sonnet-4-5':     { input: 3.00,  output: 15.00 },
@@ -253,7 +254,7 @@ export async function analyzeTraffic(opts?: { lookbackDays?: number }): Promise<
         nameIsInferred = true;
       }
     } else {
-      // Fingerprint in log but not in agents.json — use log data
+      // Fingerprint in log but not in agents.json, use log data
       name = inferAgentName(systemPromptPreview, taskDistribution);
       nameIsInferred = true;
     }

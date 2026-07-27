@@ -1,0 +1,313 @@
+/* ============================================================
+   RelayPlane Design System , Colors & Type
+   ============================================================
+   RelayPlane is governance infrastructure for AI agents:
+   the proxy that routes work across providers, enforces budgets,
+   isolates tenants, and audits every call.
+
+   The system is dark-first, infrastructure-grade, terminal-adjacent.
+   The voice is declarative; the visuals are sharp.
+   ============================================================ */
+
+/* --- Fonts (Google Fonts) --------------------------------------
+   SUBSTITUTION NOTE: RelayPlane's marketing site appears to use a
+   Geist-family sans + JetBrains-style mono. No font files were
+   provided in the repos, so we use the closest Google Fonts:
+     - Inter Tight  → display + body sans (Geist substitute)
+     - JetBrains Mono → code, CLI, run IDs, stat numbers
+   Replace these with the real Geist/IBM Plex Mono files when
+   the user provides them.
+---------------------------------------------------------------- */
+@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700;800&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  /* ===== Color tokens , RAW palette ============================ */
+  /* Ink (dark surfaces) */
+  --rp-ink-1000: #07080A;   /* deepest background */
+  --rp-ink-900:  #0B0D10;   /* page bg */
+  --rp-ink-800:  #11141A;   /* panel bg */
+  --rp-ink-700:  #181C24;   /* card bg */
+  --rp-ink-600:  #232833;   /* card bg elevated, hover */
+  --rp-ink-500:  #2E3441;   /* borders strong */
+  --rp-ink-400:  #3B4252;   /* borders */
+  --rp-ink-300:  #555C6A;   /* dim text on dark */
+
+  /* Paper (light surfaces) */
+  --rp-paper-0:    #FFFFFF;
+  --rp-paper-50:   #FAFAF8;  /* warm off-white, marketing bg */
+  --rp-paper-100:  #F4F4F0;
+  --rp-paper-200:  #E8E8E2;
+  --rp-paper-300:  #D6D6CE;
+  --rp-paper-400:  #A8A89E;
+  --rp-paper-500:  #74747A;
+  --rp-paper-600:  #4A4A52;
+  --rp-paper-700:  #2A2A30;
+
+  /* Signal , accents (functional, not decorative) */
+  --rp-signal-relay:    #34D399;  /* lime , RelayPlane brand accent, "savings", "active" */
+  --rp-signal-relay-dim:#1BA37B;
+  --rp-signal-relay-deep:#0F5E44;
+
+  --rp-signal-route:    #4D9BFF;  /* azure , routing decisions, info */
+  --rp-signal-route-dim:#2B6EC8;
+
+  --rp-signal-spend:    #FFB347;  /* amber , cost warnings, budget threshold */
+  --rp-signal-spend-dim:#C8821F;
+
+  --rp-signal-stop:     #FF5A4D;  /* coral , kill-switch, errors, denied */
+  --rp-signal-stop-dim: #C8362A;
+
+  --rp-signal-verify:   #A78BFA;  /* violet , spec-match, verification */
+  --rp-signal-verify-dim:#7C5FE0;
+
+  /* ===== Semantic tokens , DARK (default product surfaces) ===== */
+  --rp-bg:           var(--rp-ink-900);
+  --rp-bg-elev:      var(--rp-ink-800);
+  --rp-bg-card:      var(--rp-ink-700);
+  --rp-bg-card-hi:   var(--rp-ink-600);
+
+  --rp-fg-1:         #EDEEF0;   /* primary text */
+  --rp-fg-2:         #B4B7BE;   /* secondary text */
+  --rp-fg-3:         #80848C;   /* tertiary text, labels */
+  --rp-fg-mute:      #5A5E66;   /* muted, dividers as text */
+
+  --rp-border:       var(--rp-ink-500);
+  --rp-border-soft:  var(--rp-ink-600);
+  --rp-border-hi:    var(--rp-ink-400);
+
+  --rp-accent:       var(--rp-signal-relay);     /* brand accent */
+  --rp-accent-fg:    #0B0D10;                     /* text on accent */
+  --rp-link:         var(--rp-signal-route);
+
+  --rp-success:      var(--rp-signal-relay);
+  --rp-info:         var(--rp-signal-route);
+  --rp-warning:      var(--rp-signal-spend);
+  --rp-danger:       var(--rp-signal-stop);
+  --rp-verify:       var(--rp-signal-verify);
+
+  /* ===== Spacing scale ========================================= */
+  --rp-space-1:  4px;
+  --rp-space-2:  8px;
+  --rp-space-3:  12px;
+  --rp-space-4:  16px;
+  --rp-space-5:  20px;
+  --rp-space-6:  24px;
+  --rp-space-8:  32px;
+  --rp-space-10: 40px;
+  --rp-space-12: 48px;
+  --rp-space-16: 64px;
+  --rp-space-20: 80px;
+  --rp-space-24: 96px;
+
+  /* ===== Radii , restrained ==================================== */
+  --rp-radius-0:  0px;
+  --rp-radius-1:  2px;     /* inputs, badges */
+  --rp-radius-2:  4px;     /* buttons, chips */
+  --rp-radius-3:  6px;     /* cards */
+  --rp-radius-4:  10px;    /* panels */
+  --rp-radius-pill: 999px;
+
+  /* ===== Borders =============================================== */
+  --rp-stroke-hair: 1px;
+  --rp-stroke-rule: 1px;
+  --rp-stroke-emph: 2px;
+
+  /* ===== Shadows , used sparingly. Dark UI relies on borders. == */
+  --rp-shadow-1: 0 1px 0 rgba(0,0,0,.4);
+  --rp-shadow-2: 0 4px 16px -8px rgba(0,0,0,.6), 0 1px 0 rgba(255,255,255,.02) inset;
+  --rp-shadow-3: 0 12px 32px -12px rgba(0,0,0,.7);
+  --rp-glow-accent: 0 0 0 1px var(--rp-signal-relay), 0 0 24px -6px rgba(52,211,153,.5);
+  --rp-glow-stop:   0 0 0 1px var(--rp-signal-stop),  0 0 18px -6px rgba(255,90,77,.5);
+
+  /* ===== Type scale ============================================ */
+  --rp-font-sans:    'Inter Tight', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --rp-font-display: 'Instrument Serif', 'Times New Roman', Georgia, serif;
+  --rp-font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* sizes (px, line-height multipliers via classes below) */
+  --rp-size-hero:    72px;   /* h1 hero */
+  --rp-size-h1:      56px;
+  --rp-size-h2:      40px;
+  --rp-size-h3:      28px;
+  --rp-size-h4:      20px;
+  --rp-size-h5:      16px;
+  --rp-size-body:    16px;
+  --rp-size-body-sm: 14px;
+  --rp-size-caption: 12px;
+  --rp-size-micro:   11px;
+  --rp-size-eyebrow: 12px;
+  --rp-size-stat:    44px;   /* big-number stat */
+  --rp-size-stat-lg: 64px;
+
+  /* line-heights */
+  --rp-lh-tight:  1.04;
+  --rp-lh-snug:   1.15;
+  --rp-lh-normal: 1.5;
+  --rp-lh-loose:  1.65;
+
+  /* tracking */
+  --rp-track-tight:  -0.02em;
+  --rp-track-snug:   -0.01em;
+  --rp-track-normal: 0;
+  --rp-track-wide:   0.08em;
+  --rp-track-eyebrow:0.14em;
+
+  /* weights */
+  --rp-w-regular: 400;
+  --rp-w-medium:  500;
+  --rp-w-semibold:600;
+  --rp-w-bold:    700;
+  --rp-w-black:   800;
+}
+
+/* ============================================================
+   Optional LIGHT theme , for printed material / docs surfaces.
+   The product is dark-first; this is a secondary mode.
+   ============================================================ */
+[data-rp-theme="light"] {
+  --rp-bg:          var(--rp-paper-50);
+  --rp-bg-elev:     var(--rp-paper-0);
+  --rp-bg-card:     var(--rp-paper-0);
+  --rp-bg-card-hi:  var(--rp-paper-100);
+
+  --rp-fg-1:        var(--rp-ink-1000);
+  --rp-fg-2:        #3A3D45;
+  --rp-fg-3:        #6B6F78;
+  --rp-fg-mute:     #9DA1AA;
+
+  --rp-border:      var(--rp-paper-300);
+  --rp-border-soft: var(--rp-paper-200);
+  --rp-border-hi:   var(--rp-paper-400);
+
+  --rp-accent-fg:   var(--rp-ink-1000);
+  --rp-link:        var(--rp-signal-route-dim);
+}
+
+/* ============================================================
+   Base , apply when this stylesheet is the source of truth
+   ============================================================ */
+html, body {
+  background: var(--rp-bg);
+  color: var(--rp-fg-1);
+  font-family: var(--rp-font-sans);
+  font-size: var(--rp-size-body);
+  line-height: var(--rp-lh-normal);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "ss01", "cv11"; /* tabular numerals friendly */
+}
+
+::selection { background: var(--rp-signal-relay); color: var(--rp-ink-900); }
+
+/* ============================================================
+   Semantic type classes / element styles
+   ============================================================ */
+
+/* Display tier , Instrument Serif. High-contrast didone-adjacent serif.
+   Single weight (400) only; size + line-height carry the impact. Italic is
+   used for editorial emphasis inside a display headline. */
+.rp-hero, h1.rp-hero {
+  font-family: var(--rp-font-display);
+  font-size: clamp(56px, 7vw, var(--rp-size-hero));
+  font-weight: var(--rp-w-regular);
+  line-height: var(--rp-lh-tight);
+  letter-spacing: var(--rp-track-snug);
+  text-wrap: balance;
+}
+
+h1, .rp-h1 {
+  font-family: var(--rp-font-display);
+  font-size: clamp(40px, 4.5vw, var(--rp-size-h1));
+  font-weight: var(--rp-w-regular);
+  line-height: var(--rp-lh-tight);
+  letter-spacing: var(--rp-track-snug);
+  text-wrap: balance;
+}
+
+h2, .rp-h2 {
+  font-family: var(--rp-font-display);
+  font-size: clamp(32px, 3.5vw, var(--rp-size-h2));
+  font-weight: var(--rp-w-regular);
+  line-height: var(--rp-lh-snug);
+  letter-spacing: var(--rp-track-snug);
+}
+
+h3, .rp-h3 {
+  font-size: var(--rp-size-h3);
+  font-weight: var(--rp-w-semibold);
+  line-height: var(--rp-lh-snug);
+  letter-spacing: var(--rp-track-snug);
+}
+
+h4, .rp-h4 {
+  font-size: var(--rp-size-h4);
+  font-weight: var(--rp-w-semibold);
+  line-height: var(--rp-lh-snug);
+}
+
+h5, .rp-h5 {
+  font-size: var(--rp-size-h5);
+  font-weight: var(--rp-w-semibold);
+  line-height: var(--rp-lh-normal);
+}
+
+p, .rp-body {
+  font-size: var(--rp-size-body);
+  line-height: var(--rp-lh-loose);
+  color: var(--rp-fg-2);
+}
+
+.rp-body-sm { font-size: var(--rp-size-body-sm); line-height: var(--rp-lh-normal); }
+.rp-caption { font-size: var(--rp-size-caption); color: var(--rp-fg-3); }
+.rp-micro   { font-size: var(--rp-size-micro);  color: var(--rp-fg-3); }
+
+/* The signature RelayPlane "eyebrow" , used to label sections.
+   Uppercase, tracked, dot-separated runs like:
+   "MULTI-PROVIDER · TASK-AWARE ROUTING · KILL-SWITCH" */
+.rp-eyebrow {
+  font-family: var(--rp-font-mono);
+  font-size: var(--rp-size-eyebrow);
+  font-weight: var(--rp-w-medium);
+  letter-spacing: var(--rp-track-eyebrow);
+  text-transform: uppercase;
+  color: var(--rp-fg-3);
+}
+.rp-eyebrow--accent { color: var(--rp-signal-relay); }
+
+/* Numbers that act as content: stats, totals, prices, latencies */
+.rp-stat {
+  font-family: var(--rp-font-sans);
+  font-size: var(--rp-size-stat);
+  font-weight: var(--rp-w-bold);
+  line-height: 1;
+  letter-spacing: var(--rp-track-tight);
+  font-variant-numeric: tabular-nums;
+}
+.rp-stat--lg { font-size: var(--rp-size-stat-lg); }
+.rp-stat--mono {
+  font-family: var(--rp-font-mono);
+  font-weight: var(--rp-w-medium);
+  letter-spacing: 0;
+}
+
+/* Code / CLI */
+code, .rp-code, kbd, samp, pre {
+  font-family: var(--rp-font-mono);
+  font-size: 0.92em;
+}
+.rp-code-inline {
+  background: var(--rp-bg-elev);
+  border: 1px solid var(--rp-border-soft);
+  padding: 1px 6px;
+  border-radius: var(--rp-radius-1);
+  font-size: 0.88em;
+  color: var(--rp-fg-1);
+}
+
+.rp-link {
+  color: var(--rp-link);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color .12s ease, color .12s ease;
+}
+.rp-link:hover { border-bottom-color: currentColor; }

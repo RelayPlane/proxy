@@ -59,6 +59,70 @@ describe('TokenPool', () => {
       expect(pool.selectToken(NOW)).toBeNull();
     });
 
+    describe('preferApiKey (2026-07-05)', () => {
+      it('honors an explicit, available preference over priority ordering', () => {
+        const pool = makePool();
+        pool.registerConfigAccounts([
+          { label: 'primary', apiKey: 'sk-ant-api01-primary', priority: 0 },
+          { label: 'secondary', apiKey: 'sk-ant-api01-secondary', priority: 5 },
+        ]);
+        // Without a preference, priority would pick 'primary'.
+        const token = pool.selectToken(NOW, 'sk-ant-api01-secondary');
+        expect(token!.label).toBe('secondary');
+      });
+
+      it('reproduces the 2026-07-05 bug: a caller-selected, healthy token was silently swapped', () => {
+        const pool = makePool();
+        pool.registerConfigAccounts([
+          { label: 'exhausted-account', apiKey: 'sk-ant-api01-exhausted', priority: 0 },
+          { label: 'healthy-account', apiKey: 'sk-ant-api01-healthy', priority: 5 },
+        ]);
+        pool.record429('sk-ant-api01-exhausted', 120, NOW);
+
+        // Caller (e.g. oauth_creds.py) deliberately chose the healthy account
+        // and sent its token. Without preferApiKey, priority-based selection
+        // would still try 'exhausted-account' first, find it unavailable, and
+        // fall through to 'healthy-account' anyway in THIS case (since it's
+        // the only one left), but with more accounts in the pool, an
+        // available-but-lower-priority account could be picked over the
+        // caller's specific, deliberate choice. This test locks in that the
+        // caller's token wins outright when it is itself available, not just
+        // when it happens to be the last one standing.
+        const token = pool.selectToken(NOW, 'sk-ant-api01-healthy');
+        expect(token!.apiKey).toBe('sk-ant-api01-healthy');
+      });
+
+      it('falls through to normal selection when the preferred token is rate-limited', () => {
+        const pool = makePool();
+        pool.registerConfigAccounts([
+          { label: 'preferred-but-limited', apiKey: 'sk-ant-api01-limited', priority: 5 },
+          { label: 'fallback', apiKey: 'sk-ant-api01-fallback', priority: 0 },
+        ]);
+        pool.record429('sk-ant-api01-limited', 60, NOW);
+        const token = pool.selectToken(NOW, 'sk-ant-api01-limited');
+        expect(token!.apiKey).toBe('sk-ant-api01-fallback');
+      });
+
+      it('falls through to normal selection when the preferred token is not registered', () => {
+        const pool = makePool();
+        pool.registerConfigAccounts([
+          { label: 'a', apiKey: 'sk-ant-api01-a', priority: 0 },
+        ]);
+        const token = pool.selectToken(NOW, 'sk-ant-api01-never-seen');
+        expect(token!.apiKey).toBe('sk-ant-api01-a');
+      });
+
+      it('behaves exactly as before when no preference is given', () => {
+        const pool = makePool();
+        pool.registerConfigAccounts([
+          { label: 'primary', apiKey: 'sk-ant-api01-primary', priority: 0 },
+          { label: 'secondary', apiKey: 'sk-ant-api01-secondary', priority: 5 },
+        ]);
+        const token = pool.selectToken(NOW);
+        expect(token!.label).toBe('primary');
+      });
+    });
+
     it('increments requestsThisMinute on each call', () => {
       const pool = makePool();
       pool.registerConfigAccounts([
@@ -76,7 +140,7 @@ describe('TokenPool', () => {
         { label: 'main', apiKey: 'sk-ant-api01-main', priority: 0 },
         { label: 'backup', apiKey: 'sk-ant-api01-backup', priority: 1 },
       ]);
-      // Set known RPM to 10 for main — threshold is 9 requests
+      // Set known RPM to 10 for main, threshold is 9 requests
       pool.recordResponseHeaders('sk-ant-api01-main', {
         'anthropic-ratelimit-requests-limit': '10',
       }, NOW);

@@ -61,7 +61,7 @@ export interface BudgetConfig {
   alertThresholds: number[];
   /** Per-session spend cap in USD (default: 1.00). Session budget is only active when a session ID is present. */
   sessionCapUsd: number;
-  /** Model downgrade ladder — when a session exceeds 80% of its cap, downgrade to the next rung */
+  /** Model downgrade ladder: when a session exceeds 80% of its cap, downgrade to the next rung */
   modelLadder: string[];
   /**
    * Simple daily cap in USD used by BudgetTracker.
@@ -74,6 +74,29 @@ export interface BudgetConfig {
    * When daily spend / dailyCapUSD >= warningThreshold, a warning header is added.
    */
   warningThreshold?: number;
+  /** Per-session spend cap in USD (guardrails UI field). */
+  perSessionCapUsd?: number;
+  /** Per-day spend cap in USD (guardrails UI field). */
+  perDayCapUsd?: number;
+  /** Per-API-key spend caps keyed by key prefix. */
+  perKeyCapUsd?: Record<string, number>;
+  /** Auto-downgrade ladder entries. */
+  ladder?: Array<{ from: string; to: string; triggerPct: number }>;
+  /** Runaway loop detection: number of retries before kill. */
+  runawayRetries?: number;
+  /** Runaway loop detection: time window in seconds. */
+  runawayWindowSec?: number;
+  /** Alerting fanout configuration. */
+  alerting?: {
+    telegram?: boolean;
+    email?: boolean;
+    slack?: boolean;
+    webhook?: boolean;
+    telegramChatId?: string;
+    emailAddress?: string;
+    slackWebhookUrl?: string;
+    webhookUrl?: string;
+  };
 }
 
 // ─── Session Budget Types ────────────────────────────────────────────
@@ -138,6 +161,11 @@ export const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
   alertThresholds: [50, 80, 95],
   sessionCapUsd: 1.00,
   modelLadder: ['claude-opus-4-5', 'claude-sonnet-4-5', 'claude-haiku-4-5'],
+  ladder: [],
+  runawayRetries: 3,
+  runawayWindowSec: 90,
+  alerting: { telegram: false, email: false },
+  perKeyCapUsd: {},
 };
 
 // ─── Window helpers ──────────────────────────────────────────────────
@@ -247,6 +275,57 @@ export class BudgetManager {
 
   getConfig(): BudgetConfig {
     return { ...this.config };
+  }
+
+  applyGuardrailsPatch(patch: Partial<BudgetConfig>): { ok: boolean; error?: string } {
+    const capFields: Array<keyof BudgetConfig> = ['perSessionCapUsd', 'perDayCapUsd'];
+    for (const field of capFields) {
+      const val = patch[field];
+      if (val !== undefined && typeof val === 'number' && val < 0) {
+        return { ok: false, error: 'invalid_cap' };
+      }
+    }
+    if (patch.ladder !== undefined) {
+      for (const row of patch.ladder) {
+        if (!row.from || !row.to) return { ok: false, error: 'invalid_ladder_row' };
+        if (row.from === row.to) return { ok: false, error: 'invalid_ladder_row' };
+        if (row.triggerPct < 1 || row.triggerPct > 99) return { ok: false, error: 'invalid_ladder_row' };
+      }
+    }
+    if (patch.perKeyCapUsd !== undefined) {
+      for (const [, val] of Object.entries(patch.perKeyCapUsd)) {
+        if (typeof val !== 'number' || val <= 0) {
+          return { ok: false, error: 'invalid_per_key_cap' };
+        }
+      }
+    }
+    if (patch.runawayRetries !== undefined && patch.runawayRetries < 1) {
+      return { ok: false, error: 'invalid_runaway' };
+    }
+    if (patch.runawayWindowSec !== undefined && patch.runawayWindowSec < 5) {
+      return { ok: false, error: 'invalid_runaway' };
+    }
+    this.config = { ...this.config, ...patch };
+    return { ok: true };
+  }
+
+  getGuardrailsSummary(): {
+    per_session_cap_usd: number | null;
+    per_key_caps: Record<string, number>;
+    ladder: Array<{ from: string; to: string; triggerPct: number }>;
+    runaway: { retries: number; window_sec: number };
+    alerting: Record<string, unknown>;
+    alerts_fired_last_7d: number;
+  } {
+    const cfg = this.config;
+    return {
+      per_session_cap_usd: cfg.perSessionCapUsd ?? null,
+      per_key_caps: cfg.perKeyCapUsd ?? {},
+      ladder: cfg.ladder ?? [],
+      runaway: { retries: cfg.runawayRetries ?? 3, window_sec: cfg.runawayWindowSec ?? 90 },
+      alerting: cfg.alerting ?? {},
+      alerts_fired_last_7d: 0,
+    };
   }
 
   /**
@@ -432,7 +511,7 @@ export class BudgetManager {
 
   /**
    * Post-request: record actual cost for a session.
-   * Fire-and-forget — updates in-memory cache immediately, writes SQLite async.
+   * Fire-and-forget: updates in-memory cache immediately, writes SQLite async.
    */
   updateSessionBudget(sessionId: string, cost: number, modelUsed: string): void {
     const cap = this.config.sessionCapUsd;
@@ -721,7 +800,7 @@ export class BudgetTracker {
   init(): void {
     if (this._initialized) return;
     this._initialized = true;
-    if (this.dailyCapUSD === null) return; // unlimited — no persistence needed
+    if (this.dailyCapUSD === null) return; // unlimited, no persistence needed
 
     const budgetDir = path.join(os.homedir(), '.relayplane');
     fs.mkdirSync(budgetDir, { recursive: true });
@@ -765,7 +844,7 @@ export class BudgetTracker {
   }
 
   /**
-   * Pre-request check. Always <5ms — reads in-memory cache only.
+   * Pre-request check. Always <5ms, reads in-memory cache only.
    * Call `init()` before first use.
    */
   check(): BudgetCapCheckResult {

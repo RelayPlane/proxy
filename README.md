@@ -3,9 +3,9 @@
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
 
-A **Node.js npm LLM proxy** that sits between your AI agents and providers. Drop-in replacement for OpenAI and Anthropic base URLs — no Docker, no Python, just `npm install`. Tracks every request, shows where the money goes, and offers configurable task-aware routing — all running **locally, for free**.
+A **Node.js npm LLM proxy** that sits between your AI agents and providers. Drop-in replacement for OpenAI and Anthropic base URLs: no Docker, no Python, just `npm install`. Tracks every request, shows where the money goes, and offers configurable task-aware routing, all running **locally, for free**.
 
-**Live savings dashboard:** [relayplane.com/live](https://relayplane.com/live) — see real-time aggregate savings from developers worldwide.
+**Live savings dashboard:** [relayplane.com/live](https://relayplane.com/live). See real-time aggregate savings from developers worldwide.
 
 **The npm-native LLM proxy for Node.js developers.** Works with Claude Code, Cursor, OpenClaw, and any tool that supports `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`.
 
@@ -29,6 +29,19 @@ A **Node.js npm LLM proxy** that sits between your AI agents and providers. Drop
 - 🛡️ **Config resilience** - atomic writes, automatic backup/restore, credential separation
 
 > **Cloud dashboard available separately** - see [Cloud Dashboard & Pro Features](#cloud-dashboard--pro-features) below. Your prompts always stay local.
+
+## Cost Guardrails (Pro)
+
+Active spend control for AI agents. Set hard caps, auto-downgrade models as spend climbs, detect runaway loops, and review every kill decision in an audit trail.
+
+- **Hard caps**: per-session, per-day, and per-API-key spend limits
+- **Auto-downgrade ladder**: swap expensive models for cheaper ones at configurable thresholds
+- **Runaway loop detection**: kill sessions that retry too many times in a short window
+- **Alerting fanout**: Telegram, email, Slack (Max), webhook (Max)
+- **Kill audit trail**: review every session kill with timestamp, reason, and saved cost
+- **Apply in one action**: client-side validation before save
+
+See [/docs/cost-caps](https://relayplane.com/docs/cost-caps) and [/pricing](https://relayplane.com/pricing) for details.
 
 ## Quick Start
 
@@ -68,11 +81,13 @@ RelayPlane will start automatically when Claude Code opens. If it's already runn
 
 **Recent additions:**
 
-- **[relayplane.com/live](https://relayplane.com/live)** — Atlas public proof-of-work dashboard showing real-time aggregate savings from developers worldwide
-- **Osmosis Phase 1 shipped** — local telemetry capture tracks every routing decision; mesh is on by default
-- **Service installer hardened** — detects invoking user, loads env files correctly on systemd installs
-- **Provider-aware auto-routing** — Gemini, OpenRouter, xAI supported natively without extra config
-- **Agent-native signup flow** — `relayplane login` handles device OAuth inline
+- **[relayplane.com/live](https://relayplane.com/live)**: Atlas public proof-of-work dashboard showing real-time aggregate savings from developers worldwide
+- **Osmosis Phase 1 shipped**: local telemetry capture tracks every routing decision; mesh is on by default
+- **Service installer hardened**: detects invoking user, loads env files correctly on systemd installs
+- **Provider-aware auto-routing**: Gemini, OpenRouter, xAI supported natively without extra config
+- **Agent-native signup flow**: `relayplane login` handles device OAuth inline
+- **Claim-URL nudge**: at the 100th proxied request the proxy prints a one-time claim URL to stdout, letting you attach your anonymous proxy data to a RelayPlane account. The nudge fires once per install and never blocks requests.
+- **Credential quarantine**: when a pooled credential returns two consecutive 401 auth failures the proxy quarantines it for 1 hour and routes requests through the remaining credentials. This keeps a single revoked or rate-limited key from breaking the pool, and a quarantined credential is restored automatically once the window expires.
 
 **Note for upgraders from pre-v1.8.14:** Telemetry and mesh are now ON by default. Disable both: `relayplane telemetry off && relayplane mesh off`
 
@@ -366,6 +381,18 @@ relayplane start --offline
 
 Disables all network calls except the actual LLM requests. No telemetry transmission, no cloud features. The proxy still tracks everything locally for your dashboard.
 
+## Live cost ticker (CLI)
+
+For a terminal-based view of today's spend in real time, use the `watch` subcommand:
+
+```bash
+relayplane watch
+# or against a non-default proxy:
+relayplane watch --proxy http://localhost:4101 --interval 1000
+```
+
+It polls the proxy's `/v1/stats/live` endpoint and renders today's spend, the current session, model distribution, and the last 5 requests, redrawing in place. Works without cloud login.
+
 ## Dashboard
 
 The built-in dashboard runs at [http://localhost:4100](http://localhost:4100) (or `/dashboard`). It shows:
@@ -379,6 +406,7 @@ The built-in dashboard runs at [http://localhost:4100](http://localhost:4100) (o
 - Error detail capture - failed requests show the error message and HTTP status code
 - Provider health status
 - Wider 1600px layout for dense data views
+- **Cost Guardrails (Pro)** - the `config` tab lets Pro users set the daily cap, on-breach action (`warn`/`block`/`downgrade`), and routing mode (`auto`/`complexity`/`cascade`/`passthrough`) without restarting the proxy. Changes persist to `~/.relayplane/config.json`.
 
 ### Per-Agent Cost Tracking
 
@@ -463,10 +491,14 @@ The dashboard is powered by JSON endpoints you can use directly:
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /v1/telemetry/stats` | Aggregate statistics (total requests, costs, model counts) |
-| `GET /v1/telemetry/runs?limit=N` | Recent request history |
+| `GET /v1/telemetry/stats` | Aggregate statistics; now includes `today.{totalCost,totalRequests,avgLatencyMs,latencyP95,errorRate,cacheHitRate}` plus top-level `latencyP95` and `cacheHitRate` over the days window |
+| `GET /v1/telemetry/runs?limit=N` | Recent request history; each record now includes `routing_rule` and `routing_reason` (nullable when unset) |
+| `GET /v1/telemetry/spend-by-hour?day=YYYY-MM-DD` | Hourly USD spend buckets for a UTC day (24 entries, `{hour, usd}`) |
+| `GET /v1/telemetry/providers?days=N` | Per-provider rollup over the days window: `{provider, share, p95Ms, rpm, health, primary, note}` |
 | `GET /v1/telemetry/savings` | Cost savings from smart routing |
 | `GET /v1/telemetry/health` | Provider health and cooldown status |
+| `GET /v1/sessions` | Recent sessions; each record now includes `total_savings_usd` |
+| `GET /v1/telemetry/breakdown?dimension=model\|agent&window=1h\|24h\|7d\|30d` | Cost breakdown rows by model or agent for the given window. Unknown windows fall back to 24h. |
 
 ## Budget Enforcement
 
@@ -693,20 +725,18 @@ relayplane [command] [options]
 
 ## Cloud Dashboard & Pro Features
 
-The proxy is fully functional without a cloud account. All features above are **local and free**.
+The proxy is fully functional without a cloud account. RelayPlane is **free and open source (MIT)**, every feature included.
 
-Cloud dashboard is **free for all signed-up users**. Just `relayplane login`. For extended history, full mesh intelligence, and governance, [relayplane.com](https://relayplane.com) offers:
+The cloud dashboard is free too. Just `relayplane login`. There are no paid tiers: full mesh intelligence, extended history, data export, governance, per-agent spend limits, and approval flows are all included at no cost.
 
-| Feature | Plan |
-|---------|------|
-| Cloud dashboard - run history, cost trends, analytics | Free (all tiers) |
-| 30-day cloud history, weekly cost digest, routing recommendations | Starter ($9/mo) |
-| Full mesh intelligence - routing signals from thousands of agents | Pro ($29/mo) |
-| 90-day history, data export, cost spike alerts | Pro |
-| Private team mesh, per-agent spend limits, approval flows | Max ($99/mo) |
-| Governance & compliance rules, audit logs | Max |
+| Feature | Price |
+|---------|-------|
+| Local + cloud dashboard, run history, cost trends, analytics | Free |
+| Full mesh intelligence, routing signals from thousands of agents | Free |
+| Unlimited history, data export, cost spike alerts | Free |
+| Governance, per-agent spend limits, approval flows, audit logs | Free |
 
-**[View pricing →](https://relayplane.com/pricing)**
+**[Install free →](https://relayplane.com/pricing)**
 
 ### Connecting to Cloud
 

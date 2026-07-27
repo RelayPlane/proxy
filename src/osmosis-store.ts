@@ -1,5 +1,5 @@
 /**
- * Osmosis Phase 1 — KnowledgeAtom capture
+ * Osmosis Phase 1, KnowledgeAtom capture
  *
  * Stores per-request atoms in ~/.relayplane/osmosis.db (SQLite via better-sqlite3).
  * Falls back to ~/.relayplane/osmosis.jsonl if SQLite is unavailable.
@@ -19,6 +19,9 @@ export interface SuccessAtom {
   inputTokens: number;
   outputTokens: number;
   timestamp: number;
+  classifierSource?: 'regex' | 'sidecar';
+  classifierConfidence?: number;
+  classifierRecommendedModel?: string;
 }
 
 export interface FailureAtom {
@@ -27,6 +30,9 @@ export interface FailureAtom {
   model: string;
   fallbackTaken: boolean;
   timestamp: number;
+  classifierSource?: 'regex' | 'sidecar';
+  classifierConfidence?: number;
+  classifierRecommendedModel?: string;
 }
 
 export type KnowledgeAtom = SuccessAtom | FailureAtom;
@@ -118,7 +124,7 @@ function initDb(): import('better-sqlite3').Database | null {
     const db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
     db.exec(SCHEMA_SQL);
-    // Column migrations for pre-existing DBs — errors are swallowed (column already exists).
+    // Column migrations for pre-existing DBs; errors are swallowed (column already exists).
     for (const sql of COLUMN_MIGRATIONS) {
       try { db.exec(sql); } catch { /* column already exists */ }
     }
@@ -228,7 +234,7 @@ export function captureAtom(atom: KnowledgeAtom, sessionId?: string): void {
       }
       return;
     }
-    // SQLite unavailable — fall back to JSONL
+    // SQLite unavailable, fall back to JSONL
     writeToJsonl(atom);
   } catch {
     // best-effort fallback
@@ -236,7 +242,7 @@ export function captureAtom(atom: KnowledgeAtom, sessionId?: string): void {
   }
 }
 
-/** Exposed for testing — reset singleton state. */
+/** Exposed for testing; resets singleton state. */
 export function _resetStore(): void {
   if (_db) {
     try { _db.close(); } catch { /* ignore */ }

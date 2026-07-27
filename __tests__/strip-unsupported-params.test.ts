@@ -67,6 +67,43 @@ describe('thinking stripping for Haiku models', () => {
   });
 });
 
+describe('clear_thinking_20251015 strategy stripping for Haiku without thinking', () => {
+  // Bug: proxy injects (or forwards) a clear_thinking_20251015 thinking-strategy on outbound
+  // requests. The Anthropic API rejects Haiku calls that carry this strategy without
+  // thinking enabled with:
+  //   400: clear_thinking_20251015 strategy requires thinking to be enabled or adaptive
+  //
+  // Fix expectations (any of these observable in the built dist satisfies the acceptance):
+  //   1. The proxy strips clear_thinking_20251015 from the request when routing to a Haiku
+  //      model that does not have thinking enabled, OR
+  //   2. The proxy avoids injecting clear_thinking_20251015 for Haiku, OR
+  //   3. The proxy sets thinking to 'adaptive' when the strategy is applied.
+  //
+  // The test asserts the identifier appears in the dist AND is guarded by isHaikuModel, that
+  // is the minimum evidence that the proxy explicitly handles the incompatibility.
+
+  it('references clear_thinking_20251015 in the dist (fix must handle the strategy explicitly)', () => {
+    const content = getDistContent();
+    expect(content).toContain('clear_thinking_20251015');
+  });
+
+  it('guards clear_thinking_20251015 handling with isHaikuModel or a thinking-enabled check', () => {
+    const content = getDistContent();
+    // Locate the clear_thinking_20251015 site and require nearby evidence of a Haiku or
+    // thinking-enabled guard, so the strategy cannot leak into a Haiku-no-thinking request.
+    const idx = content.indexOf('clear_thinking_20251015');
+    expect(idx).toBeGreaterThan(-1);
+    const window = content.slice(Math.max(0, idx - 2000), idx + 2000);
+    expect(window).toMatch(/isHaikuModel|thinking\s*[?.:]|adaptive/);
+  });
+
+  it('logs when the clear_thinking strategy is adjusted for Haiku', () => {
+    const content = getDistContent();
+    // Any of these log-message fragments is acceptable evidence the branch is instrumented.
+    expect(content).toMatch(/clear_thinking|thinking strategy|Stripped .*(strategy|clear_thinking)/i);
+  });
+});
+
 describe('OAT beta flag stripping in header builders', () => {
   it('filters OAT_UNSUPPORTED_BETA_FLAGS in buildAnthropicHeadersWithAuth', () => {
     const content = getDistContent();

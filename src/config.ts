@@ -59,10 +59,38 @@ export interface ProviderAccountConfig {
   /** API key or OAT token */
   apiKey: string;
   /**
-   * Selection priority — lower number = tried first.
+   * Selection priority - lower number = tried first.
    * Default: 0.
    */
   priority?: number;
+}
+
+/**
+ * A single pooled credential (usage-aware failover pool).
+ * Mirrors CredentialPoolEntry in credential-pool.ts; duplicated here so config.ts
+ * stays free of a runtime dependency on the pool module.
+ */
+export interface CredentialPoolEntryConfig {
+  /** Stable id, e.g. "newmax" / "default". */
+  id: string;
+  /** Tenant this credential serves. Local proxy uses a single tenant (e.g. "local"). */
+  tenantId: string;
+  /** Where the token comes from. */
+  source: 'oauth-file' | 'api-key' | 'request-header';
+  /** oauth-file: path to a Claude-Code-style credentials JSON. */
+  path?: string;
+  /** api-key: env var holding the key. */
+  envVar?: string;
+  /** Selection weight (reserved; not yet used for weighting). */
+  weight?: number;
+  /** Max concurrent requests (reserved). */
+  maxConcurrent?: number;
+  /**
+   * oauth-file only. true = a SECOND Max account NOT logged into Claude Code here;
+   * the pool's refresh manager keeps its token fresh. false/absent = live account
+   * owned by Claude Code (read-only, never refreshed by us).
+   */
+  refresh?: boolean;
 }
 
 export interface ProviderConfig {
@@ -128,7 +156,7 @@ export interface ProxyConfig {
   telemetry_enabled: boolean;
 
   /**
-   * Lifecycle telemetry — anonymous install/session/dashboard_linked pings.
+   * Lifecycle telemetry - anonymous install/session/dashboard_linked pings.
    * No request content, no model names, no tokens. On by default per the
    * 2026-04-04 privacy spec. Opt out with `relayplane lifecycle off`.
    */
@@ -156,7 +184,7 @@ export interface ProxyConfig {
   /** Schema version for migrations */
   config_version: number;
 
-  /** True if the user explicitly ran `relayplane telemetry on/off` — migrations must not override this */
+  /** True if the user explicitly ran `relayplane telemetry on/off` - migrations must not override this */
   telemetry_explicitly_set?: boolean;
 
   /** True if the v1→v2 telemetry-off migration was applied to this config */
@@ -191,6 +219,16 @@ export interface ProxyConfig {
   providers?: Record<string, ProviderConfig>;
 
   /**
+   * Usage-aware credential pool (multi-account failover with OAuth refresh).
+   * When present, the proxy selects and injects a pooled credential per request
+   * (priority order, headroom-aware failover, reserve-Fable for elite) instead of
+   * blindly forwarding the caller's token, and runs a refresh loop that keeps any
+   * `refresh:true` account's OAuth token fresh. Absent (the default, incl. live
+   * 4100) = unchanged single-token / token-pool behavior.
+   */
+  credentialPool?: CredentialPoolEntryConfig[];
+
+  /**
    * Cross-provider cascade fallback (GH #38).
    * When enabled and a provider returns 429/529/503, the proxy will automatically
    * retry with the next provider in the `providers` cascade list.
@@ -209,7 +247,7 @@ export interface TracesConfig {
   /** Enable trace file writing (default: true) */
   enabled: boolean;
   /**
-   * Store full request/response bodies for replay (default: false — hashes only).
+   * Store full request/response bodies for replay (default: false - hashes only).
    * Set true only for debugging; bodies may contain sensitive data.
    */
   storeFullRequests: boolean;
@@ -268,7 +306,7 @@ function ensureConfigDir(): void {
 
 /**
  * Create default configuration
- * NOTE: This never touches credentials.json — credentials are managed separately.
+ * NOTE: This never touches credentials.json - credentials are managed separately.
  */
 function createDefaultConfig(): ProxyConfig {
   const now = new Date().toISOString();
@@ -361,7 +399,7 @@ export function loadConfig(): ProxyConfig {
       }
 
       // v3 → v4 migration: introduce lifecycle_enabled (default on). Only set
-      // the field if it's missing — respects explicit user choice if they
+      // the field if it's missing - respects explicit user choice if they
       // already ran `relayplane lifecycle off`.
       if (config.config_version === 3) {
         if (config.lifecycle_enabled === undefined) {
@@ -383,24 +421,24 @@ export function loadConfig(): ProxyConfig {
     try {
       const data = fs.readFileSync(CONFIG_BACKUP, 'utf-8');
       const config = JSON.parse(data) as ProxyConfig;
-      console.warn('[RelayPlane] WARNING: config.json missing or corrupt — restored from config.json.bak');
+      console.warn('[RelayPlane] WARNING: config.json missing or corrupt - restored from config.json.bak');
       
       // Check for credential separation: credentials exist but config was missing
       if (hasValidCredentials()) {
-        console.warn('[RelayPlane] Config reset detected — credentials preserved');
+        console.warn('[RelayPlane] Config reset detected - credentials preserved');
       }
       
       // Restore the backup as primary
       saveConfig(config);
       return config;
     } catch (err) {
-      console.warn('[RelayPlane] WARNING: config.json.bak is also corrupt — creating fresh config');
+      console.warn('[RelayPlane] WARNING: config.json.bak is also corrupt - creating fresh config');
     }
   }
   
   // Check for credential separation when creating fresh config
   if (hasValidCredentials()) {
-    console.warn('[RelayPlane] Config reset detected — credentials preserved');
+    console.warn('[RelayPlane] Config reset detected - credentials preserved');
   }
   
   // Last resort: create default config

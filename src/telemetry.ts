@@ -55,7 +55,7 @@ export interface TelemetryEvent {
   /** Actual cost paid on the routed model (same as cost_usd; explicit field for cloud savings split) */
   actual_cost_usd?: number;
 
-  /** Baseline cost — what the same request would cost on Claude Opus 4 at full price (no cache discount) */
+  /** Baseline cost , what the same request would cost on Claude Opus 4 at full price (no cache discount) */
   baseline_cost_usd?: number;
 
   /** Timestamp */
@@ -74,7 +74,7 @@ export interface TelemetryEvent {
 /**
  * Local telemetry store using SQLite (via Ledger)
  */
-const TELEMETRY_FILE = path.join(getConfigDir(), 'telemetry.jsonl');
+const TELEMETRY_FILE = (() => { try { return path.join(getConfigDir(), 'telemetry.jsonl'); } catch { return ''; } })();
 
 // In-memory buffer for audit mode
 let auditBuffer: TelemetryEvent[] = [];
@@ -130,7 +130,7 @@ export function inferTaskType(
  * Pricing as of 2024 (USD per 1M tokens)
  */
 export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  // Anthropic — versioned IDs
+  // Anthropic , versioned IDs
   'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
   'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0 },
@@ -140,29 +140,37 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
   'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
   'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
   'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
-  // Anthropic — generation-versioned aliases (e.g. claude-opus-4-6 = Opus 4 snapshot 6)
+  // Anthropic , generation-versioned aliases (e.g. claude-opus-4-6 = Opus 4 snapshot 6)
   'claude-opus-4-6': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
   'claude-haiku-4-6': { input: 0.8, output: 4.0 },
   'claude-opus-4-5': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
-  'claude-haiku-4-5': { input: 0.8, output: 4.0 },
-  // Anthropic — -latest aliases (resolve to same tier)
+  'claude-haiku-4-5': { input: 1.0, output: 5.0 },
+  // Anthropic , -latest aliases (resolve to same tier)
   'claude-opus-4-latest': { input: 15.0, output: 75.0 },
   'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
   'claude-3-7-sonnet-latest': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet-latest': { input: 3.0, output: 15.0 },
   'claude-3-5-haiku-latest': { input: 0.8, output: 4.0 },
   'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
-  // Anthropic — short aliases used in proxy MODEL_MAPPING
+  // Anthropic , short aliases used in proxy MODEL_MAPPING
   'claude-opus-4': { input: 15.0, output: 75.0 },
   'claude-sonnet-4': { input: 3.0, output: 15.0 },
   'claude-haiku-4': { input: 0.8, output: 4.0 },
   'claude-3-7-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-sonnet': { input: 3.0, output: 15.0 },
   'claude-3-5-haiku': { input: 0.8, output: 4.0 },
-  
+  // Anthropic June-July 2026 additions
+  'claude-opus-5':   { input: 5.0,  output: 25.0 },
+  'claude-sonnet-5': { input: 3.0,  output: 15.0 },
+  'claude-opus-4-8': { input: 5.0,  output: 25.0 },
+  'claude-fable-5':  { input: 10.0, output: 50.0 },
+  'claude-mythos-5': { input: 10.0, output: 50.0 },
+
   // OpenAI
+  'gpt-5.5':      { input: 2.0, output: 8.0 }, // TODO confirm gpt-5.5 pricing
+  'gpt-5.4-mini': { input: 2.0, output: 8.0 }, // TODO confirm gpt-5.4-mini pricing
   'gpt-4o': { input: 2.5, output: 10.0 },
   'gpt-4o-mini': { input: 0.15, output: 0.60 },
   'gpt-4.1': { input: 2.0, output: 8.0 },
@@ -195,9 +203,9 @@ export function estimateCost(model: string, inputTokens: number, outputTokens: n
     return regularInputCost + cacheCreationCost + cacheReadCost + outputCost;
   }
 
-  // No cache breakdown — backward compatible
+  // No cache breakdown , backward compatible
   const inputCost = (inputTokens / 1_000_000) * pricing.input;
-  return inputCost + outputCost; // Full precision — rounding happens at display time
+  return inputCost + outputCost; // Full precision , rounding happens at display time
 }
 
 /**

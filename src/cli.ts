@@ -120,7 +120,7 @@ async function checkForUpdate(): Promise<string | null> {
       return null;
     }
   } catch {
-    // API unavailable — fall through to npm fallback
+    // API unavailable, fall through to npm fallback
   }
 
   // Fallback: hit npm registry directly
@@ -146,7 +146,7 @@ async function checkForUpdate(): Promise<string | null> {
     }
     return null;
   } catch {
-    return null; // Network error, offline, etc. — silently skip
+    return null; // Network error, offline, etc., silently skip
   }
 }
 
@@ -262,17 +262,17 @@ async function handleLoginCommand(): Promise<void> {
       console.log(`  ✅ Browser opened to: ${verificationUrl}`);
       console.log(`     Paste the code above and approve.`);
     } else if (process.stdin.isTTY) {
-      // Interactive terminal — let user press Enter to try opening, or copy manually
+      // Interactive terminal, let user press Enter to try opening, or copy manually
       console.log(`  Press Enter to open ${verificationUrl}`);
       console.log(`  (or open it manually and paste the code above)`);
       console.log('');
 
-      // Wait for Enter (non-blocking — start polling in parallel)
+      // Wait for Enter (non-blocking, start polling in parallel)
       const waitForEnter = new Promise<void>((resolve) => {
         const onData = () => {
           process.stdin.removeListener('data', onData);
           if (process.stdin.isRaw === false || !process.stdin.setRawMode) {
-            // Normal line mode — Enter was pressed
+            // Normal line mode, Enter was pressed
           }
           tryOpenBrowser();
           resolve();
@@ -285,10 +285,10 @@ async function handleLoginCommand(): Promise<void> {
         }, 30000);
       });
 
-      // Don't await — let polling start immediately
+      // Don't await, let polling start immediately
       waitForEnter.catch(() => {});
     } else {
-      // Non-interactive (piped, CI, agent) — just show the URL
+      // Non-interactive (piped, CI, agent), just show the URL
       console.log(`  Open this URL in your browser:`);
       console.log(`    ${verificationUrl}`);
       console.log(`  Then enter the code above.`);
@@ -484,7 +484,7 @@ async function handleCloudStatusCommand(): Promise<void> {
 
 /**
  * Singleton guard: start the proxy if not already running on :4100, exit immediately if it is.
- * Designed for use in Claude Code SessionStart hooks — fast, idempotent, no duplicate processes.
+ * Designed for use in Claude Code SessionStart hooks, fast, idempotent, no duplicate processes.
  */
 async function handleEnsureRunning(): Promise<void> {
   const PORT = 4100;
@@ -700,7 +700,7 @@ function handleStatsCommand(): void {
   if (stats.savings > 0) {
     console.log(`  💰 You saved:   $${stats.savings.toFixed(4)} (${stats.savingsPercent.toFixed(1)}%)`);
   } else if (stats.totalEvents > 0 && stats.baselineCost === 0) {
-    console.log(`  ⚠️  No token data yet — savings will appear after new requests`);
+    console.log(`  ⚠️  No token data yet, savings will appear after new requests`);
   }
   console.log(`  Success rate:   ${(stats.successRate * 100).toFixed(1)}%`);
   console.log('');
@@ -893,12 +893,12 @@ async function handleAutostartCommand(args: string[]): Promise<void> {
       binPath = process.argv[0] ?? 'relayplane';
     }
 
-    // Detect the real invoking user (not root) — sanitize to prevent injection
+    // Detect the real invoking user (not root), sanitize to prevent injection
     const sudoUser = sanitizePosixUsername(process.env.SUDO_USER);
     let serviceUser: string;
     let serviceHome: string;
     if (sudoUser === 'root') {
-      // root ran sudo as root — use root's real home
+      // root ran sudo as root, use root's real home
       serviceUser = 'root';
       serviceHome = '/root';
     } else if (sudoUser) {
@@ -1086,7 +1086,7 @@ async function handleMeshCommand(args: string[]): Promise<void> {
           console.log(`✅ Synced: pushed ${data.sync.pushed ?? 0}, pulled ${data.sync.pulled ?? 0}`);
         }
       } else {
-        console.log('❌ Sync failed — is the proxy running?');
+        console.log('❌ Sync failed, is the proxy running?');
       }
     } catch {
       console.log('❌ Cannot connect to proxy. Start it first.');
@@ -1202,12 +1202,12 @@ async function handleServiceCommand(args: string[]): Promise<void> {
         return;
       }
 
-      // Detect the real invoking user (not root) — sanitize to prevent injection
+      // Detect the real invoking user (not root), sanitize to prevent injection
       const sudoUser = sanitizePosixUsername(process.env.SUDO_USER);
       let serviceUser: string;
       let serviceHome: string;
       if (sudoUser === 'root') {
-        // root ran sudo as root — use root's real home
+        // root ran sudo as root, use root's real home
         serviceUser = 'root';
         serviceHome = '/root';
       } else if (sudoUser) {
@@ -1242,7 +1242,7 @@ async function handleServiceCommand(args: string[]): Promise<void> {
         serviceContent = serviceContent.replace(/^(Environment=HOME=.*)$/m, `${envFileLines}
 $1`);
       } else {
-        // Fallback: generate inline — reuse already-sanitized serviceUser/serviceHome from above
+        // Fallback: generate inline, reuse already-sanitized serviceUser/serviceHome from above
 
         const envKeys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY'];
         const envLines = envKeys
@@ -1470,6 +1470,89 @@ WantedBy=multi-user.target
   }
 }
 
+async function handleWatchCommand(subArgs: string[]): Promise<void> {
+  let interval = 3000;
+  let proxyUrl = 'http://localhost:4100';
+  for (let i = 0; i < subArgs.length; i++) {
+    const a = subArgs[i];
+    if (a === '--interval' && subArgs[i + 1]) {
+      interval = parseInt(subArgs[++i] as string, 10) || interval;
+    } else if (a === '--proxy' && subArgs[i + 1]) {
+      proxyUrl = subArgs[++i] as string;
+    }
+  }
+
+  const url = `${proxyUrl}/v1/stats/live`;
+  const FETCH_TIMEOUT_MS = 5000;
+
+  interface LiveResponse {
+    todaySpend?: number;
+    currentSession?: { cost: number; sessionId?: string } | null;
+    modelDistribution?: Record<string, number>;
+    recentRequests?: { model: string; cost: number; latencyMs?: number }[];
+  }
+
+  const render = (data: LiveResponse): void => {
+    const todaySpend = data.todaySpend ?? 0;
+    const session = data.currentSession ?? null;
+    const models = data.modelDistribution ?? {};
+    const recent = data.recentRequests ?? [];
+
+    const lines: string[] = [];
+    lines.push('\x1b[2J\x1b[H');
+    lines.push('RelayPlane Watch (live cost ticker)\n');
+    lines.push('───────────────────────────────────\n');
+    lines.push(`Today's spend: $${todaySpend.toFixed(4)}\n`);
+    if (session) {
+      const idLabel = session.sessionId ? ` (${session.sessionId})` : '';
+      lines.push(`Current session${idLabel}: $${session.cost.toFixed(4)}\n`);
+    } else {
+      lines.push('Current session: none\n');
+    }
+    lines.push('\nModel distribution:\n');
+    const modelEntries = Object.entries(models);
+    if (modelEntries.length === 0) {
+      lines.push('  (no requests yet today)\n');
+    } else {
+      for (const [model, count] of modelEntries) {
+        lines.push(`  ${model}: ${count} requests\n`);
+      }
+    }
+    lines.push('\nRecent requests (last 5):\n');
+    if (recent.length === 0) {
+      lines.push('  (none)\n');
+    } else {
+      for (const r of recent.slice(0, 5)) {
+        const lat = typeof r.latencyMs === 'number' ? `  ${r.latencyMs}ms` : '';
+        lines.push(`  ${r.model}  $${r.cost.toFixed(4)}${lat}\n`);
+      }
+    }
+    process.stdout.write(lines.join(''));
+  };
+
+  const pollOnce = async (): Promise<void> => {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!res.ok) {
+        process.stdout.write(`\x1b[2J\x1b[HProxy returned ${res.status}. Retrying...\n`);
+        return;
+      }
+      const data = (await res.json()) as LiveResponse;
+      render(data);
+    } catch {
+      process.stdout.write(`\x1b[2J\x1b[HProxy unreachable at ${proxyUrl}. Retrying...\n`);
+    }
+  };
+
+  process.on('SIGINT', () => {
+    process.stdout.write('\n');
+    process.exit(0);
+  });
+
+  await pollOnce();
+  setInterval(() => { void pollOnce(); }, interval);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -1501,7 +1584,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'lifecycle', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
-    'ensure-running', 'agents', 'policy', 'setup',
+    'ensure-running', 'agents', 'policy', 'setup', 'watch',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1610,8 +1693,13 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (command === 'watch') {
+    await handleWatchCommand(args.slice(1));
+    process.exit(0);
+  }
+
   // Parse server options
-  let port = 4100;
+  let port = parseInt(process.env['RELAYPLANE_PROXY_PORT'] ?? process.env['RELAYPLANE_PORT'] ?? '4100', 10);
   let host = '127.0.0.1';
   let verbose = false;
   let audit = false;
@@ -1685,8 +1773,8 @@ async function main(): Promise<void> {
   const hasMoonshotKey = !!process.env['MOONSHOT_API_KEY'];
 
   if (!hasAnthropicKey && !hasOpenAIKey && !hasGeminiKey && !hasXAIKey && !hasOpenRouterKey && !hasDeepSeekKey && !hasGroqKey && !hasMoonshotKey) {
-    // Max plan / Claude Code users: no API key needed — auth passes through from Claude Code
-    console.log('  ℹ️  No API key set — running in passthrough mode.');
+    // Max plan / Claude Code users: no API key needed, auth passes through from Claude Code
+    console.log('  ℹ️  No API key set, running in passthrough mode.');
     console.log('     Claude Code (Max plan) users: this is correct, no key needed.');
     console.log('     API key users: set ANTHROPIC_API_KEY to enable env-based auth.');
     console.log('');
@@ -1742,7 +1830,7 @@ async function main(): Promise<void> {
     console.log('  Ready. Point Claude Code at the proxy:');
     console.log('');
     console.log(`    export ANTHROPIC_BASE_URL=http://localhost:${port}`);
-    console.log('    # then run: claude (Max plan — no API key needed)');
+    console.log('    # then run: claude (Max plan, no API key needed)');
     console.log('');
     console.log(`  Dashboard → http://localhost:${port}`);
     console.log('');
@@ -1822,6 +1910,9 @@ async function handleInitWizard(): Promise<void> {
   const isTTY = process.stdin.isTTY && process.stdout.isTTY;
 
   if (!isTTY) {
+    // PR C: detect fresh install BEFORE loadConfig writes a default.
+    const wasFreshInstall = !existsSync(configPath);
+
     // Non-interactive: ensure config exists, auto-detect OpenRouter-only setups, and exit
     loadConfig();
 
@@ -1838,7 +1929,30 @@ async function handleInitWizard(): Promise<void> {
           writeFileSync(configPath, JSON.stringify(rawCfg, null, 2));
           console.log('[RelayPlane] Auto-configured defaultProvider: "openrouter" (OpenRouter-only setup detected)');
         }
-      } catch { /* best-effort — never block init */ }
+      } catch { /* best-effort, never block init */ }
+    }
+
+    // PR C: on a FRESH install, silently write routing.preferred_provider=auto
+    // and the 4-tier complexity scheme (simple/moderate/complex/elite).
+    // Existing configs are never retro-fitted: absence of preferred_provider
+    // means "current behavior".
+    if (wasFreshInstall) {
+      try {
+        let rawCfg: Record<string, unknown> = {};
+        if (existsSync(configPath)) rawCfg = JSON.parse(readFileSync(configPath, 'utf-8'));
+        const routing = (rawCfg['routing'] as Record<string, unknown> | undefined) ?? {};
+        if (!('preferred_provider' in routing)) {
+          routing['preferred_provider'] = 'auto';
+          routing['complexity'] = {
+            simple: { description: 'Quick lookups, short answers, trivial edits' },
+            moderate: { description: 'Standard reasoning, multi-step tasks' },
+            complex: { description: 'Hard reasoning, refactors, deep analysis' },
+            elite: { description: 'Frontier-class problems, research-grade tasks' },
+          };
+          rawCfg['routing'] = routing;
+          writeFileSync(configPath, JSON.stringify(rawCfg, null, 2));
+        }
+      } catch { /* best-effort, never block init */ }
     }
 
     console.log('✅ RelayPlane initialized');
@@ -1892,9 +2006,9 @@ async function handleInitWizard(): Promise<void> {
 
   if (configExists) {
     console.log(`  Existing config found at: ${configPath}`);
-    console.log('  (Pre-filling with saved values — press Enter to keep)');
+    console.log('  (Pre-filling with saved values, press Enter to keep)');
   } else {
-    console.log('  No config found — setting up fresh.');
+    console.log('  No config found, setting up fresh.');
   }
   console.log('');
 
@@ -1949,9 +2063,9 @@ async function handleInitWizard(): Promise<void> {
   console.log(hr);
   console.log('  How should RelayPlane handle budget breaches?');
   console.log('');
-  console.log('    [1] Smart  — Auto-downgrade to cheaper models (recommended)');
-  console.log('    [2] Strict — Block all requests when daily limit is reached (402)');
-  console.log('    [3] Off    — No budget enforcement');
+  console.log('    [1] Smart , Auto-downgrade to cheaper models (recommended)');
+  console.log('    [2] Strict, Block all requests when daily limit is reached (402)');
+  console.log('    [3] Off   , No budget enforcement');
   console.log('');
 
   let defaultMode = '1';
@@ -1988,7 +2102,7 @@ async function handleInitWizard(): Promise<void> {
     const masked = apiKey.slice(0, 12) + '****' + apiKey.slice(-4);
     console.log(`  API Key:     ${masked}`);
   } else {
-    console.log('  API Key:     (none — will use ANTHROPIC_API_KEY env var)');
+    console.log('  API Key:     (none, will use ANTHROPIC_API_KEY env var)');
   }
   console.log(`  Daily cap:   $${dailyCapUsd.toFixed(2)}`);
   console.log(`  Routing:     ${modeLabel}`);
@@ -2000,7 +2114,7 @@ async function handleInitWizard(): Promise<void> {
 
   if (confirm.toLowerCase() === 'n') {
     console.log('');
-    console.log('  Aborted — no changes written.');
+    console.log('  Aborted, no changes written.');
     console.log('');
     return;
   }
@@ -2288,8 +2402,8 @@ function handleAgentsCommand(subArgs: string[]): void {
   console.log('-'.repeat(fpLen + nameLen + lastLen + reqLen + costLen));
   for (const e of entries) {
     const row =
-      (e.fingerprint ?? '—').padEnd(fpLen) +
-      (e.name ?? '—').padEnd(nameLen) +
+      (e.fingerprint ?? ',').padEnd(fpLen) +
+      (e.name ?? ',').padEnd(nameLen) +
       relTime(e.lastSeen ?? '').padEnd(lastLen) +
       (e.totalRequests?.toLocaleString() ?? '0').padEnd(reqLen) +
       ('$' + (e.totalCost ?? 0).toFixed(2)).padEnd(costLen);
@@ -2646,7 +2760,7 @@ async function handlePolicyCommand(subArgs: string[]): Promise<void> {
           renameSync(tmp, POLICY_FILE);
         }
       } catch {
-        // Best-effort — don't fail rename if policy update fails
+        // Best-effort, don't fail rename if policy update fails
       }
     }
 
@@ -2669,7 +2783,7 @@ async function handlePolicyCommand(subArgs: string[]): Promise<void> {
     }
 
     if (!existsSync(POLICY_FILE)) {
-      console.log('No policy file found — already in passthrough mode.');
+      console.log('No policy file found, already in passthrough mode.');
       return;
     }
 
@@ -2753,7 +2867,7 @@ async function _runPolicyAutoDisplay(
 ): Promise<void> {
   const suggestions = suggestPolicies(analyses, availableProviders);
 
-  // Phase 2 — Agent display
+  // Phase 2, Agent display
   const n = analyses.length;
   console.log('');
   console.log(`Detected ${n} agent${n !== 1 ? 's' : ''}:`);
@@ -2779,11 +2893,11 @@ async function _runPolicyAutoDisplay(
     console.log('');
     for (const name of lowDataAgents) {
       const a = analyses.find(x => x.name === name)!;
-      console.log(`  ⚠ ${name}: only ${a.totalRequests} requests — suggestions may be inaccurate`);
+      console.log(`  ⚠ ${name}: only ${a.totalRequests} requests, suggestions may be inaccurate`);
     }
   }
 
-  // Phase 3 — Suggestions
+  // Phase 3, Suggestions
   console.log('');
   console.log('Suggested policy (based on task patterns + your available keys):');
   console.log('');
@@ -2810,12 +2924,12 @@ async function _runPolicyAutoDisplay(
   console.log('');
 
   if (!interactive) {
-    // policy suggest — print CTA and exit
+    // policy suggest, print CTA and exit
     console.log('To apply this policy, run: relayplane policy auto');
     return;
   }
 
-  // Phase 4 — Confirmation
+  // Phase 4, Confirmation
   if (existsSync(POLICY_FILE)) {
     const existingPolicy = loadPolicy();
     const existingAgents = Object.keys(existingPolicy.agents ?? {}).join(', ');
@@ -2866,7 +2980,7 @@ async function _runPolicyAutoDisplay(
     return;
   }
 
-  // Phase 5 — Write
+  // Phase 5, Write
   const yaml = _buildPolicyYaml(analyses, suggestions);
   mkdirSync(join(homedir(), '.relayplane'), { recursive: true });
   const tmp = POLICY_FILE + '.tmp';
@@ -2887,8 +3001,8 @@ async function handleSetupCommand(): Promise<void> {
   console.log('Cost intelligence for AI agents.');
   console.log('');
 
-  // Step 1 — Provider detection
-  console.log('Step 1/3 — Providers');
+  // Step 1, Provider detection
+  console.log('Step 1/3, Providers');
   console.log('  Which AI providers do you have API keys for?');
   console.log('');
 
@@ -2919,10 +3033,10 @@ async function handleSetupCommand(): Promise<void> {
       console.log('  You can add keys later: relayplane config set-key');
     }
     console.log('');
-    console.log('Step 2/3 — Routing mode');
+    console.log('Step 2/3, Routing mode');
     console.log('  Auto mode selected (non-interactive).');
     console.log('');
-    console.log('Step 3/3 — Done');
+    console.log('Step 3/3, Done');
     console.log('');
     console.log('  RelayPlane is ready.');
     console.log('');
@@ -2955,14 +3069,14 @@ async function handleSetupCommand(): Promise<void> {
     console.log('  You can add keys later: relayplane config set-key');
   }
 
-  // Step 2 — Routing mode
+  // Step 2, Routing mode
   console.log('');
-  console.log('Step 2/3 — Routing mode');
+  console.log('Step 2/3, Routing mode');
   console.log('  How should RelayPlane route your requests?');
   console.log('');
-  console.log('  1. Auto (recommended) — route by task complexity, cheapest capable model');
-  console.log('  2. Manual — I\'ll configure routing rules myself');
-  console.log('  3. Passthrough — just observe costs, no routing changes');
+  console.log('  1. Auto (recommended), route by task complexity, cheapest capable model');
+  console.log('  2. Manual, I\'ll configure routing rules myself');
+  console.log('  3. Passthrough, just observe costs, no routing changes');
   console.log('');
 
   const modeInput = await prompt('Choice [1]: ');
@@ -2976,7 +3090,7 @@ async function handleSetupCommand(): Promise<void> {
 
   if (routingMode === 'auto') {
     if (existsSync(POLICY_FILE)) {
-      console.log('  (Existing policy preserved — run `relayplane policy auto` to update it)');
+      console.log('  (Existing policy preserved, run `relayplane policy auto` to update it)');
     } else {
       const autoYaml = [
         '# RelayPlane routing policy',
@@ -2995,9 +3109,9 @@ async function handleSetupCommand(): Promise<void> {
   }
   // passthrough: do not write any policy file
 
-  // Step 3 — Done
+  // Step 3, Done
   console.log('');
-  console.log('Step 3/3 — Done');
+  console.log('Step 3/3, Done');
   console.log('');
   console.log('  RelayPlane is ready.');
   console.log('');

@@ -63,10 +63,12 @@ import {
   type CascadeHop,
 } from './cross-provider-cascade.js';
 import { getBudgetManager, getBudgetTracker, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
+import { getKillAudit } from './kill-audit.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
+import { EliteGuardrails, DEFAULT_ELITE_GUARDRAILS, type RouteDecision } from './elite-guardrails.js';
 import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
 import { loadPolicy, resolvePolicy, POLICY_FILE } from './agent-policy.js';
 import { getVersionStatus } from './utils/version-status.js';
@@ -88,7 +90,45 @@ import { getSessionId, upsertSession, getSessions, getActiveSessions } from './s
 import { TraceWriter, sha256Hex, defaultTracesConfig } from './trace-writer.js';
 import { getToolRouter, extractToolContext } from './tool-router.js';
 import { getTokenPool, type PoolAccountConfig } from './token-pool.js';
-import { randomUUID } from 'node:crypto';
+import {
+  createCredentialPool,
+  type CredentialPool,
+  type CredentialPoolEntry,
+  type CredentialHeadroom,
+} from './credential-pool.js';
+import { startRefreshManager } from './credential-refresh.js';
+import { randomUUID, createHash } from 'node:crypto';
+
+/**
+ * Usage-aware credential pool (gated on the `credentialPool` config key).
+ * When absent (live 4100 default) these stay null and the request path is
+ * completely unchanged. When present, the pool becomes the Anthropic-account
+ * selection authority and a refresh loop keeps managed accounts' tokens fresh.
+ */
+let _credentialPool: CredentialPool | null = null;
+let _credentialPoolTenant: string | null = null;
+let _credRefreshManager: { stop: () => void; runOnce: () => Promise<void> } | null = null;
+/** The reserve model: elite requests avoid accounts low on its weekly headroom. */
+const CREDENTIAL_POOL_RESERVE_MODEL = 'claude-fable-5';
+
+/** Read per-account usage headroom from an optional ~/.relayplane/headroom.json. */
+function readCredentialHeadroom(credId: string): CredentialHeadroom | undefined {
+  try {
+    const p = path.join(os.homedir(), '.relayplane', 'headroom.json');
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, CredentialHeadroom>;
+    const h = raw?.[credId];
+    return h && typeof h === 'object' ? h : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when a model name resolves to the elite/reserve (Fable) tier. */
+function isEliteModelName(model: string | undefined): boolean {
+  if (!model) return false;
+  const mapped = MODEL_MAPPING[model]?.model ?? model;
+  return mapped === CREDENTIAL_POOL_RESERVE_MODEL;
+}
 const PROXY_VERSION: string = (() => {
   try {
     const pkgPath = path.join(__dirname, '..', 'package.json');
@@ -105,6 +145,33 @@ function isHaikuModel(model: string): boolean {
 
 /** Beta flags that OAT tokens (sk-ant-oat*) do not support */
 const OAT_UNSUPPORTED_BETA_FLAGS = new Set(['max-tokens-3-5-sonnet-2025-04-14']);
+
+/**
+ * Anthropic thinking strategy beta flag that requires `thinking` to be enabled
+ * or set to `adaptive`. When a Haiku request carries this flag without thinking
+ * enabled, the Anthropic API returns:
+ *   400: clear_thinking_20251015 strategy requires thinking to be enabled or adaptive
+ * The proxy strips this flag for Haiku when thinking is not enabled/adaptive.
+ */
+const CLEAR_THINKING_STRATEGY_FLAG = 'clear_thinking_20251015';
+
+/**
+ * Returns true when the body's `thinking` field is present and either enabled
+ * or set to `adaptive`. Used to decide whether it is safe to keep the
+ * clear_thinking_20251015 strategy flag on a Haiku request.
+ */
+function hasThinkingEnabledOrAdaptive(body: Record<string, unknown> | undefined): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const t = (body as Record<string, unknown>).thinking;
+  if (!t) return false;
+  if (typeof t === 'string') return t === 'adaptive' || t === 'enabled';
+  if (typeof t === 'object') {
+    const tt = t as Record<string, unknown>;
+    if (tt.type === 'enabled' || tt.type === 'adaptive') return true;
+    if (tt.enabled === true) return true;
+  }
+  return false;
+}
 
 let latestProxyVersionCache: { value: string | null; checkedAt: number } = { value: null, checkedAt: 0 };
 const LATEST_PROXY_VERSION_TTL_MS = 30 * 60 * 1000;
@@ -133,7 +200,7 @@ async function getLatestProxyVersion(): Promise<string | null> {
       return latest;
     }
   } catch {
-    // API unavailable — fall through to npm fallback
+    // API unavailable - fall through to npm fallback
   }
 
   // Fallback: hit npm registry directly
@@ -164,7 +231,7 @@ async function getLatestProxyVersion(): Promise<string | null> {
 /** Shared stats collector instance for the proxy server */
 export const proxyStatsCollector = new StatsCollector();
 
-/** Shared mesh handle — set during startProxy() */
+/** Shared mesh handle - set during startProxy() */
 let _meshHandle: MeshHandle | null = null;
 
 /** Capture a request into the mesh (fire-and-forget, never blocks) */
@@ -275,18 +342,27 @@ export const DEFAULT_ENDPOINTS: Record<string, ProviderEndpoint> = {
 export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }> = {
   // Anthropic models (using correct API model IDs)
   'claude-opus-4-5': { provider: 'anthropic', model: 'claude-opus-4-6' },
-  'claude-sonnet-4': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  'claude-sonnet-4': { provider: 'anthropic', model: 'claude-sonnet-5' },
   'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-latest' },
   'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-haiku-4-5' },
   'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5' },
   haiku: { provider: 'anthropic', model: 'claude-haiku-4-5' },
-  sonnet: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  opus: { provider: 'anthropic', model: 'claude-opus-4-6' },
+  sonnet: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  opus: { provider: 'anthropic', model: 'claude-opus-5' },
+  // Anthropic June-July 2026 additions
+  'claude-opus-5':           { provider: 'anthropic', model: 'claude-opus-5' },
+  'claude-sonnet-5':         { provider: 'anthropic', model: 'claude-sonnet-5' },
+  'claude-opus-4-8':         { provider: 'anthropic', model: 'claude-opus-4-8' },
+  'claude-fable-5':          { provider: 'anthropic', model: 'claude-fable-5' },
+  'claude-fable':            { provider: 'anthropic', model: 'claude-fable-5' },
+  'claude-mythos-5-preview': { provider: 'anthropic', model: 'claude-mythos-5' },
   // OpenAI models
   'gpt-4o': { provider: 'openai', model: 'gpt-4o' },
   'gpt-4o-mini': { provider: 'openai', model: 'gpt-4o-mini' },
   'gpt-4.1': { provider: 'openai', model: 'gpt-4.1' },
   // OpenAI GPT-5 family
+  'gpt-5.5':           { provider: 'openai', model: 'gpt-5.5' },
+  'gpt-5.4-mini':      { provider: 'openai', model: 'gpt-5.4-mini' },
   'gpt-5.4':           { provider: 'openai', model: 'gpt-5.4' },
   'gpt-5.4-pro':       { provider: 'openai', model: 'gpt-5.4-pro' },
   'gpt-5.3':           { provider: 'openai', model: 'gpt-5.3-chat' },
@@ -340,10 +416,10 @@ export const RELAYPLANE_ALIASES: Record<string, string> = {
  */
 export let SMART_ALIASES: Record<string, { provider: Provider; model: string }> = {
   // Defaults: Anthropic passthrough (Max plan / Claude Code users with no API key)
-  'rp:best': { provider: 'anthropic', model: 'claude-opus-4-6' },
-  'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  'rp:best': { provider: 'anthropic', model: 'claude-opus-5' },
+  'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-5' },
+  'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-5' },
+  'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-5' },
 };
 
 /**
@@ -356,7 +432,7 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
     return {
       via: 'openrouter',
       aliases: {
-        'rp:best': { provider: 'openrouter', model: 'anthropic/claude-sonnet-4-6' },
+        'rp:best': { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
         'rp:fast': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
         'rp:cheap': { provider: 'openrouter', model: 'google/gemini-2.5-flash-lite' },
         'rp:balanced': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
@@ -367,7 +443,7 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
     return {
       via: 'anthropic',
       aliases: {
-        'rp:best': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+        'rp:best': { provider: 'anthropic', model: 'claude-sonnet-5' },
         'rp:fast': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
         'rp:cheap': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
         'rp:balanced': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
@@ -385,22 +461,22 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
       },
     };
   }
-  // Max plan / Claude Code passthrough — no API key, auth comes from Claude Code at request time
+  // Max plan / Claude Code passthrough - no API key, auth comes from Claude Code at request time
   // Haiku not available on Max plan, so Sonnet/Opus only
   return {
-    via: 'anthropic (Max plan passthrough — Sonnet/Opus only)',
+    via: 'anthropic (Max plan passthrough - Sonnet/Opus only)',
     aliases: {
-      'rp:best': { provider: 'anthropic', model: 'claude-opus-4-6' },
-      'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-      'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-      'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+      'rp:best': { provider: 'anthropic', model: 'claude-opus-5' },
+      'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-5' },
+      'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-5' },
+      'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-5' },
     },
   };
 }
 
 /**
  * Send a telemetry event to the cloud (anonymous or authenticated).
- * Non-blocking — errors are silently swallowed.
+ * Non-blocking - errors are silently swallowed.
  */
 function sendCloudTelemetry(
   taskType: string,
@@ -436,7 +512,7 @@ function sendCloudTelemetry(
     recordCloudTelemetry(event);
     // Check whether we should show the signup nudge.
     // Called *after* the event is written so the count includes this request.
-    // Uses setImmediate to guarantee zero added latency on the response path —
+    // Uses setImmediate to guarantee zero added latency on the response path -
     // the nudge prints to stderr only after the current I/O cycle completes.
     setImmediate(() => checkAndShowNudge());
     // Star nudge fires at 50 requests (separate from signup nudge at 100)
@@ -483,15 +559,15 @@ export function resolveModelAlias(model: string): string {
  * Updated at proxy startup by provider auto-detection via detectAvailableProviders().
  */
 let DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> = {
-  code_generation: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  code_review: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  summarization: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  analysis: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  creative_writing: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  data_extraction: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  translation: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  question_answering: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-  general: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
+  code_generation: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  code_review: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  summarization: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  analysis: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  creative_writing: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  data_extraction: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  translation: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  question_answering: { provider: 'anthropic', model: 'claude-sonnet-5' },
+  general: { provider: 'anthropic', model: 'claude-sonnet-5' },
 };
 
 type RoutingSuffix = 'cost' | 'fast' | 'quality';
@@ -525,6 +601,7 @@ interface ComplexityConfig {
   simple?: string | { provider: string; model: string };
   moderate?: string | { provider: string; model: string };
   complex?: string | { provider: string; model: string };
+  elite?: string | { provider: string; model: string };
 }
 
 /**
@@ -560,49 +637,63 @@ function parseComplexityModel(
       const provider = rawProvider as Provider;
       return { provider, model };
     }
-    // Plain model name — look up in MODEL_MAPPING, fallback to anthropic
+    // Plain model name - look up in MODEL_MAPPING, fallback to anthropic
     return MODEL_MAPPING[val] ?? { provider: 'anthropic' as Provider, model: val };
   }
-  return { provider: 'anthropic' as Provider, model: 'claude-sonnet-4-6' };
+  return { provider: 'anthropic' as Provider, model: 'claude-sonnet-5' };
 }
 
 interface ComplexityTiers {
   simple:   { provider: Provider; model: string };
   moderate: { provider: Provider; model: string };
   complex:  { provider: Provider; model: string };
+  elite:    { provider: Provider; model: string };
 }
 
-/** Per-provider default complexity tier models */
-const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
+// Per-provider default complexity tier models.
+// elite = the strongest available reasoning model per provider.
+// Claude Fable 5's 2026-06 export-control suspension was lifted (2026-07-02),
+// so the anthropic elite tier routes to claude-fable-5 again for the hardest
+// long-running-agent work. Complex agentic coding moves to Opus 5 (May 2026),
+// the direct successor to Opus 4.8 at the same $5/$25 price.
+export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
   anthropic: {
     simple:   { provider: 'anthropic', model: 'claude-haiku-4-5' },
-    moderate: { provider: 'anthropic', model: 'claude-sonnet-4-6' },
-    complex:  { provider: 'anthropic', model: 'claude-opus-4-6' },
+    moderate: { provider: 'anthropic', model: 'claude-sonnet-5' },
+    // complex is Opus 5 (May 2026), the flagship agentic-coding model;
+    // resolveComplexityTier also resolves the elite auto-upgrade path to it.
+    complex:  { provider: 'anthropic', model: 'claude-opus-5' },
+    elite:    { provider: 'anthropic', model: 'claude-fable-5' },
   },
   openai: {
     simple:   { provider: 'openai', model: 'gpt-4.1-mini' },
     moderate: { provider: 'openai', model: 'gpt-5.4' },
     complex:  { provider: 'openai', model: 'gpt-5.4' },
+    elite:    { provider: 'openai', model: 'gpt-5.5' },
   },
   google: {
     simple:   { provider: 'google', model: 'gemini-2.5-flash-lite' },
     moderate: { provider: 'google', model: 'gemini-2.5-flash' },
     complex:  { provider: 'google', model: 'gemini-2.5-pro' },
+    elite:    { provider: 'google', model: 'gemini-2.5-pro' },
   },
   xai: {
     simple:   { provider: 'xai', model: 'grok-4.1-fast' },
     moderate: { provider: 'xai', model: 'grok-4.20-beta' },
     complex:  { provider: 'xai', model: 'grok-4' },
+    elite:    { provider: 'xai', model: 'grok-4' },
   },
   deepseek: {
     simple:   { provider: 'deepseek', model: 'deepseek-chat' },
     moderate: { provider: 'deepseek', model: 'deepseek-chat' },
     complex:  { provider: 'deepseek', model: 'deepseek-reasoner' },
+    elite:    { provider: 'deepseek', model: 'deepseek-reasoner' },
   },
   openrouter: {
     simple:   { provider: 'openrouter', model: 'google/gemini-2.5-flash-lite' },
     moderate: { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
-    complex:  { provider: 'openrouter', model: 'anthropic/claude-sonnet-4-6' },
+    complex:  { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
+    elite:    { provider: 'openrouter', model: 'anthropic/claude-opus-4-8' },
   },
 };
 
@@ -642,15 +733,22 @@ function detectAvailableProviders(userConfig?: Record<string, unknown>): Provide
 
 /**
  * Build default complexity tiers based on first detected provider.
- * Config overrides win — only fills in tiers not explicitly set.
+ * Config overrides win - only fills in tiers not explicitly set.
+ *
+ * Governing rule: an install without an explicit allow_elite_auto:true opt-in
+ * must never have its built elite tier resolve to the live elite model
+ * (claude-fable-5 / gpt-5.5). Absent the opt-in, elite falls back to the
+ * complex tier default, mirroring resolveComplexityTier's gated behavior.
  */
-function buildDefaultComplexityTiers(
+export function buildDefaultComplexityTiers(
   providers: Provider[],
-  existing?: Partial<ComplexityConfig>
+  existing?: Partial<ComplexityConfig>,
+  opts?: { allow_elite_auto?: boolean }
 ): ComplexityTiers {
   // Find first provider that has a known tier mapping
   const primaryProvider = providers.find((p) => PROVIDER_COMPLEXITY_TIERS[p]) ?? 'anthropic';
   const defaults = PROVIDER_COMPLEXITY_TIERS[primaryProvider] ?? PROVIDER_COMPLEXITY_TIERS['anthropic'];
+  const eliteEnabled = opts?.allow_elite_auto === true;
 
   const simple = existing?.simple != null
     ? parseComplexityModel(existing.simple)
@@ -661,8 +759,70 @@ function buildDefaultComplexityTiers(
   const complex = existing?.complex != null
     ? parseComplexityModel(existing.complex)
     : defaults.complex;
+  const elite = existing?.elite != null
+    ? parseComplexityModel(existing.elite)
+    : (eliteEnabled ? defaults.elite : complex);
 
-  return { simple, moderate, complex };
+  return { simple, moderate, complex, elite };
+}
+
+/**
+ * Decide whether a resolved 'passthrough' routingMode should be overridden
+ * back to 'auto' because routing.mode is 'auto' | 'complexity' | 'cascade'.
+ *
+ * This override exists so that a caller who names an unresolvable/generic
+ * model name (one resolveExplicitModel() cannot map to a real provider and
+ * model, e.g. a stale placeholder that doesn't match any known provider
+ * prefix like claude-, gpt-, gemini-, grok-, etc, or an unknown alias) while
+ * routing.mode=auto still gets transparently routed somewhere useful instead
+ * of erroring out. It must NOT fire when the caller
+ * explicitly opted out via X-RelayPlane-Bypass: true, since that header is a
+ * documented, unambiguous "honor passthrough as-is" signal, not a vague
+ * model name to reinterpret.
+ *
+ * It must ALSO not fire when the caller named a real, concrete model that
+ * this proxy already knows how to serve as a literal choice (e.g.
+ * "claude-fable-5", resolveExplicitModel() returns non-null). A bare literal
+ * model name with no bypass header and no routing suffix is a legitimate
+ * "run exactly this model" request, not a vague/generic placeholder to
+ * reinterpret. Only unresolvable/generic names (resolveExplicitModel()
+ * returns null) are eligible for the auto-upgrade this override exists for.
+ */
+export function shouldOverridePassthroughToAuto(
+  routingMode: string,
+  configRoutingMode: string | undefined,
+  bypassRequested: boolean,
+  requestedModel?: string,
+  complexityDefaults?: {
+    simple?: string | { provider: string; model: string };
+    moderate?: string | { provider: string; model: string };
+  },
+): boolean {
+  if (bypassRequested) return false;
+  if (routingMode !== 'passthrough') return false;
+  if (configRoutingMode !== 'auto' && configRoutingMode !== 'complexity' && configRoutingMode !== 'cascade') {
+    return false;
+  }
+  if (requestedModel) {
+    const resolved = resolveExplicitModel(requestedModel);
+    // A resolvable model is only honored literally (override skipped) when it's
+    // a genuine non-default choice, e.g. a caller explicitly asking for the
+    // elite tier. When it resolves to exactly the configured simple/moderate
+    // default (what a client sends on every request whether or not it thought
+    // about complexity at all), the override still applies so the classifier
+    // gets a chance to route it, otherwise routing.mode=complexity/auto/cascade
+    // can never fire for ordinary default-model traffic.
+    if (resolved) {
+      const defaults = [complexityDefaults?.simple, complexityDefaults?.moderate]
+        .filter((v): v is string | { provider: string; model: string } => v !== undefined)
+        .map(parseComplexityModel);
+      const isConfiguredDefault = defaults.some(
+        (d) => d.provider === resolved.provider && d.model === resolved.model
+      );
+      if (!isConfiguredDefault) return false;
+    }
+  }
+  return true;
 }
 
 interface RoutingConfig {
@@ -675,7 +835,7 @@ interface ReliabilityConfig {
   cooldowns: CooldownConfig;
 }
 
-type Complexity = 'simple' | 'moderate' | 'complex';
+type Complexity = 'simple' | 'moderate' | 'complex' | 'elite';
 
 const UNCERTAINTY_PATTERNS = [
   /i'?m not (entirely |completely |really )?sure/i,
@@ -693,7 +853,29 @@ const REFUSAL_PATTERNS = [
   /as an ai/i,
 ];
 
-class CooldownManager {
+/**
+ * Account-aware key derivation, named for its original use (CooldownManager)
+ * but also used for the request-per-minute rate limiter's workspaceId (both
+ * share the same bug and the same fix). Bare `provider`/`workspaceId` string
+ * alone in most modes, but in Authorization-passthrough mode (Claude Code
+ * OAuth / Max plan) different callers can be different accounts sharing this
+ * one proxy process. Without an account-specific key, one near-capped
+ * account's failures or usage exhaust the shared bucket that a completely
+ * unrelated, fresh account also depends on (2026-07-05: a warned account
+ * tripped a 120s cooldown blackout, then separately exhausted the shared
+ * rpm bucket, both blocking a 0%-utilized account that would have
+ * succeeded). Fold in a short hash of the incoming token so tracking is
+ * per-account whenever we have one to key on.
+ */
+export function cooldownKey(provider: string, authHeader?: string): string {
+  if (!authHeader) return provider;
+  const token = authHeader.replace(/^Bearer\s+/i, '');
+  if (!token) return provider;
+  const hash = createHash('sha256').update(token).digest('hex').slice(0, 12);
+  return `${provider}:${hash}`;
+}
+
+export class CooldownManager {
   private health: Map<string, ProviderHealth> = new Map();
   private config: CooldownConfig;
   
@@ -835,7 +1017,7 @@ interface RelayPlaneProxyConfigFile {
   memory?: {
     /**
      * When true, inject top procedural knowledge hints into system prompts.
-     * Default: false — no system prompt modification occurs.
+     * Default: false - no system prompt modification occurs.
      * Can also be set via env RELAYPLANE_PROCEDURAL_INJECTION=true.
      */
     proceduralInjectionEnabled?: boolean;
@@ -917,8 +1099,20 @@ interface RequestHistoryEntry {
   requestContent?: RequestContentData;
   error?: string;
   statusCode?: number;
+  routing_rule?: string | null;
+  routing_reason?: string | null;
 }
 const requestHistory: RequestHistoryEntry[] = [];
+
+/** Test helper: expose the in-memory request history array. */
+export function getRequestHistory(): RequestHistoryEntry[] {
+  return requestHistory;
+}
+
+/** Test helper: clear the in-memory request history. */
+export function clearRequestHistory(): void {
+  requestHistory.length = 0;
+}
 const MAX_HISTORY = 10000;
 const HISTORY_RETENTION_DAYS = 7;
 let requestIdCounter = 0;
@@ -1100,6 +1294,8 @@ function logRequest(
     agentId,
     error: errorMessage,
     statusCode: errorStatusCode,
+    routing_rule: null,
+    routing_reason: null,
   };
   requestHistory.push(entry);
   if (requestHistory.length > MAX_HISTORY) {
@@ -1240,7 +1436,7 @@ function isContentLoggingEnabled(): boolean {
 
 /**
  * Whether procedural knowledge hints should be injected into system prompts.
- * Default: false — no system prompt modification occurs.
+ * Default: false - no system prompt modification occurs.
  * Config file: memory.proceduralInjectionEnabled
  * Env override: RELAYPLANE_PROCEDURAL_INJECTION=true
  */
@@ -1462,22 +1658,82 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   if (andCount >= 3) score += 1;
   if (andCount >= 5) score += 1;
 
-  // Calculate total tokens across ALL messages, not just last user message.
-  // For agent workloads (OpenClaw, aider, Claude Code) the last user message is
-  // often tiny while the real complexity lives in the 100K+ token context.
+  // Whole-conversation size is a WEAK, capped signal - never a dominant one.
+  //
+  // Earlier this added up to +7 (a +5 "context floor" for >100K tokens plus a
+  // +2 message-count bonus), on the theory that agent requests have a tiny last
+  // message but real complexity hidden in a huge context. That was backwards:
+  // for agent workloads (OpenClaw, Claude Code, aider) the 100K+ context and
+  // long history are AMBIENT - the repo, files, and prior turns - not a measure
+  // of how hard THIS request is. That floor pushed nearly every agent request to
+  // complex/elite regardless of the actual task, defeating per-task routing and
+  // over-spending on Opus/Fable. Keep it as a small nudge (max +3) so the
+  // last-user-message content above decides the tier, while still leaning
+  // borderline turns in a genuinely large working session toward the premium
+  // model for quality. A genuinely large one-shot prompt is still caught by the
+  // last-message token scaling above.
   const allText = extractMessageText(messages);
   const totalTokens = Math.ceil(allText.length / 4);
-  // Context size floor — use as a hard signal regardless of last-message score
-  if (totalTokens > 100000) score += 5;      // definitely complex
-  else if (totalTokens > 50000) score += 3;  // likely moderate+
-  else if (totalTokens > 20000) score += 2;
-  // Message count signal — long conversations imply multi-step reasoning
-  if (messages.length > 50) score += 2;
-  else if (messages.length > 20) score += 1;
-
+  let ambient = 0;
+  if (totalTokens > 100000) ambient += 2;       // very large context
+  else if (totalTokens > 50000) ambient += 1;   // large context
+  if (messages.length > 20) ambient += 1;       // long session
+  // 2026-07-06 merge fix: ambient was computed but never folded into score,
+  // so the "small nudge" this comment describes had been a no-op since
+  // 2026-07-02. Apply it before the elite check below can use it.
+  score += ambient;
+  // Elite threshold is 16 (not 12): calibration against live pipeline traffic
+  // showed a sharply bimodal score distribution - routine agent turns at 1-2 and
+  // genuinely-dense task prompts at 13-24 with an empty gap. At 12 the borderline
+  // prompts (score ~13) were promoted to Fable; 16 reserves Fable for the clearly
+  // hardest cluster (~7% of pipeline traffic), routing the rest to Opus.
+  if (score >= 16) return 'elite';
   if (score >= 4) return 'complex';
   if (score >= 2) return 'moderate';
   return 'simple';
+}
+
+/**
+ * Resolve the concrete provider/model for a given complexity tier, respecting
+ * the allow_elite_auto gate and the opus drift fix (both additive/opt-in).
+ *
+ * Governing rule: callers without allow_elite_auto see zero behavior change.
+ */
+export function resolveComplexityTier(
+  complexity: Complexity,
+  config: { provider: string; allow_elite_auto?: boolean },
+): { provider: string; model: string } {
+  const provider = config.provider;
+  const eliteEnabled = config.allow_elite_auto === true;
+
+  if (complexity === 'elite') {
+    if (eliteEnabled) {
+      const eliteModels: Record<string, string> = {
+        anthropic: 'claude-fable-5',
+        openai: 'gpt-5.5',
+      };
+      if (eliteModels[provider] !== undefined) {
+        return { provider, model: eliteModels[provider] };
+      }
+    }
+    // Elite disabled or no elite model for this provider: fall back to complex.
+    return resolveComplexityTier('complex', config);
+  }
+
+  if (complexity === 'complex' && eliteEnabled) {
+    const modernComplexModels: Record<string, string> = {
+      anthropic: 'claude-opus-5',
+    };
+    if (modernComplexModels[provider] !== undefined) {
+      return { provider, model: modernComplexModels[provider] };
+    }
+  }
+
+  // Default: pull from static tier table (no behaviour change for existing configs).
+  const tiers = PROVIDER_COMPLEXITY_TIERS[provider] ?? PROVIDER_COMPLEXITY_TIERS['anthropic']!;
+  const tier = tiers[complexity as keyof typeof tiers];
+  if (tier) return { provider: tier.provider, model: tier.model };
+  return { provider, model: tiers.complex.model };
 }
 
 export function shouldEscalate(responseText: string, trigger: CascadeConfig['escalateOn']): boolean {
@@ -2713,7 +2969,7 @@ function parsePreferredModel(
  * Resolve explicit model name to provider and model.
 /**
  * Add provider prefix to bare model names for aggregator routing (e.g., OpenRouter).
- * Complexity routing produces bare names like 'claude-sonnet-4-6' — aggregators need
+ * Complexity routing produces bare names like 'claude-sonnet-4-6' - aggregators need
  * the full 'anthropic/claude-sonnet-4-6' format to identify the upstream provider.
  * If the model already has a prefix (contains '/'), it's returned unchanged.
  */
@@ -2745,7 +3001,7 @@ function addProviderPrefix(model: string, detectedProvider: string): string {
 
 /**
  * When `defaultProvider` is set, ALL models are routed to that provider
- * regardless of model name prefix — the model name is preserved as-is
+ * regardless of model name prefix - the model name is preserved as-is
  * so OpenRouter receives the full `anthropic/claude-sonnet-4-6` format.
  */
 export function resolveExplicitModel(
@@ -2805,7 +3061,7 @@ export function resolveExplicitModel(
 
   // OpenRouter/DeepSeek/Groq models
   if (modelName.startsWith('openrouter/')) {
-    // Strip the "openrouter/" prefix — OpenRouter expects just "google/gemini-2.5-pro" not "openrouter/google/gemini-2.5-pro"
+    // Strip the "openrouter/" prefix - OpenRouter expects just "google/gemini-2.5-pro" not "openrouter/google/gemini-2.5-pro"
     return { provider: 'openrouter', model: modelName.slice('openrouter/'.length) };
   }
   if (modelName.startsWith('deepseek-') || modelName.startsWith('groq-')) {
@@ -2922,7 +3178,7 @@ function convertNativeAnthropicBodyToChatRequest(
   if (body['system'] && typeof body['system'] === 'string') {
     messages.push({ role: 'system', content: body['system'] });
   } else if (Array.isArray(body['system'])) {
-    // Anthropic structured system (array of {type, text}) — flatten to text
+    // Anthropic structured system (array of {type, text}) - flatten to text
     const systemText = (body['system'] as Array<{ type?: string; text?: string }>)
       .filter((b) => b.type === 'text')
       .map((b) => b.text ?? '')
@@ -2937,7 +3193,7 @@ function convertNativeAnthropicBodyToChatRequest(
     if (typeof content === 'string') {
       messages.push({ role: role as 'user' | 'assistant', content });
     } else if (Array.isArray(content)) {
-      // Anthropic content blocks — extract text parts
+      // Anthropic content blocks - extract text parts
       const text = (content as Array<{ type?: string; text?: string }>)
         .filter((b) => b.type === 'text')
         .map((b) => b.text ?? '')
@@ -3061,7 +3317,7 @@ function resolveProviderApiKey(
     return { apiKey: undefined };
   }
 
-  // Ollama doesn't need an API key — it's local
+  // Ollama doesn't need an API key - it's local
   if (provider === 'ollama') {
     return { apiKey: 'ollama-local' };
   }
@@ -3139,9 +3395,17 @@ function getFastModel(config: RelayPlaneProxyConfigFile): string {
   );
 }
 
-function getQualityModel(config: RelayPlaneProxyConfigFile): string {
+export function getQualityModel(config: RelayPlaneProxyConfigFile): string {
+  // The ":quality" / rp:quality / rp:best routing suffix is documented as one
+  // of three ways to reach the elite tier, so it must prefer the elite model
+  // over complex, respecting the same allow_elite_auto gate resolveComplexityTier
+  // uses (installs without the opt-in must see zero behavior change).
+  const complexityConfig = config.routing?.complexity;
+  const eliteEnabled = (complexityConfig as { allow_elite_auto?: boolean } | undefined)?.allow_elite_auto === true;
+  const eliteModel = eliteEnabled ? complexityValToString(complexityConfig?.elite) : undefined;
   return (
-    complexityValToString(config.routing?.complexity?.complex) ||
+    eliteModel ||
+    complexityValToString(complexityConfig?.complex) ||
     config.routing?.cascade?.models?.[config.routing?.cascade?.models?.length ? config.routing.cascade.models.length - 1 : 0] ||
     process.env['RELAYPLANE_QUALITY_MODEL'] ||
     'claude-sonnet-4-6'
@@ -3191,42 +3455,127 @@ async function cascadeRequest(
   throw new Error('All cascade models exhausted');
 }
 
-function getDashboardHTML(): string {
+export function getDashboardHTML(): string {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Dashboard</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1600px;margin:0 auto}
-a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
-.header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
-.header .meta{font-size:.8rem;color:#64748b}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:32px}
-.card{background:#111318;border:1px solid #1e293b;border-radius:12px;padding:20px}
-.card .label{font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
-.card .value{font-size:1.75rem;font-weight:700}.green{color:#34d399}
-.tooltip-wrap{position:relative;display:inline-block}
-.tooltip-wrap .tooltip-box{visibility:hidden;opacity:0;background:#1e293b;color:#e2e8f0;font-size:.8rem;font-weight:400;text-transform:none;letter-spacing:0;line-height:1.5;border:1px solid #334155;border-radius:8px;padding:10px 14px;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:280px;z-index:999;pointer-events:none;transition:opacity .15s;box-shadow:0 4px 16px rgba(0,0,0,.4)}
-.tooltip-wrap .tooltip-box::after{content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-bottom-color:#334155}
-.tooltip-wrap:hover .tooltip-box{visibility:visible;opacity:1}
-.info-icon{cursor:help;color:#64748b;font-size:.75rem;vertical-align:middle;margin-left:4px}
-table{width:100%;border-collapse:collapse;font-size:.85rem}
-th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
-td{padding:8px 12px;border-bottom:1px solid #111318}
-.section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.warn{background:#fbbf24}.dot.down{background:#ef4444}
-.section.collapsible h2{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px}.section.collapsible h2::after{content:'▾';font-size:.8rem;color:#475569;transition:transform .2s}.section.collapsed h2::after{transform:rotate(-90deg)}.section.collapsed>*:not(h2){display:none!important}
-.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
-.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}.badge.err-auth{background:#2d0a0a;color:#ef4444}.badge.err-rate{background:#2d2a0a;color:#fbbf24}.badge.err-timeout{background:#2d1a0a;color:#fb923c}
-.badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
-.badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
-.vstat{display:inline-flex;align-items:center;gap:6px;margin-left:8px;padding:1px 8px;border-radius:999px;border:1px solid #334155;font-size:.72rem}
+*{margin:0;padding:0;box-sizing:border-box}
+.gated{opacity:0.5;pointer-events:none;filter:grayscale(40%)}
+.gated.mesh-on{opacity:1;pointer-events:auto;filter:none}
+body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1600px;margin:0 auto}
+a{color:#34d399}h1{font-size:1.4rem;font-weight:600}
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:20px;gap:12px;flex-wrap:wrap}
+.header-left{display:flex;align-items:center;gap:16px}
+.header-right{display:flex;align-items:center;gap:10px;font-size:.8rem;color:#64748b}
+.tf-pills{display:flex;gap:4px}
+.tf-pill{background:#0f172a;border:1px solid #1e293b;padding:4px 12px;border-radius:999px;cursor:pointer;font-size:.8rem;color:#64748b;transition:all .15s}
+.tf-pill.active{background:#1e293b;color:#e2e8f0;border-color:#334155}
+.tf-pill:hover:not(.active){border-color:#334155;color:#94a3b8}
+.vstat{display:inline-flex;align-items:center;gap:6px;padding:1px 8px;border-radius:999px;border:1px solid #334155;font-size:.72rem}
 .vstat.current{color:#94a3b8;border-color:#334155;background:#0f172a66}
 .vstat.outdated{color:#fbbf24;border-color:#f59e0b55;background:#3a2f1e66}
 .vstat.unavailable{color:#a3a3a3;border-color:#52525b66;background:#18181b66}
-@media(max-width:768px){.col-tt,.col-cx{display:none}}
-.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+/* Savings banner */
+.intro-banner{background:#0f1b2d;border:1px solid #1e3a5f;border-radius:12px;padding:16px 20px;margin-bottom:20px;position:relative}
+.intro-banner h3{font-size:.95rem;font-weight:600;color:#60a5fa;margin-bottom:12px}
+.intro-banner .row{display:flex;gap:32px;flex-wrap:wrap;font-size:.9rem}
+.intro-banner .row span{color:#64748b}
+.intro-banner .row strong{color:#e2e8f0}
+.intro-banner .dismiss{position:absolute;top:12px;right:14px;background:none;border:none;color:#475569;cursor:pointer;font-size:1rem;line-height:1}
+.intro-banner .dismiss:hover{color:#94a3b8}
+.intro-banner .model-mix{font-size:.8rem;color:#64748b;margin-top:10px}
+/* Budget card */
+.budget-card{background:#111318;border:1px solid #1e293b;border-left:3px solid var(--budget-color,#34d399);border-radius:12px;padding:18px 22px;margin-bottom:20px}
+.budget-top{display:flex;align-items:baseline;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.budget-amount{font-size:1.6rem;font-weight:700}
+.budget-label{font-size:.85rem;color:#64748b}
+.budget-bar-wrap{background:#1e293b;border-radius:999px;height:8px;margin-bottom:10px;overflow:hidden}
+.budget-bar-fill{height:100%;border-radius:999px;transition:width .4s}
+.budget-meta{display:flex;align-items:center;gap:16px;font-size:.8rem;color:#64748b;flex-wrap:wrap}
+.budget-btn{background:none;border:1px solid #334155;color:#94a3b8;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:.75rem}
+.budget-btn:hover{border-color:#475569;color:#e2e8f0}
+.cap-input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:3px 8px;border-radius:6px;font-size:.8rem;width:90px}
+/* Stat cards */
+.stat-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px}
+.stat-card{background:#111318;border:1px solid #1e293b;border-radius:12px;padding:18px 20px}
+.stat-card .label{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.stat-card .value{font-size:1.65rem;font-weight:700}
+.stat-card .sub{font-size:.78rem;color:#64748b;margin-top:4px}
+.green{color:#34d399}
+/* Tooltip */
+.tooltip-wrap{position:relative;display:inline-block}
+.tooltip-wrap .tooltip-box{visibility:hidden;opacity:0;background:#1e293b;color:#e2e8f0;font-size:.8rem;font-weight:400;line-height:1.5;border:1px solid #334155;border-radius:8px;padding:10px 14px;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:280px;z-index:999;pointer-events:none;transition:opacity .15s;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+.tooltip-wrap .tooltip-box::after{content:'';position:absolute;bottom:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-bottom-color:#334155}
+.tooltip-wrap:hover .tooltip-box{visibility:visible;opacity:1}
+.info-icon{cursor:help;color:#64748b;font-size:.72rem;vertical-align:middle}
+/* Sessions */
+.section{margin-bottom:28px}
+.section-title{font-size:.95rem;font-weight:600;color:#94a3b8;margin-bottom:12px}
+.session-row{display:flex;align-items:center;gap:12px;padding:10px 14px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;margin-bottom:8px;cursor:pointer;flex-wrap:wrap}
+.session-row:hover{border-color:#334155}
+.session-row.expanded{border-bottom-left-radius:0;border-bottom-right-radius:0}
+.session-detail{background:#0a0b0d;border:1px solid #1e293b;border-top:none;border-radius:0 0 8px 8px;padding:8px;margin-bottom:8px}
+.sess-live{background:#052e1633;color:#34d399;font-size:.7rem;font-weight:600;padding:2px 7px;border-radius:6px;border:1px solid #34d39933}
+.sess-idle{color:#475569;font-size:.75rem}
+.sess-src-cc{color:#60a5fa;font-size:.8rem;font-weight:500}
+.sess-src-proxy{color:#94a3b8;font-size:.8rem}
+.sess-chip{background:#1e293b;color:#94a3b8;font-size:.72rem;padding:2px 6px;border-radius:4px}
+.sess-dot{color:#64748b;font-size:.75rem}
+/* Config panel */
+.config-section{background:#111318;border:1px solid #1e293b;border-radius:12px;margin-bottom:24px;overflow:hidden}
+.config-header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;cursor:pointer;user-select:none}
+.config-header:hover{background:#151b24}
+.config-toggle{color:#475569;font-size:.85rem;transition:transform .2s}
+.config-body{padding:16px 18px;border-top:1px solid #1e293b;display:none}
+.config-body.open{display:block}
+.config-row{display:flex;align-items:center;gap:12px;margin-bottom:12px;font-size:.87rem;flex-wrap:wrap}
+.config-row label{color:#94a3b8;min-width:120px}
+.config-select{background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:5px 10px;border-radius:7px;font-size:.82rem}
+.config-readonly{font-size:.78rem;color:#64748b;border-top:1px solid #1e293b;padding-top:12px;margin-top:4px;line-height:1.7}
+.config-save-btn{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:5px 14px;border-radius:7px;cursor:pointer;font-size:.82rem}
+.config-save-btn:hover{background:#334155}
+/* Provider status */
+.prov{display:flex;gap:12px;flex-wrap:wrap}
+.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:7px 14px;border-radius:8px;border:1px solid #1e293b}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.dot.up{background:#34d399}.dot.warn{background:#fbbf24}.dot.down{background:#ef4444}
+/* Collapsed details sections */
+details{background:#111318;border:1px solid #1e293b;border-radius:12px;margin-bottom:16px;overflow:hidden}
+details summary{padding:13px 18px;cursor:pointer;font-size:.92rem;font-weight:600;color:#94a3b8;list-style:none;display:flex;align-items:center;gap:8px;user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:'▸';font-size:.8rem;color:#475569;transition:transform .2s;display:inline-block}
+details[open] summary::before{transform:rotate(90deg)}
+details summary:hover{color:#cbd5e1}
+.details-body{padding:0 18px 16px}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+td{padding:8px 12px;border-bottom:1px solid #111318}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
+.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
+.badge.err-auth{background:#2d0a0a;color:#ef4444}.badge.err-rate{background:#2d2a0a;color:#fbbf24}.badge.err-timeout{background:#2d1a0a;color:#fb923c}
+.badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}
+.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
+.badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
 .rename-btn{background:none;border:none;cursor:pointer;font-size:.75rem;opacity:.5;padding:2px}.rename-btn:hover{opacity:1}
+@media(max-width:768px){.stat-cards{grid-template-columns:1fr}.col-tt,.col-cx,.col-cache{display:none}}
 </style></head><body>
-<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/dashboard/config">Config</a> · <span id="ver"></span><span id="vstat" class="vstat unavailable">Unable to check</span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
-<div id="policy-nudge" style="display:none;background:#1a1a2e;border:1px solid #4a9eff;border-radius:6px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;font-family:monospace;font-size:13px;color:#e0e0e0"><span>You've routed <strong id="nudge-reqs">0</strong> requests across <strong id="nudge-agents">0</strong> detected agent<span id="nudge-plural">s</span>. Run <code>relayplane policy auto</code> to optimize routing. Estimated savings: ~<strong id="nudge-savings">$0</strong>/mo.</span><div style="display:flex;gap:8px;margin-left:16px"><button onclick="fetch('/v1/policy-auto',{method:'POST'}).then(()=>location.reload())" style="background:#4a9eff;color:#000;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">Run now</button><button onclick="document.getElementById('policy-nudge').style.display='none';localStorage.setItem('nudge-dismissed','1')" style="background:transparent;color:#888;border:1px solid #444;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:12px">Dismiss</button></div></div>
+<!-- HEADER -->
+<div class="header">
+  <div class="header-left">
+    <h1>⚡ RelayPlane</h1>
+    <div class="tf-pills">
+      <button class="tf-pill" data-days="1" onclick="setTimeframe(1)">Today</button>
+      <button class="tf-pill" data-days="7" onclick="setTimeframe(7)">7d</button>
+      <button class="tf-pill" data-days="30" onclick="setTimeframe(30)">30d</button>
+    </div>
+  </div>
+  <div class="header-right">
+    <span id="ver"></span><span id="vstat" class="vstat unavailable">Unable to check</span>
+    <span>up <span id="uptime"></span></span>
+    <span>· 5s poll</span>
+    <a href="?classic=1" style="color:#64748b;font-size:.75rem;margin-left:8px" title="Revert to v1.9.38 dashboard">classic</a>
+  </div>
+</div>
+<div id="policy-nudge" style="display:none;background:#1a1a2e;border:1px solid #4a9eff;border-radius:6px;padding:12px 16px;margin-bottom:16px;align-items:center;justify-content:space-between;font-family:monospace;font-size:13px;color:#e0e0e0"><span>You've routed <strong id="nudge-reqs">0</strong> requests across <strong id="nudge-agents">0</strong> detected agent<span id="nudge-plural">s</span>. Run <code>relayplane policy auto</code> to optimize routing. Estimated savings: ~<strong id="nudge-savings">$0</strong>/mo.</span><div style="display:flex;gap:8px;margin-left:16px"><button onclick="fetch('/v1/policy-auto',{method:'POST'}).then(()=>location.reload())" style="background:#4a9eff;color:#000;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">Run now</button><button onclick="document.getElementById('policy-nudge').style.display='none';localStorage.setItem('nudge-dismissed','1')" style="background:transparent;color:#888;border:1px solid #444;padding:4px 8px;border-radius:4px;cursor:pointer;font-size:12px">Dismiss</button></div></div>
 <script>
 (async function(){
   if(localStorage.getItem('nudge-dismissed'))return;
@@ -3245,173 +3594,458 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
   }catch(e){}
 })();
 </script>
-<div class="cards">
-  <div class="card"><div class="label">Requests (7d window, max 10k)</div><div class="value" id="totalReq">—</div><div id="totalReqDetail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
-  <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
-  <div class="card"><div class="label">Routing Savings <span class="tooltip-wrap"><span class="info-icon">ⓘ</span><span class="tooltip-box" id="savings-tooltip">Loading...</span></span></div><div class="value green" id="savings">—</div><div id="savings-detail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
-  <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div><div id="avgLatDetail" style="font-size:.75rem;color:#64748b;margin-top:4px">—</div></div>
+<!-- SAVINGS BANNER (post-install, localStorage-gated) -->
+<div id="intro-banner" class="intro-banner" style="display:none">
+  <button class="dismiss" onclick="dismissBanner()" title="Dismiss">✕</button>
+  <h3>Your first session with RelayPlane</h3>
+  <div class="row">
+    <div><span>Without RelayPlane (all-Opus): </span><strong id="banner-baseline">-</strong></div>
+    <div><span>With RelayPlane: </span><strong id="banner-actual">-</strong></div>
+    <div><span>You saved: </span><strong class="green" id="banner-saved">-</strong></div>
+  </div>
+  <div class="model-mix" id="banner-mix"></div>
 </div>
-<div class="section collapsible collapsed"><h2>Model Breakdown <span style="font-size:.75rem;color:#64748b;font-weight:400">(7d window, history-capped)</span></h2>
-<table><thead><tr><th>Provider</th><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total Cost</th></tr></thead><tbody id="models"></tbody></table></div>
-<div class="section collapsible collapsed"><h2>Agent Cost Breakdown</h2>
-<table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table></div>
-<div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
-<div class="section collapsible collapsed"><h2>Learning</h2><div id="learning-panel" style="display:flex;flex-direction:column;gap:12px"><div id="learning-stats" style="display:flex;gap:12px;flex-wrap:wrap"></div><div id="learning-recent"></div></div></div>
-<div class="section collapsible collapsed" id="sessions-section"><h2>Sessions <span id="sessionsLabel" style="font-size:.75rem;color:#64748b;font-weight:400">(last 7d)</span></h2>
-<table><thead><tr><th>Session ID</th><th>Source</th><th>Started</th><th>Duration</th><th>Requests</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Models</th><th>Status</th></tr></thead><tbody id="sessions"></tbody></table>
+<!-- BUDGET CARD -->
+<div class="budget-card" id="budget-card">
+  <div class="budget-top">
+    <span class="budget-amount" id="budget-spent">-</span>
+    <span class="budget-label" id="budget-of">of - today</span>
+  </div>
+  <div class="budget-bar-wrap"><div class="budget-bar-fill" id="budget-bar" style="width:0%;background:#34d399"></div></div>
+  <div class="budget-meta">
+    <span id="budget-projection"></span>
+    <span id="budget-remaining"></span>
+    <button class="budget-btn" id="cap-edit-btn" onclick="toggleCapEdit()">✎ edit cap</button>
+    <span id="cap-edit-area" style="display:none">
+      <input type="number" class="cap-input" id="cap-input" step="0.01" min="0" placeholder="0.00">
+      <button class="budget-btn" onclick="saveCap()">Save</button>
+      <button class="budget-btn" onclick="toggleCapEdit()">Cancel</button>
+    </span>
+    <button class="budget-btn" onclick="resetBudget()">Reset today</button>
+  </div>
 </div>
-<div class="section collapsible collapsed" id="token-pool-section"><h2>Token Pool</h2><div id="token-pool-panel"></div></div>
-<div class="section"><h2>Recent Runs <span id="historyLabel" style="font-size:.75rem;color:#64748b;font-weight:400">(7d window, history-capped)</span></h2>
-<table><thead><tr><th>Time</th><th>Agent</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache Create</th><th class="col-cache">Cache Read</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<!-- STAT CARDS -->
+<div class="stat-cards">
+  <div class="stat-card">
+    <div class="label">Spent</div>
+    <div class="value" id="totalCost">-</div>
+    <div class="sub" id="totalReq">-</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Saved <span class="tooltip-wrap"><span class="info-icon">ⓘ</span><span class="tooltip-box" id="savings-tooltip">Loading...</span></span></div>
+    <div class="value green" id="savings">-</div>
+    <div class="sub" id="savings-detail">vs all-Opus</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Avg Latency</div>
+    <div class="value" id="avgLat">-</div>
+    <div class="sub" id="avgLatSub"></div>
+  </div>
+</div>
+<!-- SESSIONS -->
+<div class="section">
+  <div class="section-title">Sessions</div>
+  <div id="sessions-list"><div style="color:#64748b;font-size:.85rem">Loading sessions…</div></div>
+</div>
+<!-- CONFIG PANEL -->
+<div class="config-section">
+  <div class="config-header" id="config-header" onclick="toggleConfig()">
+    <span style="font-size:.95rem;font-weight:600;color:#94a3b8">⚙ Config</span>
+    <span class="config-toggle" id="config-toggle">▾</span>
+  </div>
+  <div class="config-body" id="config-body">
+    <div class="config-row">
+      <label>Routing mode</label>
+      <select class="config-select" id="routing-mode" onchange="applyRoutingMode(this.value)">
+        <option value="smart">Smart (complexity)</option>
+        <option value="opus">Opus only</option>
+        <option value="sonnet">Sonnet only</option>
+        <option value="haiku">Haiku only</option>
+      </select>
+    </div>
+    <div class="config-row">
+      <label>Daily cap</label>
+      <input type="number" class="config-select" id="config-cap" step="0.01" min="0" placeholder="0.00" style="width:110px">
+      <button class="config-save-btn" onclick="saveCapFromConfig()">Save</button>
+    </div>
+    <div class="config-row">
+      <label>On breach</label>
+      <select class="config-select" id="on-breach" onchange="applyOnBreach(this.value)">
+        <option value="warn">warn</option>
+        <option value="block">block</option>
+        <option value="downgrade">downgrade</option>
+      </select>
+    </div>
+    <div class="config-readonly" id="config-readonly">Loading config…</div>
+  </div>
+</div>
+<!-- PROVIDER STATUS -->
+<div class="section">
+  <div class="section-title">Provider Status</div>
+  <div class="prov" id="providers"></div>
+</div>
+<!-- COLLAPSED SECTIONS -->
+<details id="model-breakdown">
+  <summary>Model Breakdown</summary>
+  <div class="details-body">
+    <table><thead><tr><th>Provider</th><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table>
+  </div>
+</details>
+<details id="agent-breakdown">
+  <summary>Agent Cost Breakdown</summary>
+  <div class="details-body">
+    <table><thead><tr><th>Agent</th><th>Requests</th><th>Total Cost</th><th>Last Active</th><th></th></tr></thead><tbody id="agents"></tbody></table>
+  </div>
+</details>
+<details id="recent-requests">
+  <summary>Recent Requests</summary>
+  <div class="details-body">
+    <table><thead><tr><th>Time</th><th>Agent</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th class="col-cache">Cache +</th><th class="col-cache">Cache ↩</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table>
+  </div>
+</details>
+<div id="panel-sessions" class="section gated" style="display:none"><h2>Sessions (Mesh) <span class="gated-badge"><a href="https://relayplane.com/pricing">Upgrade to Mesh</a></span></h2><div id="panel-sessions-inner"></div></div>
+<div id="panel-mesh" class="section gated" style="display:none"><h2>Mesh Routing <span class="gated-badge"><a href="https://relayplane.com/pricing">Upgrade to Mesh</a></span></h2><div id="panel-mesh-inner"></div></div>
+<div id="panel-token-pool" class="section gated" style="display:none"><h2>Token Pool (Mesh) <span class="gated-badge"><a href="https://relayplane.com/pricing">Upgrade to Mesh</a></span></h2><div id="panel-token-pool-inner"></div></div>
+<div id="panel-xprov" class="section gated" style="display:none"><h2>Cross-Provider Routing <span class="gated-badge"><a href="https://relayplane.com/pricing">Upgrade to Mesh</a></span></h2><div id="panel-xprov-inner"></div></div>
+<div id="panel-learning" class="section gated" style="display:none"><h2>Learning Insights <span class="gated-badge"><a href="https://relayplane.com/pricing">Upgrade to Mesh</a></span></h2><div id="panel-learning-inner"></div></div>
 <script>
-const $ = id => document.getElementById(id);
+const $=id=>document.getElementById(id);
 function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-document.querySelectorAll('.section.collapsible h2').forEach(h2=>h2.addEventListener('click',()=>h2.parentElement.classList.toggle('collapsed')));
-function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
-function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
-function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
+function fmt(n,d){d=d===undefined?2:d;return typeof n==='number'?n.toFixed(d):'-'}
+function fmtTime(s){return new Date(s).toLocaleTimeString()}
+function fmtAgo(s){var ms=Date.now()-new Date(s).getTime();if(ms<60000)return Math.round(ms/1000)+'s ago';if(ms<3600000)return Math.round(ms/60000)+'m ago';return Math.round(ms/3600000)+'h ago'}
+function dur(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
+function shortModel(m){return m.replace('claude-','').replace(/-\d{8}$/,'').replace('sonnet','Sonnet').replace('opus','Opus').replace('haiku','Haiku')}
+
+// ── Time frame ──────────────────────────────────────────────────────────
+var currentDays=parseInt(localStorage.getItem('rp_tf')||'1',10);
+function setTimeframe(d){
+  currentDays=d;
+  localStorage.setItem('rp_tf',String(d));
+  document.querySelectorAll('.tf-pill').forEach(function(b){b.classList.toggle('active',parseInt(b.dataset.days||'0',10)===d)});
+  load();loadSessions();
+}
+(function initPills(){document.querySelectorAll('.tf-pill').forEach(function(b){b.classList.toggle('active',parseInt(b.dataset.days||'0',10)===currentDays)})})();
+
+// ── Budget ───────────────────────────────────────────────────────────────
+var _budgetData=null;
+async function loadBudget(){
+  try{
+    var b=await fetch('/control/budget').then(function(r){return r.json()}).catch(function(){return null});
+    if(!b)return;
+    _budgetData=b;
+    var pct=b.pct_used||0;
+    var color=pct>=90?'#ef4444':pct>=70?'#fbbf24':'#34d399';
+    document.getElementById('budget-card').style.setProperty('--budget-color',color);
+    $('budget-spent').textContent='$'+fmt(b.today_usd,2);
+    if(b.limit_usd){
+      $('budget-of').textContent='of $'+fmt(b.limit_usd,2)+' today  \xb7  '+Math.round(pct)+'%';
+      var bar=$('budget-bar');
+      bar.style.width=Math.min(pct,100)+'%';
+      bar.style.background=color;
+      var elapsedH=(Date.now()-new Date(new Date().toDateString()).getTime())/3600000;
+      if(elapsedH>1&&b.today_usd>0){
+        var projMo=(b.today_usd/elapsedH)*24*30;
+        $('budget-projection').textContent='at this rate: ~$'+fmt(projMo,2)+'/mo';
+      }else{$('budget-projection').textContent=''}
+      $('budget-remaining').textContent='$'+fmt(b.remaining_usd,2)+' remaining';
+    }else{
+      $('budget-of').textContent='(no cap set)';
+      $('budget-remaining').textContent='';
+      $('budget-projection').textContent='';
+      $('budget-bar').style.width='0%';
+    }
+    if(b.on_breach){var sel=$('on-breach');if(sel)sel.value=b.on_breach}
+  }catch(e){console.error('budget load error',e)}
+}
+function toggleCapEdit(){
+  var area=$('cap-edit-area');
+  var btn=$('cap-edit-btn');
+  if(area.style.display==='none'){
+    area.style.display='inline-flex';
+    area.style.alignItems='center';
+    area.style.gap='6px';
+    btn.style.display='none';
+    if(_budgetData&&_budgetData.limit_usd)$('cap-input').value=_budgetData.limit_usd;
+    $('cap-input').focus();
+  }else{
+    area.style.display='none';
+    btn.style.display='';
+  }
+}
+async function saveCap(){
+  var v=parseFloat($('cap-input').value);
+  if(isNaN(v)||v<0)return;
+  await fetch('/control/budget/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dailyUsd:v})});
+  toggleCapEdit();
+  loadBudget();
+}
+async function saveCapFromConfig(){
+  var v=parseFloat($('config-cap').value);
+  if(isNaN(v)||v<0)return;
+  await fetch('/control/budget/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dailyUsd:v})});
+  loadBudget();
+}
+async function resetBudget(){
+  if(!confirm('Reset today\\'s budget usage?'))return;
+  await fetch('/control/budget/reset',{method:'POST'});
+  loadBudget();
+}
+
+// ── Config panel ─────────────────────────────────────────────────────────
+function toggleConfig(){
+  var body=$('config-body');
+  var toggle=$('config-toggle');
+  var isOpen=body.classList.contains('open');
+  body.classList.toggle('open',!isOpen);
+  toggle.textContent=isOpen?'▾':'▴';
+}
+function openConfig(){
+  var body=$('config-body');
+  body.classList.add('open');
+  $('config-toggle').textContent='▴';
+}
+async function applyRoutingMode(mode){
+  if(mode==='smart'){
+    await fetch('/control/model/reset',{method:'POST'}).catch(function(){});
+  }else{
+    var modelMap={opus:'claude-opus-5',sonnet:'claude-sonnet-5',haiku:'claude-haiku-4-5-20251001'};
+    var model=modelMap[mode]||'claude-sonnet-5';
+    await fetch('/control/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:model,reason:'dashboard'})});
+  }
+}
+async function applyOnBreach(v){
+  await fetch('/control/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({budget:{onBreach:v}})});
+}
+async function loadConfigReadonly(){
+  try{
+    var cfg=await fetch('/v1/config').then(function(r){return r.json()}).catch(function(){return null});
+    var el=$('config-readonly');
+    if(!el)return;
+    if(!cfg){el.textContent='Config unavailable';return}
+    var parts=[];
+    if(cfg.cascade!==undefined)parts.push('Cascade '+(cfg.cascade?'on':'off'));
+    if(cfg.mesh!==undefined)parts.push('Mesh '+(cfg.mesh?'on':'off'));
+    if(cfg.models){
+      var ms=[];
+      if(cfg.models.complex)ms.push('Anthropic \u2192 '+(cfg.models.complex||'').replace('claude-','')+ ' (complex)');
+      if(cfg.models.simple)ms.push((cfg.models.simple||'').replace('claude-','')+ ' (simple)');
+      if(ms.length)parts.push(ms.join(', '));
+    }
+    el.textContent='Read-only: '+(parts.join(' \xb7 ')||'-');
+    if(_budgetData&&_budgetData.limit_usd)$('config-cap').value=_budgetData.limit_usd;
+  }catch(e){console.error('config readonly error',e)}
+}
+
+// ── Hash routing ─────────────────────────────────────────────────────────
+if(window.location.hash==='#config'){openConfig()}
+
+// ── Sessions ─────────────────────────────────────────────────────────────
+var expandedSessions=new Set();
 async function loadSessions(){
   try{
-    const [sessR,activeR]=await Promise.all([
-      fetch('/v1/sessions?limit=20&days=7').then(r=>r.json()).catch(()=>({sessions:[]})),
-      fetch('/v1/sessions/active').then(r=>r.json()).catch(()=>({sessions:[]}))
+    var days=currentDays;
+    var [sessR,activeR]=await Promise.all([
+      fetch('/v1/sessions?limit=20&days='+days).then(function(r){return r.json()}).catch(function(){return{sessions:[]}}),
+      fetch('/v1/sessions/active').then(function(r){return r.json()}).catch(function(){return{sessions:[]}})
     ]);
-    const activeIds=new Set((activeR.sessions||[]).map(s=>s.id));
-    const sessions=sessR.sessions||[];
-    const el=$('sessions');
+    var activeIds=new Set((activeR.sessions||[]).map(function(s){return s.id}));
+    var sessions=sessR.sessions||[];
+    var el=$('sessions-list');
     if(!el)return;
-    el.innerHTML=sessions.length?sessions.map(s=>{
-      const isActive=activeIds.has(s.id)||s.active;
-      const dur=s.duration_ms>0?Math.round(s.duration_ms/1000)+'s':'—';
-      const badge=isActive?'<span class="badge ok" style="font-size:.7rem">LIVE</span>':'<span style="color:#64748b;font-size:.75rem">idle</span>';
-      const srcBadge=s.session_source==='claude-code'?'<span style="color:#60a5fa;font-size:.75rem">claude-code</span>':'<span style="color:#94a3b8;font-size:.75rem">proxy</span>';
-      const sid=s.id.length>20?s.id.slice(0,20)+'…':s.id;
-      const mix=s.model_mix&&Object.keys(s.model_mix).length?Object.entries(s.model_mix).map(([m,c])=>{const short=m.replace('claude-','').replace(/-\d{8}$/,'').replace('sonnet','Sonnet').replace('opus','Opus').replace('haiku','Haiku');return '<span style="font-size:.72rem;color:#94a3b8">'+short+'<span style="color:#475569">×</span>'+c+'</span>';}).join(' '):'<span style="color:#475569;font-size:.72rem">—</span>';
-      return '<tr><td style="font-family:monospace;font-size:.8rem" title="'+esc(s.id)+'">'+sid+'</td><td>'+srcBadge+'</td><td>'+fmtTime(new Date(s.started_at).toISOString())+'</td><td>'+dur+'</td><td>'+s.request_count+'</td><td>'+(s.total_tokens_in||0)+'</td><td>'+(s.total_tokens_out||0)+'</td><td>$'+fmt(s.total_cost_usd,4)+'</td><td>'+mix+'</td><td>'+badge+'</td></tr>';
-    }).join(''):'<tr><td colspan=10 style="color:#64748b">No sessions recorded yet</td></tr>';
-    const totalCost=sessions.reduce((s,r)=>s+(r.total_cost_usd||0),0);
+    if(!sessions.length){el.innerHTML='<div style="color:#64748b;font-size:.85rem">No sessions recorded yet</div>';return}
+    el.innerHTML=sessions.map(function(s,i){
+      var isActive=activeIds.has(s.id)||s.active;
+      var liveBadge=isActive?'<span class="sess-live">● LIVE</span>':'<span class="sess-idle">○</span>';
+      var srcBadge=s.session_source==='claude-code'?'<span class="sess-src-cc">claude-code</span>':'<span class="sess-src-proxy">proxy</span>';
+      var mix='';
+      if(s.model_mix&&Object.keys(s.model_mix).length){
+        mix=Object.entries(s.model_mix).map(function(e){return '<span class="sess-chip">'+shortModel(e[0])+'<span style="color:#475569">\xd7</span>'+e[1]+'</span>'}).join(' ');
+      }
+      var ago=fmtAgo(s.last_seen_at||s.started_at);
+      var cost='$'+fmt(s.total_cost_usd,4);
+      var reqCount=s.request_count+' req';
+      var expanded=expandedSessions.has(s.id);
+      var row='<div class="session-row'+(expanded?' expanded':'')+'" id="srow-'+i+'" onclick="toggleSession('+i+',\''+esc(s.id)+'\')">'
+        +liveBadge+' '+srcBadge
+        +'<span class="sess-dot">&middot;</span><span style="font-size:.82rem">'+reqCount+'</span>'
+        +'<span class="sess-dot">&middot;</span><span style="font-size:.82rem">'+cost+'</span>'
+        +(mix?'<span class="sess-dot">&middot;</span>'+mix:'')
+        +'<span class="sess-dot">&middot;</span><span style="font-size:.78rem;color:#64748b">'+ago+'</span>'
+        +'<span style="flex:1"></span><span style="font-size:.7rem;color:#475569">'+esc(s.id.slice(0,16))+'…</span>'
+        +'</div>';
+      var detail='<div class="session-detail" id="sdetail-'+i+'" style="display:'+(expanded?'block':'none')+'"><div style="color:#64748b;font-size:.8rem">Loading…</div></div>';
+      return row+detail;
+    }).join('');
   }catch(e){console.error('sessions load error',e)}
 }
+async function toggleSession(i,sid){
+  var row=document.getElementById('srow-'+i);
+  var detail=document.getElementById('sdetail-'+i);
+  if(!row||!detail)return;
+  var isExpanded=row.classList.contains('expanded');
+  if(isExpanded){row.classList.remove('expanded');detail.style.display='none';expandedSessions.delete(sid);return}
+  row.classList.add('expanded');detail.style.display='block';expandedSessions.add(sid);
+  detail.innerHTML='<div style="color:#64748b;font-size:.8rem;padding:8px">Loading…</div>';
+  try{
+    var runsR=await fetch('/v1/telemetry/runs?session_id='+encodeURIComponent(sid)+'&limit=50').then(function(r){return r.json()});
+    var runs=runsR.runs||[];
+    if(!runs.length){detail.innerHTML='<div style="color:#64748b;font-size:.8rem;padding:8px">No requests found for this session</div>';return}
+    detail.innerHTML='<table style="font-size:.8rem"><thead><tr><th>Time</th><th>Model</th><th>Task</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody>'+
+      runs.map(function(r){
+        var badge=r.status==='success'?'<span class="badge ok">ok</span>':'<span class="badge err">'+(r.statusCode||'err')+'</span>';
+        return '<tr><td>'+fmtTime(r.started_at)+'</td><td style="font-size:.75rem">'+shortModel(r.model||'')+'</td><td><span class="badge tt-'+(r.taskType||'general').replace(/_/g,'-')+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+badge+'</td></tr>'
+      }).join('')+'</tbody></table>';
+  }catch(e){detail.innerHTML='<div style="color:#64748b;font-size:.8rem;padding:8px">Failed to load session runs</div>'}
+}
+
+// ── Post-install banner ───────────────────────────────────────────────────
+function dismissBanner(){localStorage.setItem('rp_intro_dismissed','1');var b=$('intro-banner');if(b)b.remove()}
+function maybeShowBanner(sav,stats){
+  if(localStorage.getItem('rp_intro_dismissed'))return;
+  if(!sav||!sav.actualCost||sav.actualCost<=0)return;
+  var banner=$('intro-banner');
+  if(!banner)return;
+  $('banner-baseline').textContent='$'+fmt(sav.potentialSavings,2);
+  $('banner-actual').textContent='$'+fmt(sav.actualCost,2);
+  $('banner-saved').textContent='$'+fmt(sav.savedAmount,2)+' ('+Math.round(sav.percentage||0)+'%)';
+  var mix='';
+  if(stats&&stats.byModel){
+    var totalReqs=(stats.byModel||[]).reduce(function(s,m){return s+m.count},0);
+    mix=(stats.byModel||[]).map(function(m){return shortModel(m.model)+'\xd7'+m.count}).join('  ');
+    if(totalReqs)mix=totalReqs+' requests  \xb7  '+mix+'  \xb7  complexity routing';
+  }
+  $('banner-mix').textContent=mix;
+  banner.style.display='block';
+}
+
+// ── Main load ─────────────────────────────────────────────────────────────
+var _agents=[];
+const expandedRuns=new Set();
 async function load(){
   try{
-    const [health,stats,runsR,sav,provH,agentsR]=await Promise.all([
-      fetch('/health').then(r=>r.json()),
-      fetch('/v1/telemetry/stats').then(r=>r.json()),
-      fetch('/v1/telemetry/runs?limit=20').then(r=>r.json()),
-      fetch('/v1/telemetry/savings').then(r=>r.json()),
-      fetch('/v1/telemetry/health').then(r=>r.json()),
-      fetch('/api/agents').then(r=>r.json()).catch(()=>({agents:[]}))
+    var days=currentDays;
+    var [health,stats,runsR,sav,provH,agentsR]=await Promise.all([
+      fetch('/health').then(function(r){return r.json()}),
+      fetch('/v1/telemetry/stats?days='+days).then(function(r){return r.json()}),
+      fetch('/v1/telemetry/runs?limit=20').then(function(r){return r.json()}),
+      fetch('/v1/telemetry/savings?days='+days).then(function(r){return r.json()}),
+      fetch('/v1/telemetry/health').then(function(r){return r.json()}),
+      fetch('/api/agents').then(function(r){return r.json()}).catch(function(){return{agents:[]}})
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
-
-    const versionStatus = await fetch('/v1/version-status').then(r=>r.json()).catch(()=>({state:'unavailable', current: health.version, latest: null}));
-    const vEl = $('vstat');
-    if (vEl) {
-      vEl.className = 'vstat ' + (versionStatus.state === 'outdated' ? 'outdated' : versionStatus.state === 'up-to-date' ? 'current' : 'unavailable');
-      if (versionStatus.state === 'outdated') {
-        vEl.textContent = 'Update available · v' + versionStatus.current + ' → v' + versionStatus.latest;
-      } else if (versionStatus.state === 'up-to-date') {
-        vEl.textContent = 'Up to date · v' + versionStatus.current;
-      } else {
-        vEl.textContent = 'Unable to check · v' + versionStatus.current;
-      }
+    var versionStatus=await fetch('/v1/version-status').then(function(r){return r.json()}).catch(function(){return{state:'unavailable',current:health.version,latest:null}});
+    var vEl=$('vstat');
+    if(vEl){
+      vEl.className='vstat '+(versionStatus.state==='outdated'?'outdated':versionStatus.state==='up-to-date'?'current':'unavailable');
+      if(versionStatus.state==='outdated')vEl.textContent='Update available \xb7 v'+versionStatus.current+' \u2192 v'+versionStatus.latest;
+      else if(versionStatus.state==='up-to-date')vEl.textContent='Up to date \xb7 v'+versionStatus.current;
+      else vEl.textContent='Unable to check \xb7 v'+versionStatus.current;
     }
-    const lifetimeTotal=stats.summary?.totalRequests ?? stats.summary?.totalEvents ?? 0;
-    const historyTotal=stats.summary?.totalEvents ?? 0;
-    const historyLimit=stats.summary?.historyLimit ?? 10000;
-    const retentionDays=stats.summary?.retentionDays ?? 7;
-    $('totalReq').textContent=historyTotal;
-    $('totalReqDetail').textContent='Process lifetime: '+lifetimeTotal.toLocaleString()+' (resets on restart)';
-    $('historyLabel').textContent='('+retentionDays+'d window, max '+historyLimit.toLocaleString()+' requests)';
-    $('totalCost').textContent='$'+fmt(stats.summary?.totalCostUsd??0,4);
-    const savAmt=sav.savedAmount??sav.savings??0;
-    const cacheSav=sav.cacheSavings??0;
-    const routeSav=sav.routingSavings??0;
-    const actual=sav.actualCost??0;
-    const hasAnthropic=sav.hasAnthropicCalls!==false;
-    const baseline=sav.potentialSavings??sav.total??0;
-    // Headline = routing savings % (RelayPlane's actual contribution)
-    const routeBaseline=baseline>0?baseline:1;
-    const routePct=hasAnthropic?Math.round((routeSav/routeBaseline)*100):0;
-    const totalPct=sav.percentage??0;
-    $('savings').textContent='$'+fmt(routeSav,2);
-    // Secondary: show total % including cache as context
+    // Stat cards
+    var historyTotal=stats.summary&&stats.summary.totalEvents||0;
+    $('totalCost').textContent='$'+fmt(stats.summary&&stats.summary.totalCostUsd||0,4);
+    $('totalReq').textContent=historyTotal+' requests';
+    var latMs=stats.summary&&stats.summary.avgLatencyMs||0;
+    $('avgLat').textContent=latMs>=1000?(latMs/1000).toFixed(1)+'s':latMs+'ms';
+    // Savings card
+    var savAmt=sav.savedAmount||sav.savings||0;
+    var cacheSav=sav.cacheSavings||0;
+    var routeSav=sav.routingSavings||0;
+    var actual=sav.actualCost||0;
+    var hasAnthropic=sav.hasAnthropicCalls!==false;
+    var baseline=sav.potentialSavings||sav.total||0;
+    var totalPct=sav.percentage||0;
+    $('savings').textContent='$'+fmt(savAmt,2);
+    var detailEl=$('savings-detail');
     if(hasAnthropic){
-      $('savings-detail').innerHTML='<span style="color:#60a5fa">routing savings</span> · <span style="color:#64748b" title="Includes Anthropic prompt cache hits which happen regardless of routing">'+totalPct+'% total incl. cache</span>';
-    } else {
-      $('savings-detail').innerHTML='<span style="color:#a78bfa">$'+fmt(cacheSav,2)+' cache</span> · <span style="color:#64748b">'+totalPct+'% total</span>';
+      detailEl.innerHTML='<span style="color:#60a5fa">$'+fmt(routeSav,2)+' routing</span> + <span style="color:#a78bfa">$'+fmt(cacheSav,2)+' cache</span> vs all-Opus';
+    }else{
+      detailEl.innerHTML='<span style="color:#a78bfa">$'+fmt(cacheSav,2)+' cache hits</span> \xb7 '+totalPct+'% total';
     }
-    const tipEl=$('savings-tooltip');
+    var tipEl=$('savings-tooltip');
     if(tipEl){
-      let tip='<strong>How savings are calculated</strong><br><br>';
+      var tip='<strong>How savings are calculated</strong><br><br>';
       if(hasAnthropic){
-        tip+='<span style="color:#60a5fa">🔀 Routing savings: $'+fmt(routeSav,2)+'</span><br><small>Requests routed to cheaper models (e.g. Sonnet) vs always using Opus. RelayPlane contribution.</small><br><br>';
-        tip+='<span style="color:#a78bfa">💾 Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Anthropic prompt cache hits (10× cheaper reads). This would happen without RelayPlane too.</small><br><br>';
-      } else {
-        tip+='<span style="color:#a78bfa">💾 Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Provider cache hits. Happens automatically, not specific to RelayPlane.</small><br><br>';
+        tip+='<span style="color:#60a5fa">\ud83d\udd00 Routing savings: $'+fmt(routeSav,2)+'</span><br><small>vs always using Opus (RelayPlane\\'s contribution)</small><br><br>';
+        tip+='<span style="color:#a78bfa">\ud83d\udcbe Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Anthropic prompt cache hits (would happen without RelayPlane)</small><br><br>';
+      }else{
+        tip+='<span style="color:#a78bfa">\ud83d\udcbe Cache savings: $'+fmt(cacheSav,2)+'</span><br><small>Provider cache hits. Automatic, not RelayPlane-specific.</small><br><br>';
       }
-      tip+='💳 Actual cost: <b>$'+fmt(actual,2)+'</b><br>✅ Total saved: <b>$'+fmt(savAmt,2)+'</b>';
+      tip+='\ud83d\udcb3 Actual cost: <b>$'+fmt(actual,2)+'</b><br>\u2705 Total saved: <b>$'+fmt(savAmt,2)+'</b>';
       tipEl.innerHTML=tip;
     }
-    $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
-    $('avgLatDetail').textContent='7d window metric (history-capped)';
-    const modelTotalCost=(stats.byModel||[]).reduce((s,m)=>s+(m.costUsd||0),0);
-    $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td style="color:#94a3b8;font-size:.85rem">'+(m.provider||'—')+'</td><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(modelTotalCost>0?m.costUsd/modelTotalCost*100:0,1)+'%</td></tr>'
-    ).join('')||'<tr><td colspan=5 style="color:#64748b">No data yet</td></tr>';
-    function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
-    function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
-    const agents=(agentsR.agents||[]).sort((a,b)=>(b.totalCost||0)-(a.totalCost||0));
-    $('runs').innerHTML=(runsR.runs||[]).map((r,i)=>{
-      function errBadge(r){if(r.status==='success')return '<span class="badge ok">success</span>';var cls='err';var label=r.error||'error';if(r.statusCode===401||r.statusCode===403||(r.error&&/auth/i.test(r.error)))cls='err-auth';else if(r.statusCode===429||(r.error&&/rate.?limit/i.test(r.error)))cls='err-rate';else if(r.error&&/timeout/i.test(r.error))cls='err-timeout';return '<span class="badge '+cls+'" title="'+esc(r.error||'')+' (HTTP '+( r.statusCode||'?')+')">'+(r.statusCode?r.statusCode+' ':'')+ (label.length>40?label.slice(0,40)+'…':label)+'</span>';}
-      const agentName=agents.find(a=>a.fingerprint===r.agentFingerprint)?.name||(r.agentId||'—');
-      const row='<tr style="cursor:pointer" onclick="toggleDetail('+i+')"><td><span id="arrow-'+i+'" style="color:#64748b;font-size:.7rem;margin-right:6px">▶</span>'+fmtTime(r.started_at)+'</td><td style="font-size:.85rem">'+esc(agentName)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+errBadge(r)+'</td></tr>';
-      const c=r.requestContent||{};
-      let detail='<tr id="run-detail-'+i+'" style="display:none"><td colspan="12" style="padding:16px;background:#111217;border-bottom:1px solid #1e293b">';
+    // Model breakdown
+    var modelTotalCost=(stats.byModel||[]).reduce(function(s,m){return s+(m.costUsd||0)},0);
+    $('models').innerHTML=(stats.byModel||[]).map(function(m){
+      return '<tr><td style="color:#94a3b8;font-size:.85rem">'+(m.provider||'-')+'</td><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(modelTotalCost>0?m.costUsd/modelTotalCost*100:0,1)+'%</td></tr>'
+    }).join('')||'<tr><td colspan=5 style="color:#64748b">No data yet</td></tr>';
+    // Agents
+    _agents=(agentsR.agents||[]).sort(function(a,b){return(b.totalCost||0)-(a.totalCost||0)});
+    $('agents').innerHTML=_agents.length?_agents.map(function(a){
+      return '<tr><td><span>'+esc(a.name)+'</span> <button class="rename-btn" onclick="renameAgent(\''+esc(a.fingerprint)+'\',\''+esc(a.name)+'\')">&#9999;&#65039;</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b">'+esc(a.fingerprint)+'</td></tr>'
+    }).join(''):'<tr><td colspan=5 style="color:#64748b">No agents detected yet</td></tr>';
+    // Recent runs
+    function ttCls(t){var m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
+    function cxCls(c){var m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
+    $('runs').innerHTML=(runsR.runs||[]).map(function(r,i){
+      function errBadge(r){if(r.status==='success')return'<span class="badge ok">ok</span>';var cls='err';if(r.statusCode===401||r.statusCode===403)cls='err-auth';else if(r.statusCode===429||(r.error&&/rate.?limit/i.test(r.error)))cls='err-rate';else if(r.error&&/timeout/i.test(r.error))cls='err-timeout';return'<span class="badge '+cls+'" title="'+esc(r.error||'')+'">'+(r.statusCode||'err')+'</span>'}
+      var agentName=_agents.find(function(a){return a.fingerprint===r.agentFingerprint});
+      var name=agentName?agentName.name:(r.agentId||'-');
+      var row='<tr style="cursor:pointer" onclick="toggleRunDetail('+i+')"><td><span id="arr-'+i+'" style="color:#64748b;font-size:.7rem;margin-right:4px">\u25b6</span>'+fmtTime(r.started_at)+'</td><td style="font-size:.82rem">'+esc(name)+'</td><td style="font-size:.82rem">'+shortModel(r.model||'')+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td class="col-cache" style="color:#60a5fa">'+(r.cacheCreationTokens||0)+'</td><td class="col-cache" style="color:#34d399">'+(r.cacheReadTokens||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td>'+errBadge(r)+'</td></tr>';
+      var c=r.requestContent||{};
+      var detail='<tr id="rdet-'+i+'" style="display:none"><td colspan="12" style="padding:14px;background:#111217;border-bottom:1px solid #1e293b">';
       if(c.systemPrompt||c.userMessage||c.responsePreview){
-        if(c.systemPrompt) detail+='<div style="color:#64748b;font-size:.85rem;margin-bottom:10px;font-style:italic"><strong style="color:#94a3b8">System:</strong> '+esc(c.systemPrompt)+'</div>';
-        if(c.userMessage) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">User Message</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.userMessage)+'</div></div>';
-        if(c.responsePreview) detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-bottom:10px"><strong style="color:#94a3b8;font-size:.8rem">Response Preview</strong><div style="margin-top:6px;white-space:pre-wrap">'+esc(c.responsePreview)+'</div></div>';
-        const btnAttrs='id="full-btn-'+i+'" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;font-size:.8rem"';
-        detail+=(r.tokensOut>0?'<button onclick="event.stopPropagation();loadFullResponse(&quot;'+r.id+'&quot;,'+i+')" '+btnAttrs+'>Show full response</button>':'<button disabled '+btnAttrs+' style="opacity:.4;cursor:default">Response not available (streaming)</button>')+'<pre id="full-resp-'+i+'" style="display:none;white-space:pre-wrap;margin-top:10px;background:#0d0e11;border:1px solid #1e293b;border-radius:8px;padding:12px;max-height:400px;overflow:auto;font-size:.8rem"></pre>';
-      } else {
-        detail+='<span style="color:#64748b">No content captured for this request</span>';
-      }
+        if(c.systemPrompt)detail+='<div style="color:#64748b;font-size:.82rem;margin-bottom:8px;font-style:italic"><strong style="color:#94a3b8">System:</strong> '+esc(c.systemPrompt)+'</div>';
+        if(c.userMessage)detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:10px;margin-bottom:8px"><strong style="color:#94a3b8;font-size:.78rem">User</strong><div style="margin-top:4px;white-space:pre-wrap;font-size:.82rem">'+esc(c.userMessage)+'</div></div>';
+        if(c.responsePreview)detail+='<div style="background:#1a1c23;border:1px solid #1e293b;border-radius:8px;padding:10px;margin-bottom:8px"><strong style="color:#94a3b8;font-size:.78rem">Response Preview</strong><div style="margin-top:4px;white-space:pre-wrap;font-size:.82rem">'+esc(c.responsePreview)+'</div></div>';
+        var ba='id="fb-'+i+'" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:5px 10px;border-radius:6px;font-size:.78rem"';
+        detail+=(r.tokensOut>0?'<button onclick="event.stopPropagation();loadFullResp(\''+r.id+'\','+i+')" '+ba+'>Show full response</button>':'<button disabled '+ba+' style="opacity:.4;cursor:default">Response not available (streaming)</button>')+'<pre id="fr-'+i+'" style="display:none;white-space:pre-wrap;margin-top:8px;background:#0d0e11;border:1px solid #1e293b;border-radius:8px;padding:10px;max-height:400px;overflow:auto;font-size:.78rem"></pre>';
+      }else{detail+='<span style="color:#64748b">No content captured</span>'}
       detail+='</td></tr>';
       return row+detail;
     }).join('')||'<tr><td colspan=12 style="color:#64748b">No runs yet</td></tr>';
-    restoreExpanded();
-    $('agents').innerHTML=agents.length?agents.map(a=>
-      '<tr><td><span class="agent-name" data-fp="'+a.fingerprint+'">'+esc(a.name)+'</span> <button class="rename-btn" onclick="renameAgent(&quot;'+a.fingerprint+'&quot;,&quot;'+a.name.replace(/"/g,'')+'&quot;)">✏️</button></td><td>'+a.totalRequests+'</td><td>$'+fmt(a.totalCost,4)+'</td><td>'+fmtTime(a.lastSeen)+'</td><td style="font-size:.7rem;color:#64748b" title="'+esc(a.systemPromptPreview||'')+'">'+a.fingerprint+'</td></tr>'
-    ).join(''):'<tr><td colspan=5 style="color:#64748b">No agents detected yet</td></tr>';
-    $('providers').innerHTML=(provH.providers||[]).map(p=>{
-      const dotClass = p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
-      const rate = p.successRate!==undefined?(' '+Math.round(p.successRate*100)+'%'):'';
-      return '<div class="prov-item"><span class="dot '+dotClass+'"></span>'+p.provider+rate+'</div>';
+    restoreRunExpanded();
+    // Providers
+    $('providers').innerHTML=(provH.providers||[]).map(function(p){
+      var dotCls=p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
+      var rate=p.successRate!==undefined?(' '+Math.round(p.successRate*100)+'%'):'';
+      return '<div class="prov-item"><span class="dot '+dotCls+'"></span>'+(p.provider||p.name)+rate+'</div>';
     }).join('');
+    // Banner
+    maybeShowBanner(sav,stats);
+    // Config
+    loadBudget();
+    loadConfigReadonly();
   }catch(e){console.error(e)}
 }
-async function renameAgent(fp,currentName){
-  const name=prompt('Rename agent:',currentName);
-  if(!name||name===currentName)return;
-  await fetch('/api/agents/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp,name:name})});
-  load();
+function toggleRunDetail(i){
+  var d=document.getElementById('rdet-'+i);
+  var a=document.getElementById('arr-'+i);
+  if(!d)return;
+  if(d.style.display==='none'){d.style.display='table-row';expandedRuns.add(i);if(a)a.textContent='\u25bc'}
+  else{d.style.display='none';expandedRuns.delete(i);if(a)a.textContent='\u25b6'}
 }
-const expandedRows=new Set();
-function toggleDetail(i){var d=document.getElementById('run-detail-'+i);var arrow=document.getElementById('arrow-'+i);if(d.style.display==='none'){d.style.display='table-row';expandedRows.add(i);if(arrow)arrow.textContent='▼'}else{d.style.display='none';expandedRows.delete(i);if(arrow)arrow.textContent='▶'}}
-function restoreExpanded(){expandedRows.forEach(i=>{var d=document.getElementById('run-detail-'+i);var arrow=document.getElementById('arrow-'+i);if(d)d.style.display='table-row';if(arrow)arrow.textContent='▼'})}
-async function loadFullResponse(runId,i){
-  const btn=document.getElementById('full-btn-'+i);
-  const pre=document.getElementById('full-resp-'+i);
+function restoreRunExpanded(){expandedRuns.forEach(function(i){var d=document.getElementById('rdet-'+i);var a=document.getElementById('arr-'+i);if(d)d.style.display='table-row';if(a)a.textContent='\u25bc'})}
+async function loadFullResp(runId,i){
+  var btn=document.getElementById('fb-'+i);
+  var pre=document.getElementById('fr-'+i);
+  if(!btn||!pre)return;
   if(pre.style.display!=='none'){pre.style.display='none';btn.textContent='Show full response';return}
-  btn.textContent='Loading...';
+  btn.textContent='Loading…';
   try{
-    const data=await fetch('/api/runs/'+runId).then(r=>r.json());
-    const full=data.requestContent&&data.requestContent.fullResponse;
+    var data=await fetch('/api/runs/'+runId).then(function(r){return r.json()});
+    var full=data.requestContent&&data.requestContent.fullResponse;
     if(full){pre.textContent=full;pre.style.display='block';btn.textContent='Hide full response'}
     else{btn.textContent='No full response available'}
   }catch{btn.textContent='Error loading response'}
+}
+async function renameAgent(fp,name){
+  var n=prompt('Rename agent:',name);
+  if(!n||n===name)return;
+  await fetch('/api/agents/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:fp,name:n})});
+  load();
 }
 async function loadLearning(){
   try{
@@ -3423,7 +4057,7 @@ async function loadLearning(){
       statsEl.innerHTML='<div class="card" style="flex:1;min-width:140px"><div class="label">Total Learnings</div><div class="value">'+k.totalLearnings+'</div></div>'+
         '<div class="card" style="flex:1;min-width:140px"><div class="label">Recent (7d)</div><div class="value">'+k.recentLearnings.length+'</div></div>'+
         '<div class="card" style="flex:2;min-width:200px"><div class="label">Knowledge Files</div><div class="value" style="font-size:.9rem;line-height:1.6">'+
-        (k.fileStats.length?k.fileStats.map(function(f){return '<span style="color:#94a3b8;font-weight:400">'+f.file+'</span> <span style="color:#34d399">'+f.learnings+'</span>'}).join(' &middot; '):'—')+'</div></div>';
+        (k.fileStats.length?k.fileStats.map(function(f){return '<span style="color:#94a3b8;font-weight:400">'+f.file+'</span> <span style="color:#34d399">'+f.learnings+'</span>'}).join(' &middot; '):',')+'</div></div>';
     }
     if(recentEl){
       if(k.recentLearnings.length){
@@ -3456,7 +4090,24 @@ async function loadTokenPool(){
       }).join('')+'</tbody></table>';
   }catch(e){console.error('token pool load error',e)}
 }
-load();loadLearning();loadSessions();loadTokenPool();setInterval(load,5000);setInterval(loadLearning,30000);setInterval(loadSessions,10000);setInterval(loadTokenPool,10000);
+async function applyTier(){
+  try{
+    const params=new URLSearchParams(window.location.search);
+    const mockParam=params.get('tier');
+    const url=mockParam?'/v1/tier?mock='+encodeURIComponent(mockParam):'/v1/tier';
+    const t=await fetch(url).then(r=>r.json());
+    const isMesh=t.tier==='mesh';
+    document.querySelectorAll('.gated').forEach(el=>{
+      if(isMesh)el.classList.add('mesh-on');else el.classList.remove('mesh-on');
+    });
+    if(isMesh){loadMeshPanel();loadTokenPoolPanel();loadXProvPanel();loadLearningPanel();}
+  }catch(e){console.error('applyTier error',e)}
+}
+function loadMeshPanel(){const el=document.getElementById('panel-mesh-inner');if(el)el.innerHTML='<p style="color:#94a3b8;font-size:.85rem">Mesh routing active.</p>';}
+function loadTokenPoolPanel(){const el=document.getElementById('panel-token-pool-inner');if(el)el.innerHTML='<p style="color:#94a3b8;font-size:.85rem">Token pool data loading...</p>';}
+function loadXProvPanel(){const el=document.getElementById('panel-xprov-inner');if(el)el.innerHTML='<p style="color:#94a3b8;font-size:.85rem">Cross-provider routing active.</p>';}
+function loadLearningPanel(){const el=document.getElementById('panel-learning-inner');if(el)el.innerHTML='<p style="color:#94a3b8;font-size:.85rem">Learning insights loading...</p>';}
+load();loadLearning();loadSessions();loadTokenPool();setInterval(load,5000);setInterval(loadLearning,30000);setInterval(loadSessions,10000);setInterval(loadTokenPool,10000);applyTier();
 </script><footer style="text-align:center;padding:20px 0;color:#475569;font-size:.75rem;border-top:1px solid #1e293b;margin-top:20px">🔒 Request content stays on your machine. Never sent to cloud.</footer></body></html>`;
 }
 
@@ -3614,6 +4265,163 @@ load();
 </script></body></html>`;
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Dashboard telemetry helpers (Phase 1 dashboard redesign)
+// Pure functions so they're easy to unit-test without spinning up the server.
+// ──────────────────────────────────────────────────────────────────────────
+
+export interface DayWindowStats {
+  totalCost: number;
+  totalRequests: number;
+  avgLatencyMs: number;
+  latencyP95: number;
+  errorRate: number;
+  cacheHitRate: number;
+}
+
+function percentile(sortedAsc: number[], p: number): number {
+  if (sortedAsc.length === 0) return 0;
+  if (sortedAsc.length === 1) return sortedAsc[0]!;
+  const idx = Math.min(sortedAsc.length - 1, Math.ceil((p / 100) * sortedAsc.length) - 1);
+  return sortedAsc[Math.max(0, idx)]!;
+}
+
+function entryHasCacheHit(r: RequestHistoryEntry): boolean {
+  return (r.cacheReadTokens ?? 0) > 0;
+}
+
+function computeWindowStats(entries: RequestHistoryEntry[]): DayWindowStats {
+  if (entries.length === 0) {
+    return { totalCost: 0, totalRequests: 0, avgLatencyMs: 0, latencyP95: 0, errorRate: 0, cacheHitRate: 0 };
+  }
+  const totalCost = entries.reduce((s, r) => s + (r.costUsd || 0), 0);
+  const totalLatency = entries.reduce((s, r) => s + (r.latencyMs || 0), 0);
+  const sortedLatencies = entries.map(r => r.latencyMs || 0).sort((a, b) => a - b);
+  const errorCount = entries.filter(r => !r.success).length;
+  const cacheHits = entries.filter(entryHasCacheHit).length;
+  return {
+    totalCost: Math.round(totalCost * 10000) / 10000,
+    totalRequests: entries.length,
+    avgLatencyMs: Math.round(totalLatency / entries.length),
+    latencyP95: percentile(sortedLatencies, 95),
+    errorRate: errorCount / entries.length,
+    cacheHitRate: cacheHits / entries.length,
+  };
+}
+
+/** Get the UTC day stats summary for "today". */
+export function computeTodayStats(history: RequestHistoryEntry[], now: number = Date.now()): DayWindowStats {
+  const utcDay = new Date(now);
+  utcDay.setUTCHours(0, 0, 0, 0);
+  const dayStart = utcDay.getTime();
+  const dayEnd = dayStart + 86400000;
+  const todayEntries = history.filter(r => {
+    const t = new Date(r.timestamp).getTime();
+    return t >= dayStart && t < dayEnd;
+  });
+  return computeWindowStats(todayEntries);
+}
+
+/** Parse a YYYY-MM-DD param strictly. Returns the UTC ms range when valid. */
+export function parseDayParam(day: string | null): { ok: true; dayStart: number; dayEnd: number } | { ok: false } {
+  if (!day || typeof day !== 'string') return { ok: false };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { ok: false };
+  const [yStr, mStr, dStr] = day.split('-');
+  const y = parseInt(yStr!, 10);
+  const m = parseInt(mStr!, 10);
+  const d = parseInt(dStr!, 10);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return { ok: false };
+  const ms = Date.UTC(y, m - 1, d);
+  const back = new Date(ms);
+  if (back.getUTCFullYear() !== y || back.getUTCMonth() !== m - 1 || back.getUTCDate() !== d) {
+    return { ok: false };
+  }
+  return { ok: true, dayStart: ms, dayEnd: ms + 86400000 };
+}
+
+/** 24-entry hourly spend bucket for a UTC day. */
+export function computeSpendByHour(history: RequestHistoryEntry[], dayStart: number, dayEnd: number): Array<{ hour: number; usd: number }> {
+  const buckets: number[] = new Array(24).fill(0);
+  for (const r of history) {
+    const t = new Date(r.timestamp).getTime();
+    if (t < dayStart || t >= dayEnd) continue;
+    const hr = Math.floor((t - dayStart) / 3600000);
+    if (hr >= 0 && hr < 24) buckets[hr]! += r.costUsd || 0;
+  }
+  return buckets.map((usd, hour) => ({ hour, usd: Math.round(usd * 10000) / 10000 }));
+}
+
+export interface ProviderRollup {
+  provider: string;
+  share: number;
+  p95Ms: number;
+  rpm: number;
+  health: 'healthy' | 'degraded' | 'down';
+  primary: boolean;
+  note: string;
+}
+
+/** Per-provider rollup over the last `days` UTC days. */
+export function computeProvidersRollup(history: RequestHistoryEntry[], days: number, now: number = Date.now()): ProviderRollup[] {
+  const cutoff = now - days * 86400000;
+  const recent = history.filter(r => new Date(r.timestamp).getTime() >= cutoff);
+  const total = recent.length;
+  if (total === 0) return [];
+  const byProvider = new Map<string, RequestHistoryEntry[]>();
+  for (const r of recent) {
+    const key = r.provider || 'unknown';
+    if (!byProvider.has(key)) byProvider.set(key, []);
+    byProvider.get(key)!.push(r);
+  }
+  const windowMinutes = Math.max(1, (days * 86400) / 60);
+  const rows: ProviderRollup[] = [];
+  for (const [provider, rs] of byProvider) {
+    const errorRate = rs.filter(r => !r.success).length / rs.length;
+    let health: 'healthy' | 'degraded' | 'down' = 'healthy';
+    let note = '';
+    if (errorRate > 0.25) {
+      health = 'down';
+      note = `${Math.round(errorRate * 100)}% error rate`;
+    } else if (errorRate > 0.05) {
+      health = 'degraded';
+      note = `${Math.round(errorRate * 100)}% error rate`;
+    }
+    const latencies = rs.map(r => r.latencyMs || 0).sort((a, b) => a - b);
+    rows.push({
+      provider,
+      share: rs.length / total,
+      p95Ms: percentile(latencies, 95),
+      rpm: Math.round((rs.length / windowMinutes) * 100) / 100,
+      health,
+      primary: false,
+      note,
+    });
+  }
+  rows.sort((a, b) => b.share - a.share);
+  // Normalise shares to sum to exactly 1.0 (within rounding) and mark primary
+  const sum = rows.reduce((s, r) => s + r.share, 0);
+  if (sum > 0) {
+    for (const r of rows) r.share = Math.round((r.share / sum) * 10000) / 10000;
+  }
+  if (rows.length > 0) rows[0]!.primary = true;
+  return rows;
+}
+
+/** Compute total savings for a session from its request-history entries. */
+export function computeSessionSavings(sessionId: string, history: RequestHistoryEntry[]): number {
+  const entries = history.filter(r => r.agentId === sessionId);
+  let saved = 0;
+  for (const r of entries) {
+    try {
+      const baseline = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut, r.cacheCreationTokens || undefined, r.cacheReadTokens || undefined);
+      saved += Math.max(0, baseline - (r.costUsd || 0));
+    } catch {
+      // estimateCost is defensive but guard anyway
+    }
+  }
+  return Math.round(saved * 10000) / 10000;
+}
+
 /**
  * Start the RelayPlane proxy server
  */
@@ -3712,7 +4520,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // Build default tiers, respecting any existing user config overrides
       const existingComplexity = proxyConfig.routing?.complexity as Partial<ComplexityConfig> | undefined;
       const defaultProviders: Provider[] = availableProviders.length > 0 ? availableProviders : ['openrouter'];
-      const tiers = buildDefaultComplexityTiers(defaultProviders, existingComplexity);
+      const allowEliteAuto = (proxyConfig.routing as { allow_elite_auto?: boolean } | undefined)?.allow_elite_auto === true;
+      const tiers = buildDefaultComplexityTiers(defaultProviders, existingComplexity, { allow_elite_auto: allowEliteAuto });
 
       // Update DEFAULT_ROUTING with detected provider's moderate tier
       const moderateRoute = tiers.moderate;
@@ -3721,7 +4530,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         DEFAULT_ROUTING[tt] = moderateRoute;
       }
 
-      console.log(`[RelayPlane] Auto-routing: simple=${tiers.simple.model}, moderate=${tiers.moderate.model}, complex=${tiers.complex.model}`);
+      console.log(`[RelayPlane] Auto-routing: simple=${tiers.simple.model}, moderate=${tiers.moderate.model}, complex=${tiers.complex.model}, elite=${tiers.elite.model}`);
     }
 
     if (isFirstRun || proxyConfig.routing?.mode === 'auto') {
@@ -3734,24 +4543,25 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           existingRaw = JSON.parse(await fs.promises.readFile(configPath, 'utf8'));
         } catch { /* fresh start, no existing config */ }
 
-        let autoComplexity: { simple: string; moderate: string; complex: string };
+        let autoComplexity: { simple: string; moderate: string; complex: string; elite: string };
         if (availableProviders.includes('anthropic') && hasRegularApiKey) {
-          // Full Anthropic API key — enable haiku 3-tier routing
-          console.log('[RelayPlane] Auto-config: ANTHROPIC_API_KEY detected — enabling 3-tier routing (haiku/sonnet/opus)');
-          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-4-6', complex: 'claude-opus-4-6' };
+          // Full Anthropic API key - enable haiku 4-tier routing
+          console.log('[RelayPlane] Auto-config: ANTHROPIC_API_KEY detected - enabling 4-tier routing (haiku/sonnet/opus/fable-elite)');
+          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5' };
         } else if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
-          // Non-Anthropic provider — use detected provider's tiers
+          // Non-Anthropic provider - use detected provider's tiers
           const providerTiers = buildDefaultComplexityTiers(availableProviders);
-          console.log(`[RelayPlane] Auto-config: ${availableProviders[0]} detected — enabling provider-aware 3-tier routing`);
+          console.log(`[RelayPlane] Auto-config: ${availableProviders[0]} detected - enabling provider-aware 4-tier routing`);
           autoComplexity = {
             simple: `${providerTiers.simple.provider}/${providerTiers.simple.model}`,
             moderate: `${providerTiers.moderate.provider}/${providerTiers.moderate.model}`,
             complex: `${providerTiers.complex.provider}/${providerTiers.complex.model}`,
+            elite: `${providerTiers.elite.provider}/${providerTiers.elite.model}`,
           };
         } else {
-          // OAuth only or no API key — skip Haiku (OAuth not supported for Haiku)
-          console.warn('[RelayPlane] ⚠️  No ANTHROPIC_API_KEY (sk-ant-api*) — Haiku disabled. Set ANTHROPIC_API_KEY to enable 3-tier routing.');
-          autoComplexity = { simple: 'claude-sonnet-4-6', moderate: 'claude-sonnet-4-6', complex: 'claude-opus-4-6' };
+          // OAuth only or no API key - skip Haiku (OAuth not supported for Haiku)
+          console.warn('[RelayPlane] ⚠️  No ANTHROPIC_API_KEY (sk-ant-api*) - Haiku disabled. Set ANTHROPIC_API_KEY to enable full 4-tier routing.');
+          autoComplexity = { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5' };
         }
 
         const autoRouting = {
@@ -3787,6 +4597,39 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
   }
 
+  // === Credential pool: usage-aware failover + both-account OAuth refresh ===
+  // Gated on the `credentialPool` config key. When absent, nothing here runs and
+  // the request path is unchanged (this is the live-4100 default).
+  {
+    const userCfg = loadUserConfig();
+    const poolCfg = userCfg.credentialPool;
+    if (poolCfg && poolCfg.length > 0) {
+      const entries: CredentialPoolEntry[] = poolCfg.map((e) => ({
+        id: e.id,
+        tenantId: e.tenantId,
+        source: e.source,
+        path: e.path,
+        envVar: e.envVar,
+        weight: e.weight ?? 1,
+        maxConcurrent: e.maxConcurrent ?? 5,
+        refresh: e.refresh,
+      }));
+      _credentialPool = createCredentialPool(
+        { credentialPool: entries },
+        { getHeadroom: readCredentialHeadroom },
+      );
+      _credentialPoolTenant = entries[0]!.tenantId;
+      const managed = entries.filter((e) => e.source === 'oauth-file' && e.refresh === true);
+      _credRefreshManager = startRefreshManager(entries, {
+        log: (m) => console.log(m),
+      });
+      console.log(
+        `[RelayPlane] Credential pool: ${entries.length} account(s) active (tenant=${_credentialPoolTenant}), ` +
+        `${managed.length} managed w/ OAuth refresh`,
+      );
+    }
+  }
+
   // === Ollama provider initialization ===
   if (_activeOllamaConfig?.enabled !== false && _activeOllamaConfig?.models?.length) {
     const ollamaUrl = _activeOllamaConfig.baseUrl ?? OLLAMA_DEFAULTS.baseUrl;
@@ -3809,10 +4652,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (health.available) {
         console.log(`[RelayPlane] ✓ Ollama is online (${health.models.length} models available, ${health.responseTimeMs}ms)`);
       } else {
-        console.warn(`[RelayPlane] ⚠️  Ollama not available: ${health.error} — will fall back to cloud providers`);
+        console.warn(`[RelayPlane] ⚠️  Ollama not available: ${health.error} - will fall back to cloud providers`);
       }
     }).catch(() => {
-      console.warn('[RelayPlane] ⚠️  Ollama health check failed — will fall back to cloud providers');
+      console.warn('[RelayPlane] ⚠️  Ollama health check failed - will fall back to cloud providers');
     });
   }
 
@@ -3824,7 +4667,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     const createdAt = new Date(userConfig.created_at).getTime();
     const now = Date.now();
     if (Math.abs(now - createdAt) < 5000) {
-      console.warn('[RelayPlane] WARNING: Fresh config detected — previous config may have been deleted');
+      console.warn('[RelayPlane] WARNING: Fresh config detected - previous config may have been deleted');
     }
     
     // Check if credentials exist but config doesn't reference them
@@ -4098,10 +4941,13 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // === Health endpoint ===
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/healthz')) {
       const uptimeMs = Date.now() - globalStats.startedAt;
+      const planRaw = (process.env.RELAYPLANE_PLAN || 'free').toLowerCase();
+      const plan = ['free', 'trial', 'pro', 'fleet', 'max'].includes(planRaw) ? planRaw : 'free';
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
         version: PROXY_VERSION,
+        plan,
         uptime: Math.floor(uptimeMs / 1000),
         uptimeMs,
         requests: globalStats.totalRequests,
@@ -4240,7 +5086,42 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           hourly_pct_used: Math.round(status.hourlyPercent * 10) / 10,
           breached: status.breached,
           breach_type: status.breachType,
+          per_session_cap_usd: cfg.perSessionCapUsd ?? null,
+          per_key_caps: cfg.perKeyCapUsd ?? {},
+          ladder: cfg.ladder ?? [],
+          runaway: { retries: cfg.runawayRetries ?? 3, window_sec: cfg.runawayWindowSec ?? 90 },
+          alerting: cfg.alerting ?? {},
+          alerts_fired_last_7d: 0,
         }));
+        return;
+      }
+
+      if (req.method === 'PATCH' && pathname === '/control/budget') {
+        try {
+          const body = await readJsonBody(req) as Record<string, unknown>;
+          const result = budgetManager.applyGuardrailsPatch(body);
+          if (!result.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: result.error }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+          }
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid_body' }));
+        }
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/control/kills') {
+        const killsQs = url.includes('?') ? url.split('?')[1] ?? '' : '';
+        const killsParams = new URLSearchParams(killsQs);
+        const limit = Math.min(Number(killsParams.get('limit') ?? 50), 500);
+        const since = killsParams.get('since') ?? undefined;
+        const events = getKillAudit().list({ limit, since });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ events }));
         return;
       }
 
@@ -4464,11 +5345,160 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === Live stats endpoint for `relayplane watch` ===
+    if (req.method === 'GET' && pathname === '/v1/stats/live') {
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
+      const startMs = startOfDay.getTime();
+      const todayRequests = requestHistory.filter(r => new Date(r.timestamp).getTime() >= startMs);
+      const todaySpend = todayRequests.reduce((s, r) => s + r.costUsd, 0);
+
+      const modelDistribution: Record<string, number> = {};
+      for (const r of todayRequests) {
+        modelDistribution[r.targetModel] = (modelDistribution[r.targetModel] || 0) + 1;
+      }
+
+      const recentRequests = [...requestHistory].slice(-5).reverse().map(r => ({
+        model: r.targetModel,
+        cost: r.costUsd,
+        latencyMs: r.latencyMs,
+      }));
+
+      let currentSession: { cost: number; sessionId?: string } | null = null;
+      try {
+        const active = getActiveSessions();
+        if (active.length > 0) {
+          const latest = active.reduce((a, b) => (a.last_seen_at >= b.last_seen_at ? a : b));
+          currentSession = { cost: latest.total_cost_usd, sessionId: latest.id };
+        }
+      } catch { /* in-memory fallback or no sessions yet */ }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ todaySpend, currentSession, modelDistribution, recentRequests }));
+      return;
+    }
+
+    // === Test probe endpoint, seeds requestHistory for integration tests ===
+    if (req.method === 'POST' && pathname === '/v1/test/probe') {
+      const id = 'probe-' + Math.random().toString(36).slice(2, 10);
+      const entry: RequestHistoryEntry = {
+        id,
+        originalModel: 'claude-haiku-4-5',
+        targetModel: 'claude-haiku-4-5',
+        provider: 'anthropic',
+        latencyMs: 100,
+        success: true,
+        mode: 'proxy',
+        escalated: false,
+        timestamp: new Date().toISOString(),
+        tokensIn: 100,
+        tokensOut: 200,
+        costUsd: 0.001,
+        agentFingerprint: 'probetest',
+      };
+      requestHistory.push(entry);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, id }));
+      return;
+    }
+
     // === Telemetry endpoints for dashboard ===
     if (pathname.startsWith('/v1/telemetry/')) {
       const telemetryPath = pathname.replace('/v1/telemetry/', '');
       const queryString = url.includes('?') ? url.split('?')[1] ?? '' : '';
       const params = new URLSearchParams(queryString);
+
+      if (req.method === 'GET' && telemetryPath === 'breakdown') {
+        const dimension = params.get('dimension') || 'model';
+        const rawWindow = params.get('window') || '24h';
+        const windowMap: Record<string, number> = {
+          '1h': 3600000,
+          '24h': 86400000,
+          '7d': 7 * 86400000,
+          '30d': 30 * 86400000,
+        };
+        const windowKey = windowMap[rawWindow] ? rawWindow : '24h';
+        const cutoff = Date.now() - windowMap[windowKey]!;
+        const recent = requestHistory.filter(r => new Date(r.timestamp).getTime() >= cutoff);
+        const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
+
+        let rows: Array<Record<string, unknown>> = [];
+
+        if (dimension === 'agent') {
+          const agentMap = new Map<string, {
+            requests: number; input_tokens: number; output_tokens: number; cost_usd: number;
+            models: Map<string, number>;
+          }>();
+          for (const r of recent) {
+            const fp = r.agentFingerprint;
+            if (!fp || fp.startsWith('unknow')) continue;
+            const key = fp.slice(0, 8);
+            const cur = agentMap.get(key) || { requests: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0, models: new Map() };
+            cur.requests++;
+            cur.input_tokens += r.tokensIn;
+            cur.output_tokens += r.tokensOut;
+            cur.cost_usd += r.costUsd;
+            cur.models.set(r.targetModel, (cur.models.get(r.targetModel) || 0) + r.costUsd);
+            agentMap.set(key, cur);
+          }
+          rows = Array.from(agentMap.entries()).map(([fp, v]) => {
+            let topModel = '';
+            let topCost = -1;
+            for (const [m, c] of v.models) {
+              if (c > topCost) { topCost = c; topModel = m; }
+            }
+            return {
+              agent_fingerprint: fp,
+              label: null,
+              top_model: topModel,
+              requests: v.requests,
+              input_tokens: v.input_tokens,
+              output_tokens: v.output_tokens,
+              cost_usd: v.cost_usd,
+              pct_of_window_spend: totalCost > 0 ? (v.cost_usd / totalCost) * 100 : 0,
+              avg_cost_per_request: v.requests > 0 ? v.cost_usd / v.requests : 0,
+            };
+          });
+        } else {
+          const modelMap = new Map<string, {
+            provider: string; model: string; requests: number;
+            input_tokens: number; output_tokens: number; cost_usd: number;
+          }>();
+          for (const r of recent) {
+            const key = `${r.provider || 'unknown'}/${r.targetModel}`;
+            const cur = modelMap.get(key) || {
+              provider: r.provider || 'unknown', model: r.targetModel,
+              requests: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0,
+            };
+            cur.requests++;
+            cur.input_tokens += r.tokensIn;
+            cur.output_tokens += r.tokensOut;
+            cur.cost_usd += r.costUsd;
+            modelMap.set(key, cur);
+          }
+          rows = Array.from(modelMap.values()).map(v => ({
+            model_id: v.model,
+            provider: v.provider,
+            requests: v.requests,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            cost_usd: v.cost_usd,
+            pct_of_window_spend: totalCost > 0 ? (v.cost_usd / totalCost) * 100 : 0,
+            avg_cost_per_request: v.requests > 0 ? v.cost_usd / v.requests : 0,
+          }));
+        }
+
+        rows.sort((a, b) => (b.cost_usd as number) - (a.cost_usd as number));
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          rows,
+          total_cost_usd: totalCost,
+          window: windowKey,
+          generated_at: new Date().toISOString(),
+        }));
+        return;
+      }
 
       if (req.method === 'GET' && telemetryPath === 'stats') {
         const days = parseInt(params.get('days') || '7', 10);
@@ -4484,6 +5514,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           cur.cost += r.costUsd;
           modelMap.set(key, cur);
         }
+
+        // Agent breakdown (keyed by agentId; requests with no agentId are bucketed as 'unattributed')
+        const agentMap = new Map<string, { agentId: string; count: number; cost: number; lastSeen: string }>();
+        for (const r of recent) {
+          const key = r.agentId || 'unattributed';
+          const cur = agentMap.get(key) || { agentId: key, count: 0, cost: 0, lastSeen: r.timestamp };
+          cur.count++;
+          cur.cost += r.costUsd;
+          if (r.timestamp > cur.lastSeen) cur.lastSeen = r.timestamp;
+          agentMap.set(key, cur);
+        }
         
         // Daily stats
         const dailyMap = new Map<string, { requests: number; cost: number }>();
@@ -4497,7 +5538,43 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
         const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
         const totalLatency = recent.reduce((s, r) => s + r.latencyMs, 0);
-        
+        const windowStats = computeWindowStats(recent);
+        const todayStats = computeTodayStats(requestHistory);
+
+        // p95 latency over the window
+        const sortedLatencies = recent.map(r => r.latencyMs).sort((a, b) => a - b);
+        const p95Idx = sortedLatencies.length > 0
+          ? Math.min(sortedLatencies.length - 1, Math.floor(sortedLatencies.length * 0.95))
+          : 0;
+        const latencyP95 = sortedLatencies.length ? sortedLatencies[p95Idx]! : 0;
+
+        // cache hit rate: requests with cacheReadTokens > 0 / total
+        const cacheHits = recent.filter(r => (r.cacheReadTokens ?? 0) > 0).length;
+        const cacheHitRate = recent.length ? cacheHits / recent.length : 0;
+
+        // today.* summary (UTC day boundary)
+        const todayStart = new Date();
+        todayStart.setUTCHours(0, 0, 0, 0);
+        const todayCutoff = todayStart.getTime();
+        const todayRecent = recent.filter(r => new Date(r.timestamp).getTime() >= todayCutoff);
+        const todayLatencies = todayRecent.map(r => r.latencyMs).sort((a, b) => a - b);
+        const todayP95Idx = todayLatencies.length > 0
+          ? Math.min(todayLatencies.length - 1, Math.floor(todayLatencies.length * 0.95))
+          : 0;
+        const todayLatencyP95 = todayLatencies.length ? todayLatencies[todayP95Idx]! : 0;
+        const todayCost = todayRecent.reduce((s, r) => s + r.costUsd, 0);
+        const todayLatencyTotal = todayRecent.reduce((s, r) => s + r.latencyMs, 0);
+        const todayErrors = todayRecent.filter(r => !r.success).length;
+        const todayCacheHits = todayRecent.filter(r => (r.cacheReadTokens ?? 0) > 0).length;
+        const todaySummary = {
+          totalCost: todayCost,
+          totalRequests: todayRecent.length,
+          avgLatencyMs: todayRecent.length ? Math.round(todayLatencyTotal / todayRecent.length) : 0,
+          latencyP95: todayLatencyP95,
+          errorRate: todayRecent.length ? todayErrors / todayRecent.length : 0,
+          cacheHitRate: todayRecent.length ? todayCacheHits / todayRecent.length : 0,
+        };
+
         const result = {
           summary: {
             totalCostUsd: totalCost,
@@ -4509,8 +5586,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             retentionDays: HISTORY_RETENTION_DAYS,
             avgLatencyMs: recent.length ? Math.round(totalLatency / recent.length) : 0,
             successRate: recent.length ? recent.filter(r => r.success).length / recent.length : 0,
+            latencyP95,
+            cacheHitRate,
           },
+          // Dashboard redesign Phase 1: top-level latencyP95 + cacheHitRate over the days window.
+          latencyP95: windowStats.latencyP95,
+          cacheHitRate: windowStats.cacheHitRate,
+          // Always-present "today" UTC summary, independent of the days window param.
+          // Includes todaySummary fields (from main) merged with todayStats (from HEAD).
+          today: { ...todaySummary, ...todayStats },
           byModel: Array.from(modelMap.entries()).map(([, v]) => ({ model: v.model, provider: v.provider, count: v.count, costUsd: v.cost, savings: 0 })),
+          byAgent: Array.from(agentMap.values()).map(v => ({ agentId: v.agentId, count: v.count, costUsd: v.cost, lastSeen: v.lastSeen })),
           dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({ date, costUsd: v.cost, requests: v.requests })),
         };
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4521,9 +5607,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (req.method === 'GET' && telemetryPath === 'runs') {
         const limit = parseInt(params.get('limit') || '50', 10);
         const offset = parseInt(params.get('offset') || '0', 10);
+        const sessionIdFilter = params.get('session_id');
         const sorted = [...requestHistory].reverse();
-        const runs = sorted.slice(offset, offset + limit).map(r => {
-          // Savings should reflect routing decisions only — pass same cache tokens to baseline
+        const filtered = sessionIdFilter ? sorted.filter(r => r.agentId === sessionIdFilter) : sorted;
+        const runs = filtered.slice(offset, offset + limit).map(r => {
+          // Savings should reflect routing decisions only - pass same cache tokens to baseline
           // so the cache discount doesn't get counted as "savings from routing"
           const origCost = estimateCost('claude-opus-4-6', r.tokensIn, r.tokensOut, r.cacheCreationTokens || undefined, r.cacheReadTokens || undefined);
           const perRunSavings = Math.max(0, origCost - r.costUsd);
@@ -4553,6 +5641,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             statusCode: r.statusCode ?? null,
             agentFingerprint: r.agentFingerprint ?? null,
             agentId: r.agentId ?? null,
+            routing_rule: r.routing_rule ?? null,
+            routing_reason: r.routing_reason ?? null,
             requestContent: r.requestContent ? {
               systemPrompt: r.requestContent.systemPrompt,
               userMessage: r.requestContent.userMessage,
@@ -4562,7 +5652,101 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           };
         });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ runs, pagination: { total: requestHistory.length } }));
+        res.end(JSON.stringify({ runs, pagination: { total: filtered.length } }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'spend-by-hour') {
+        const dayParam = params.get('day');
+        const parsed = parseDayParam(dayParam);
+        if (!parsed.ok) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'day must be YYYY-MM-DD' }));
+          return;
+        }
+        const buckets = computeSpendByHour(requestHistory, parsed.dayStart, parsed.dayEnd);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ day: dayParam, buckets }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'providers') {
+        const rawDays = parseInt(params.get('days') || '7', 10);
+        const provDays = Number.isFinite(rawDays) && rawDays > 0 ? rawDays : 7;
+        const rollup = computeProvidersRollup(requestHistory, provDays);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ providers: rollup }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'providers') {
+        // /v1/telemetry/providers?days=N: per-provider rollup with p95Ms latency.
+        const days = parseInt(params.get('days') || '7', 10);
+        const cutoff = Date.now() - days * 86400000;
+        const recent = requestHistory.filter(r => new Date(r.timestamp).getTime() >= cutoff);
+        const totalReqs = recent.length;
+        const windowMinutes = Math.max(1, days * 24 * 60);
+        const byProv = new Map<string, { count: number; lats: number[]; errs: number }>();
+        for (const r of recent) {
+          const key = r.provider || 'unknown';
+          const cur = byProv.get(key) || { count: 0, lats: [], errs: 0 };
+          cur.count++;
+          cur.lats.push(r.latencyMs);
+          if (!r.success) cur.errs++;
+          byProv.set(key, cur);
+        }
+        let primary = '';
+        let primaryCount = -1;
+        for (const [k, v] of byProv) {
+          if (v.count > primaryCount) { primaryCount = v.count; primary = k; }
+        }
+        const records = Array.from(byProv.entries()).map(([provider, v]) => {
+          const sorted = v.lats.sort((a, b) => a - b);
+          const idx = sorted.length ? Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95)) : 0;
+          const p95Ms = sorted.length ? sorted[idx]! : 0;
+          const errRate = v.count ? v.errs / v.count : 0;
+          const health = errRate < 0.05 ? 'ok' : errRate < 0.2 ? 'degraded' : 'down';
+          return {
+            provider,
+            share: totalReqs ? v.count / totalReqs : 0,
+            p95Ms,
+            rpm: v.count / windowMinutes,
+            health,
+            primary: provider === primary,
+            note: '',
+          };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ providers: records, days, generated_at: new Date().toISOString() }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'spend-by-hour') {
+        // /v1/telemetry/spend-by-hour?day=YYYY-MM-DD: 24 hourly buckets in UTC.
+        const day = params.get('day') || '';
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_day', message: 'day must be YYYY-MM-DD' }));
+          return;
+        }
+        const dayStart = Date.parse(`${day}T00:00:00Z`);
+        if (Number.isNaN(dayStart)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_day' }));
+          return;
+        }
+        const dayEnd = dayStart + 86400000;
+        const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, costUsd: 0, requests: 0 }));
+        for (const r of requestHistory) {
+          const t = new Date(r.timestamp).getTime();
+          if (t < dayStart || t >= dayEnd) continue;
+          const h = Math.floor((t - dayStart) / 3600000);
+          if (h < 0 || h > 23) continue;
+          buckets[h]!.costUsd += r.costUsd;
+          buckets[h]!.requests++;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ day, buckets }));
         return;
       }
 
@@ -4570,13 +5754,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         // Routing savings: cost at same model with no cache vs actual cost
         // Cache savings: what cache hits saved vs paying full input price
         // Baseline: each request at full input price (no cache, no routing)
+        const savingsDays = parseInt(params.get('days') || '7', 10);
+        const savingsCutoff = Date.now() - savingsDays * 86400000;
+        const savingsHistory = requestHistory.filter(r => new Date(r.timestamp).getTime() >= savingsCutoff);
         let totalActualCost = 0;
         let totalCacheSavings = 0;   // savings from cache hits (Anthropic feature)
         let totalRoutingSavings = 0; // savings from routing to cheaper model
         let hasAnthropicCalls = false;
         const byDayMap = new Map<string, { savedAmount: number; originalCost: number; actualCost: number }>();
 
-        for (const r of requestHistory) {
+        for (const r of savingsHistory) {
           const actualCost = r.costUsd;
           totalActualCost += actualCost;
 
@@ -4651,7 +5838,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         
         const providers: Array<{ provider: string; status: string; latency: number; successRate: number; lastChecked: string }> = [];
         for (const [name, ep] of Object.entries(DEFAULT_ENDPOINTS)) {
-          // Skip Ollama from normal key-based health check — it's handled separately
+          // Skip Ollama from normal key-based health check - it's handled separately
           if (name === 'ollama') continue;
           const hasKey = !!process.env[ep.apiKeyEnv];
           const stats = providerStats[name.toLowerCase()];
@@ -4698,7 +5885,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // === Agent tracking API ===
-    // === /api/runs/:id — full request/response content for a single run ===
+    // === /api/runs/:id - full request/response content for a single run ===
     const runsIdMatch = pathname.match(/^\/api\/runs\/(.+)$/);
     if (req.method === 'GET' && runsIdMatch) {
       const runId = runsIdMatch[1];
@@ -4757,15 +5944,56 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // === Dashboard ===
-    if (req.method === 'GET' && (pathname === '/' || pathname === '/dashboard')) {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(getDashboardHTML());
-      return;
-    }
+    // New Vite-built static bundle lives at dist/dashboard/ (built from packages/proxy/dashboard).
+    // ?classic=1 falls back to the legacy inlined HTML during transition.
+    if ((req.method === 'GET' || req.method === 'HEAD') && (pathname === '/' || pathname === '/dashboard' || pathname.startsWith('/dashboard/'))) {
+      const dashQuery = url.includes('?') ? url.split('?')[1] ?? '' : '';
+      const isClassic = new URLSearchParams(dashQuery).get('classic') === '1';
+      const distDir = path.resolve(__dirname, '../dist/dashboard');
+      const indexHtmlPath = path.join(distDir, 'index.html');
+      const hasBuild = fs.existsSync(indexHtmlPath);
 
-    if (req.method === 'GET' && pathname === '/dashboard/config') {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(getConfigDashboardHTML());
+      if (pathname === '/dashboard/config') {
+        res.writeHead(302, { Location: '/#config' });
+        res.end();
+        return;
+      }
+
+      if (isClassic || !hasBuild) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(getDashboardHTML());
+        return;
+      }
+
+      // Serve static assets under /dashboard/assets/* and other built files.
+      if (pathname.startsWith('/dashboard/') && pathname !== '/dashboard/') {
+        const rel = pathname.slice('/dashboard/'.length);
+        const filePath = path.normalize(path.join(distDir, rel));
+        if (!filePath.startsWith(distDir)) {
+          res.writeHead(403); res.end(); return;
+        }
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+          const ext = path.extname(filePath).toLowerCase();
+          const ctype =
+            ext === '.js' ? 'application/javascript' :
+            ext === '.css' ? 'text/css' :
+            ext === '.svg' ? 'image/svg+xml' :
+            ext === '.png' ? 'image/png' :
+            ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+            ext === '.woff2' ? 'font/woff2' :
+            ext === '.woff' ? 'font/woff' :
+            ext === '.json' ? 'application/json' :
+            ext === '.html' ? 'text/html' :
+            'application/octet-stream';
+          res.writeHead(200, { 'Content-Type': ctype, 'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600' });
+          fs.createReadStream(filePath).pipe(res);
+          return;
+        }
+      }
+
+      // SPA entry: serve index.html for / and /dashboard.
+      res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' });
+      res.end(fs.readFileSync(indexHtmlPath, 'utf8'));
       return;
     }
 
@@ -4773,6 +6001,42 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     if (req.method === 'GET' && pathname === '/v1/token-pool/status') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getTokenPool().getStatus()));
+      return;
+    }
+
+    // === Credential pool health (usage-aware failover pool) ===
+    if (req.method === 'GET' && pathname === '/v1/credential-pool/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        enabled: _credentialPool !== null,
+        tenant: _credentialPoolTenant,
+        accounts: _credentialPool ? _credentialPool.getHealth() : [],
+      }));
+      return;
+    }
+
+    // === Tier endpoint ===
+    if (req.method === 'GET' && (pathname === '/v1/tier')) {
+      const qIdx = url.indexOf('?');
+      const searchParams = new URLSearchParams(qIdx >= 0 ? url.slice(qIdx + 1) : '');
+      const mockTier = searchParams.get('mock');
+      if (mockTier === 'mesh' || mockTier === 'free') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tier: mockTier, anthropicAccountCount: mockTier === 'mesh' ? 2 : 0 }));
+        return;
+      }
+      try {
+        const configMod = await import('./config.js') as Record<string, unknown>;
+        const loader = (configMod['loadUserConfig'] ?? configMod['loadConfig']) as (() => unknown) | undefined;
+        const cfg = loader ? loader() : {};
+        const accounts = (cfg as { providers?: { anthropic?: { accounts?: unknown[] } } })?.providers?.anthropic?.accounts ?? [];
+        const count = Array.isArray(accounts) ? accounts.length : 0;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tier: count > 1 ? 'mesh' : 'free', anthropicAccountCount: count }));
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tier: 'free', anthropicAccountCount: 0 }));
+      }
       return;
     }
 
@@ -4937,6 +6201,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         active: s.last_seen_at >= activeCutoff,
         duration_ms: s.last_seen_at - s.started_at,
         model_mix: modelMixMap.get(s.id) ?? {},
+        total_savings_usd: computeSessionSavings(s.id, requestHistory),
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ sessions: result, total: result.length }));
@@ -5033,7 +6298,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
-    // === Memory endpoints (Session 4 — localhost-only) ===
+    // === Memory endpoints (Session 4 - localhost-only) ===
     if ((pathname ?? '').startsWith('/v1/memory')) {
       const remoteAddr = req.socket.remoteAddress;
       if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
@@ -5145,13 +6410,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     const recordTelemetry = relayplaneEnabled && !relayplaneBypass;
 
     // === Token pool: auto-detect incoming token ===
-    {
-      const incomingToken = ctx.authHeader
-        ? ctx.authHeader.replace(/^Bearer\s+/i, '')
-        : ctx.apiKeyHeader;
-      if (incomingToken) {
-        getTokenPool().autoDetect(incomingToken);
-      }
+    const incomingToken = ctx.authHeader
+      ? ctx.authHeader.replace(/^Bearer\s+/i, '')
+      : ctx.apiKeyHeader;
+    if (incomingToken) {
+      getTokenPool().autoDetect(incomingToken);
     }
 
     // Determine which Anthropic auth to use based on mode.
@@ -5159,13 +6422,37 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // the pool and use it as the effective key (overrides env and passthrough).
     let useAnthropicEnvKey: string | undefined;
     let _poolSelectedToken: string | undefined; // tracks the token chosen from the pool for this request
-    if (getTokenPool().size() > 0) {
-      const poolToken = getTokenPool().selectToken();
+    let _credSelectedId: string | undefined;    // credential-pool id backing _poolSelectedToken (if pool active)
+    const _isNativeMessages = req.method === 'POST' && (url.endsWith('/v1/messages') || url.includes('/v1/messages?'));
+    if (_credentialPool && _credentialPoolTenant) {
+      // Usage-aware credential pool is the Anthropic selection authority.
+      // Elite (reserve-Fable) can only be known once the model is resolved, so
+      // select non-elite here; the native path re-selects if it routes to Fable.
+      const cred = _credentialPool.selectCredential(_credentialPoolTenant, { elite: false });
+      if (cred) {
+        const token = _credentialPool.resolveToken(cred);
+        if (token) {
+          _poolSelectedToken = token;
+          _credSelectedId = cred.id;
+          useAnthropicEnvKey = token;
+          // Defer usage accounting for the native path (records with the real
+          // elite flag after model resolution); count other paths now.
+          if (!_isNativeMessages) _credentialPool.recordUsage(cred.id, { elite: false });
+        } else {
+          log(`[CredentialPool] selected "${cred.id}" but token did not resolve; falling back`);
+          useAnthropicEnvKey = anthropicAuthMode === 'passthrough' ? undefined : anthropicEnvKey;
+        }
+      } else {
+        // Every account cooled down - fall back to normal resolution.
+        useAnthropicEnvKey = anthropicAuthMode === 'passthrough' ? undefined : anthropicEnvKey;
+      }
+    } else if (getTokenPool().size() > 0) {
+      const poolToken = getTokenPool().selectToken(Date.now(), incomingToken);
       if (poolToken) {
         _poolSelectedToken = poolToken.apiKey;
         useAnthropicEnvKey = poolToken.apiKey;
       } else {
-        // All tokens exhausted — fall back to normal resolution
+        // All tokens exhausted - fall back to normal resolution
         useAnthropicEnvKey = anthropicAuthMode === 'passthrough' ? undefined : anthropicEnvKey;
       }
     } else if (anthropicAuthMode === 'env') {
@@ -5174,7 +6461,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       useAnthropicEnvKey = undefined; // Only use incoming auth
     } else {
       // 'auto': Use incoming auth if present, fallback to env
-      // ALWAYS keep env key available — OAuth (sk-ant-oat) doesn't work for all models (e.g. Haiku)
+      // ALWAYS keep env key available - OAuth (sk-ant-oat) doesn't work for all models (e.g. Haiku)
       useAnthropicEnvKey = anthropicEnvKey;
     }
 
@@ -5224,7 +6511,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       let routingSuffix = parsedModel.suffix;
       requestedModel = parsedModel.baseModel;
 
-      // ── CAP 3: Deterministic Traces — allocate traceId + emit request.start ──
+      // ── CAP 3: Deterministic Traces - allocate traceId + emit request.start ──
       const nativeTraceId = randomUUID();
       {
         const tw = TraceWriter.getInstance();
@@ -5313,7 +6600,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // KEY: When routing.mode is "auto", ALWAYS classify and route based on complexity,
       // even when the user sends a specific model like "claude-opus-4-6".
       // This is the core UX: user flips routing.mode to "auto" and the proxy handles the rest.
-      if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
+      // EXCEPTION: never override when the caller explicitly opted out via
+      // X-RelayPlane-Bypass. That header is a documented, unambiguous signal
+      // to honor passthrough as-is, not a vague/generic model name to reinterpret.
+      // EXCEPTION 2: never override when the caller named a real, concrete,
+      // non-default model (resolveExplicitModel succeeds and it's not just
+      // the configured simple/moderate default), that's a literal choice to
+      // honor, not a generic/placeholder name to reinterpret.
+      if (
+        shouldOverridePassthroughToAuto(
+          routingMode,
+          proxyConfig.routing?.mode,
+          relayplaneBypass,
+          requestedModel,
+          proxyConfig.routing?.complexity
+        )
+      ) {
         routingMode = 'auto';
         log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
       }
@@ -5373,7 +6675,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       let confidence = 0;
       let complexity: Complexity = 'simple';
 
-      // Always classify — needed for taskType display, telemetry, and routing decisions
+      // Always classify - needed for taskType display, telemetry, and routing decisions
       // even in passthrough mode we want accurate task type data
       if (messages.length > 0) {
         promptText = extractMessageText(messages);
@@ -5518,7 +6820,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (
         proxyConfig.reliability?.cooldowns?.enabled &&
         !useCascade &&
-        !cooldownManager.isAvailable(targetProvider)
+        !cooldownManager.isAvailable(cooldownKey(targetProvider, ctx.authHeader))
       ) {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: `Provider ${targetProvider} is temporarily cooled down` }));
@@ -5659,7 +6961,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // ── End tool authorization check ──
 
       // ── Rate limit check ──
-      const workspaceId = 'local'; // Local proxy uses single workspace
+      // Fold the account into the workspace id (same rationale as cooldownKey,
+      // see 2026-07-05): in Authorization-passthrough mode this proxy serves
+      // multiple distinct accounts, and without an account-specific key one
+      // heavily-used account's requests fill the shared rpm bucket that a
+      // fresh, unrelated account also depends on.
+      const workspaceId = cooldownKey('local', ctx.authHeader);
       try {
         // Pass targetProvider so per-provider limits are applied and limits don't
         // cascade across providers (e.g. Anthropic hitting its cap won't block OpenAI).
@@ -5700,7 +7007,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (resolved.provider !== 'anthropic') {
                 throw new Error(`Cascade model ${modelName} is not Anthropic-compatible`);
               }
-              if (proxyConfig.reliability?.cooldowns?.enabled && !cooldownManager.isAvailable(resolved.provider)) {
+              if (proxyConfig.reliability?.cooldowns?.enabled && !cooldownManager.isAvailable(cooldownKey(resolved.provider, ctx.authHeader))) {
                 throw new CooldownError(resolved.provider);
               }
               let attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
@@ -5729,12 +7036,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               const responseData = (await providerResponse.json()) as Record<string, unknown>;
               if (!providerResponse.ok) {
                 if (proxyConfig.reliability?.cooldowns?.enabled) {
-                  cooldownManager.recordFailure(resolved.provider, JSON.stringify(responseData));
+                  cooldownManager.recordFailure(cooldownKey(resolved.provider, ctx.authHeader), JSON.stringify(responseData));
                 }
                 throw new ProviderResponseError(providerResponse.status, responseData);
               }
               if (proxyConfig.reliability?.cooldowns?.enabled) {
-                cooldownManager.recordSuccess(resolved.provider);
+                cooldownManager.recordSuccess(cooldownKey(resolved.provider, ctx.authHeader));
               }
               return { responseData, provider: resolved.provider, model: resolved.model };
             },
@@ -5755,6 +7062,28 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         } else {
           // Hybrid auth: use MAX token for Opus models, API key for others
           const finalModel = targetModel || requestedModel;
+
+          // Credential pool: reserve-Fable. Now that the model is resolved, if
+          // this request routes to the elite (Fable) tier, re-select with
+          // elite=true to avoid an account low on Fable weekly headroom. Record
+          // usage here with the real elite flag (deferred from early selection).
+          if (_credentialPool && _credentialPoolTenant && _credSelectedId) {
+            const _elite = isEliteModelName(finalModel);
+            if (_elite) {
+              const _eliteCred = _credentialPool.selectCredential(_credentialPoolTenant, { elite: true });
+              if (_eliteCred && _eliteCred.id !== _credSelectedId) {
+                const _eliteToken = _credentialPool.resolveToken(_eliteCred);
+                if (_eliteToken) {
+                  log(`[CredentialPool] elite request: reserving Fable, ${_credSelectedId} -> ${_eliteCred.id}`);
+                  _poolSelectedToken = _eliteToken;
+                  _credSelectedId = _eliteCred.id;
+                  useAnthropicEnvKey = _eliteToken;
+                }
+              }
+            }
+            _credentialPool.recordUsage(_credSelectedId, { elite: _elite });
+          }
+
           const modelAuth = getAuthForModel(finalModel, proxyConfig.auth, useAnthropicEnvKey);
           if (modelAuth.isMax) {
             log(`Using MAX token for ${finalModel}`);
@@ -5764,16 +7093,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (isRerouted) {
             log(`Rerouted: ${originalModel} → ${finalModel} (auth fallback enabled)`);
           }
-          // Build pool-aware context: when the pool is managing auth, clear incoming
-          // auth headers so buildAnthropicHeadersWithAuth uses the pool token instead.
-          const _nativeReqCtx: RequestContext = _poolSelectedToken
-            ? { ...effectiveCtx, authHeader: undefined, apiKeyHeader: undefined }
-            : effectiveCtx;
-
           // Strip thinking from body when routing to (or from) Haiku models.
           // Haiku does not support extended thinking. Also strip when the original
           // requested model was Haiku but routing.mode overrode it to a different
-          // model — the user's intent was a non-thinking model, so thinking params
+          // model - the user's intent was a non-thinking model, so thinking params
           // (which may also be malformed, e.g. budget_tokens < 1024) should be dropped.
           let _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
           if ((isHaikuModel(finalModel) || isHaikuModel(requestedModel)) && 'thinking' in _nativeReqBody) {
@@ -5782,6 +7105,29 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             _strippedThinking = true;
             log(`Stripped thinking from request (${finalModel} does not support extended thinking, originally requested: ${requestedModel})`);
           }
+
+          // Strip the clear_thinking_20251015 thinking strategy beta flag for Haiku
+          // when thinking is not enabled/adaptive. The Anthropic API rejects Haiku
+          // requests carrying this strategy without thinking on with a 400:
+          //   "clear_thinking_20251015 strategy requires thinking to be enabled or adaptive".
+          // See CLEAR_THINKING_STRATEGY_FLAG.
+          if (isHaikuModel(finalModel) || isHaikuModel(requestedModel)) {
+            if (!hasThinkingEnabledOrAdaptive(_nativeReqBody) && effectiveCtx.betaHeaders && effectiveCtx.betaHeaders.includes(CLEAR_THINKING_STRATEGY_FLAG)) {
+              const _filteredBeta = effectiveCtx.betaHeaders
+                .split(',')
+                .map(b => b.trim())
+                .filter(b => b !== CLEAR_THINKING_STRATEGY_FLAG)
+                .join(',');
+              effectiveCtx = { ...effectiveCtx, betaHeaders: _filteredBeta || undefined };
+              log(`Stripped clear_thinking_20251015 thinking strategy from anthropic-beta header (${finalModel} does not have thinking enabled)`);
+            }
+          }
+
+          // Build pool-aware context: when the pool is managing auth, clear incoming
+          // auth headers so buildAnthropicHeadersWithAuth uses the pool token instead.
+          const _nativeReqCtx: RequestContext = _poolSelectedToken
+            ? { ...effectiveCtx, authHeader: undefined, apiKeyHeader: undefined }
+            : effectiveCtx;
 
           // Log OAT beta flag stripping if applicable
           const _nativeEffectiveToken = _poolSelectedToken
@@ -5805,8 +7151,35 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             isRerouted
           );
 
-          // Token pool: on 429, record and retry with next available token
-          if (providerResponse.status === 429 && _poolSelectedToken) {
+          // Credential pool: on 429/401, cool the failed account and fail over to
+          // the next available one (this is the both-account stale-token guard -
+          // a dead second-account token 401s and we move on without a hard fail).
+          if (
+            (providerResponse.status === 429 || providerResponse.status === 401) &&
+            _credentialPool && _credentialPoolTenant && _credSelectedId
+          ) {
+            _credentialPool.recordFailure(_credSelectedId, providerResponse.status === 429 ? 429 : 401);
+            const _elite = isEliteModelName(finalModel);
+            const _next = _credentialPool.selectCredential(_credentialPoolTenant, { elite: _elite });
+            if (_next && _next.id !== _credSelectedId) {
+              const _nextToken = _credentialPool.resolveToken(_next);
+              if (_nextToken) {
+                log(`[CredentialPool] ${providerResponse.status} on "${_credSelectedId}" - failing over to "${_next.id}"`);
+                _poolSelectedToken = _nextToken;
+                _credSelectedId = _next.id;
+                _credentialPool.recordUsage(_next.id, { elite: _elite });
+                const _retryCtx: RequestContext = { ...ctx, authHeader: undefined, apiKeyHeader: undefined };
+                providerResponse = await forwardNativeAnthropicRequest(
+                  _nativeReqBody,
+                  _retryCtx,
+                  _nextToken,
+                  _nextToken.startsWith('sk-ant-oat'),
+                  isRerouted,
+                );
+              }
+            }
+          } else if (providerResponse.status === 429 && _poolSelectedToken) {
+            // Token pool: on 429, record and retry with next available token
             const _poolRetryAfterHeader = providerResponse.headers.get('retry-after');
             const _poolRetryAfterS = _poolRetryAfterHeader ? parseInt(_poolRetryAfterHeader, 10) : undefined;
             getTokenPool().record429(
@@ -5815,7 +7188,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             );
             const _nextPoolToken = getTokenPool().selectToken();
             if (_nextPoolToken) {
-              log(`[TokenPool] 429 on token …${_poolSelectedToken.slice(-8)} — retrying with "${_nextPoolToken.label}"`);
+              log(`[TokenPool] 429 on token …${_poolSelectedToken.slice(-8)} - retrying with "${_nextPoolToken.label}"`);
               _poolSelectedToken = _nextPoolToken.apiKey;
               const _retryCtx: RequestContext = { ...ctx, authHeader: undefined, apiKeyHeader: undefined };
               providerResponse = await forwardNativeAnthropicRequest(
@@ -5828,17 +7201,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             }
           }
 
-          // Token pool: learn rate limits from upstream response headers
-          if (_poolSelectedToken && providerResponse.ok) {
-            const _upstreamHeaders: Record<string, string | undefined> = {};
-            providerResponse.headers.forEach((v, k) => { _upstreamHeaders[k] = v; });
-            getTokenPool().recordResponseHeaders(_poolSelectedToken, _upstreamHeaders);
+          // Pool success: record the win (credential pool) and learn rate limits
+          // from upstream headers (token pool).
+          if (providerResponse.ok) {
+            if (_credentialPool && _credSelectedId) {
+              _credentialPool.recordSuccess(_credSelectedId);
+            }
+            if (_poolSelectedToken) {
+              const _upstreamHeaders: Record<string, string | undefined> = {};
+              providerResponse.headers.forEach((v, k) => { _upstreamHeaders[k] = v; });
+              getTokenPool().recordResponseHeaders(_poolSelectedToken, _upstreamHeaders);
+            }
           }
 
           if (!providerResponse.ok) {
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
             if (proxyConfig.reliability?.cooldowns?.enabled) {
-              cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
+              cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), JSON.stringify(errorPayload));
             }
 
             // ── Cross-provider cascade for /v1/messages path (GH #38) ──
@@ -5877,7 +7256,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               );
 
               if (cascResult.success && cascData) {
-                // Cascade succeeded — update provider/model and respond
+                // Cascade succeeded - update provider/model and respond
                 const cascDurationMs = Date.now() - startTime;
                 const cascProvider = cascResult.provider as Provider;
                 const cascModel = cascResult.model;
@@ -5903,7 +7282,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 res.end(JSON.stringify(cascData));
                 return;
               }
-              // All fallbacks exhausted — fall through to original error response
+              // All fallbacks exhausted - fall through to original error response
             }
             // ── End cross-provider cascade ──
 
@@ -5926,7 +7305,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             return;
           }
           if (proxyConfig.reliability?.cooldowns?.enabled) {
-            cooldownManager.recordSuccess(targetProvider);
+            cooldownManager.recordSuccess(cooldownKey(targetProvider, ctx.authHeader));
           }
 
           if (isStreaming) {
@@ -6055,7 +7434,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           taskType, complexity
         );
 
-        // Always extract and persist token counts — this is what the telemetry endpoints read
+        // Always extract and persist token counts - this is what the telemetry endpoints read
         // nativeResponseData holds response JSON for non-streaming, or { usage: { input_tokens, output_tokens } }
         // synthesised from SSE events for streaming
         const nativeUsageData = (nativeResponseData as any)?.usage;
@@ -6112,7 +7491,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           });
         } catch { /* never block hot path */ }
 
-        // ── CAP 3: Deterministic Traces — emit request.end + finalize ──
+        // ── CAP 3: Deterministic Traces - emit request.end + finalize ──
         {
           const tw = TraceWriter.getInstance();
           if (tw.isEnabled() && recordTelemetry) {
@@ -6154,7 +7533,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               model: `${targetProvider}:${targetModel || requestedModel}`,
             })
             .then((runResult) => {
-              // Backfill token/cost data — relay.run() has no adapters so records NULLs
+              // Backfill token/cost data - relay.run() has no adapters so records NULLs
               relay.patchRunTokens(runResult.runId, nativeTokIn, nativeTokOut, nativeCostUsd);
             })
             .catch(() => {});
@@ -6184,7 +7563,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           nativeAgentFingerprint, nativeExplicitAgentId,
           catchErrMsg, catchErrStatus
         );
-        // ── CAP 3: Deterministic Traces — emit request.end (error) + finalize ──
+        // ── CAP 3: Deterministic Traces - emit request.end (error) + finalize ──
         {
           const tw = TraceWriter.getInstance();
           if (tw.isEnabled() && recordTelemetry) {
@@ -6218,7 +7597,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       log('Pre-flight estimate request');
 
       // --- Per-IP rate limit: 60 requests/minute ---
-      // Fix B: Use only the raw socket address — never x-forwarded-for.
+      // Fix B: Use only the raw socket address - never x-forwarded-for.
       // x-forwarded-for is a client-controlled header and is trivially spoofed;
       // any attacker can send "X-Forwarded-For: 1.2.3.4" to bypass per-IP limits.
       // The socket remoteAddress reflects the actual TCP connection and cannot be faked.
@@ -6339,7 +7718,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       chatAgentFingerprint = agentResult.fingerprint;
     }
 
-    // ── CAP 3: Deterministic Traces — allocate chatTraceId + emit request.start ──
+    // ── CAP 3: Deterministic Traces - allocate chatTraceId + emit request.start ──
     const chatTraceId = randomUUID();
     {
       const tw = TraceWriter.getInstance();
@@ -6491,7 +7870,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // KEY: When routing.mode is "auto", "complexity", or "cascade", ALWAYS classify and route,
     // even when the user sends a specific model like "claude-opus-4-6".
     // This is the core UX: user flips routing.mode and the proxy handles the rest.
-    if (routingMode === 'passthrough' && (proxyConfig.routing?.mode === 'auto' || proxyConfig.routing?.mode === 'complexity' || proxyConfig.routing?.mode === 'cascade')) {
+    // EXCEPTION: never override when the caller explicitly opted out via
+    // X-RelayPlane-Bypass. That header is a documented, unambiguous signal
+    // to honor passthrough as-is, not a vague/generic model name to reinterpret.
+    // EXCEPTION 2: never override when the caller named a real, concrete,
+    // non-default model (resolveExplicitModel succeeds and it's not just
+    // the configured simple/moderate default), that's a literal choice to
+    // honor, not a generic/placeholder name to reinterpret.
+    if (
+      shouldOverridePassthroughToAuto(
+        routingMode,
+        proxyConfig.routing?.mode,
+        bypassRouting,
+        requestedModel,
+        proxyConfig.routing?.complexity
+      )
+    ) {
       routingMode = 'auto';
       log(`Config routing.mode=${proxyConfig.routing?.mode}: overriding passthrough → auto for model ${requestedModel}`);
     }
@@ -6503,7 +7897,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     let confidence = 0;
     let complexity: Complexity = 'simple';
 
-    // Always classify — taskType is needed for display, routing decisions, and telemetry
+    // Always classify - taskType is needed for display, routing decisions, and telemetry
     if (request.messages && request.messages.length > 0) {
       promptText = extractPromptText(request.messages);
       taskType = inferTaskType(promptText);
@@ -6602,7 +7996,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
-    // Guard: Sonnet 200K context limit — upgrade to Opus for large contexts
+    // Guard: Sonnet 200K context limit - upgrade to Opus for large contexts
     if (
       targetProvider === 'anthropic' &&
       targetModel.includes('sonnet') &&
@@ -6650,12 +8044,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // ── defaultProvider: override provider for all non-cascade cloud routing ──
     // When set, ALL models route to this provider regardless of model prefix.
-    // Ollama is excluded — local routing takes priority over defaultProvider.
+    // Ollama is excluded - local routing takes priority over defaultProvider.
     if (proxyConfig.defaultProvider && !useCascade && targetProvider !== 'ollama') {
       const originalProvider = targetProvider;
       targetProvider = proxyConfig.defaultProvider as Provider;
       // When routing to OpenRouter (or any aggregator), model names need provider prefixes.
-      // Complexity routing produces bare names like 'claude-sonnet-4-6' — OpenRouter needs
+      // Complexity routing produces bare names like 'claude-sonnet-4-6' - OpenRouter needs
       // 'anthropic/claude-sonnet-4-6'. Passthrough mode preserves the original request model,
       // but strips any leading provider-prefix that matches the defaultProvider
       // (e.g. "openrouter/anthropic/claude-opus-4.6" → "anthropic/claude-opus-4.6").
@@ -6679,7 +8073,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     const cooldownsEnabled = proxyConfig.reliability?.cooldowns?.enabled === true;
-    if (!useCascade && cooldownsEnabled && !cooldownManager.isAvailable(targetProvider)) {
+    if (!useCascade && cooldownsEnabled && !cooldownManager.isAvailable(cooldownKey(targetProvider, ctx.authHeader))) {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: `Provider ${targetProvider} is temporarily cooled down` }));
       return;
@@ -6716,7 +8110,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // ── End budget check ──
 
     // ── Rate limit check ──
-    const chatWorkspaceId = 'local'; // Local proxy uses single workspace
+    // Same account-aware key as the primary request path above.
+    const chatWorkspaceId = cooldownKey('local', ctx.authHeader);
     try {
       // Pass targetProvider so per-provider limits apply and don't cascade across providers.
       await acquireSlot(chatWorkspaceId, targetModel, targetProvider);
@@ -6778,7 +8173,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               if (!resolved) {
                 throw new Error(`Invalid cascade model: ${modelName}`);
               }
-              if (cooldownsEnabled && !cooldownManager.isAvailable(resolved.provider)) {
+              if (cooldownsEnabled && !cooldownManager.isAvailable(cooldownKey(resolved.provider, ctx.authHeader))) {
                 throw new CooldownError(resolved.provider);
               }
               const apiKeyResult = resolveProviderApiKey(resolved.provider, ctx, useAnthropicEnvKey);
@@ -6794,12 +8189,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               );
               if (!result.ok) {
                 if (cooldownsEnabled) {
-                  cooldownManager.recordFailure(resolved.provider, JSON.stringify(result.responseData));
+                  cooldownManager.recordFailure(cooldownKey(resolved.provider, ctx.authHeader), JSON.stringify(result.responseData));
                 }
                 throw new ProviderResponseError(result.status, result.responseData);
               }
               if (cooldownsEnabled) {
-                cooldownManager.recordSuccess(resolved.provider);
+                cooldownManager.recordSuccess(cooldownKey(resolved.provider, ctx.authHeader));
               }
               return { responseData: result.responseData, provider: resolved.provider, model: resolved.model };
             },
@@ -6846,7 +8241,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             });
           } catch { /* never block hot path */ }
 
-          // ── CAP 3: Deterministic Traces — emit request.end + finalize (chat cascade) ──
+          // ── CAP 3: Deterministic Traces - emit request.end + finalize (chat cascade) ──
           {
             const tw = TraceWriter.getInstance();
             if (tw.isEnabled() && recordTelemetry) {
@@ -6875,7 +8270,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 taskType,
                 model: `${cascadeResult.provider}:${cascadeResult.model}`,
               });
-              // Backfill token/cost data — relay.run() has no adapters so records NULLs
+              // Backfill token/cost data - relay.run() has no adapters so records NULLs
               relay.patchRunTokens(runResult.runId, cascadeTokensIn, cascadeTokensOut, cascadeCost);
               responseData['_relayplane'] = {
                 runId: runResult.runId,
@@ -7007,7 +8402,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (watchdogFailures >= WATCHDOG_MAX_FAILURES) {
         console.error('[RelayPlane] CRITICAL: 3 consecutive watchdog failures. Attempting graceful restart...');
         sdNotify('STOPPING=1');
-        // Close server and exit — systemd Restart=always will restart us
+        // Close server and exit - systemd Restart=always will restart us
         server.close(() => {
           process.exit(1);
         });
@@ -7038,7 +8433,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       console.log(`  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality`);
       if (proxyConfig.defaultProvider) {
         console.log(`  Providers:`);
-        console.log(`    ✓ ${proxyConfig.defaultProvider.charAt(0).toUpperCase() + proxyConfig.defaultProvider.slice(1)} (default provider — all models route here)`);
+        console.log(`    ✓ ${proxyConfig.defaultProvider.charAt(0).toUpperCase() + proxyConfig.defaultProvider.slice(1)} (default provider - all models route here)`);
       }
       console.log(`  Auth: Passthrough for Anthropic, env vars for other providers`);
       console.log(`  Streaming: ✅ Enabled`);
@@ -7049,7 +8444,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // Use setImmediate to ensure it runs after startup logs are printed.
       setImmediate(() => sendPing('startup'));
 
-      // Policy nudge — check once, 5 seconds after startup, only if nudge conditions met
+      // Policy nudge - check once, 5 seconds after startup, only if nudge conditions met
       setTimeout(async () => {
         try {
           const nudgeLog = getRoutingLog({ limit: 100 });
@@ -7238,7 +8633,7 @@ async function handleStreamingRequest(
     if (!providerResponse.ok) {
       const errorData = await providerResponse.json() as Record<string, unknown>;
       if (cooldownsEnabled) {
-        cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData));
+        cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), JSON.stringify(errorData));
       }
       const durationMs = Date.now() - startTime;
       const streamErrMsg = extractProviderErrorMessage(errorData, providerResponse.status);
@@ -7254,7 +8649,7 @@ async function handleStreamingRequest(
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     if (cooldownsEnabled) {
-      cooldownManager.recordFailure(targetProvider, errorMsg);
+      cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), errorMsg);
     }
     const durationMs = Date.now() - startTime;
     logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, agentFingerprint, agentId, errorMsg, 500);
@@ -7294,7 +8689,7 @@ async function handleStreamingRequest(
         for await (const chunk of convertAnthropicStream(providerResponse, targetModel)) {
           res.write(chunk);
           if (shouldCacheStream) rawChunks.push(chunk);
-          // Parse OpenAI-format chunks for usage — the converter embeds
+          // Parse OpenAI-format chunks for usage - the converter embeds
           // cache_creation_tokens and cache_read_tokens from message_start.
           try {
             const lines = chunk.split('\n');
@@ -7373,7 +8768,7 @@ async function handleStreamingRequest(
   }
 
   if (cooldownsEnabled) {
-    cooldownManager.recordSuccess(targetProvider);
+    cooldownManager.recordSuccess(cooldownKey(targetProvider, ctx.authHeader));
   }
 
   const durationMs = Date.now() - startTime;
@@ -7430,7 +8825,7 @@ async function handleStreamingRequest(
         model: `${targetProvider}:${targetModel}`,
       })
       .then((runResult) => {
-        // Backfill token/cost data — relay.run() has no adapters so records NULLs
+        // Backfill token/cost data - relay.run() has no adapters so records NULLs
         relay.patchRunTokens(runResult.runId, streamTokensIn, streamTokensOut, streamCost);
         log(`Completed streaming in ${durationMs}ms, runId: ${runResult.runId}`);
       })
@@ -7467,7 +8862,7 @@ async function handleNonStreamingRequest(
   complexity: Complexity = 'simple',
   agentFingerprint?: string,
   agentId?: string,
-  /** Anthropic env API key — required for cross-provider cascade API key resolution (GH #38) */
+  /** Anthropic env API key - required for cross-provider cascade API key resolution (GH #38) */
   anthropicEnvKeyForCascade?: string,
   sessionId?: string,
   sessionSource?: 'claude-code' | 'synthetic',
@@ -7487,7 +8882,7 @@ async function handleNonStreamingRequest(
     responseData = result.responseData;
     if (!result.ok) {
       if (cooldownsEnabled) {
-        cooldownManager.recordFailure(targetProvider, JSON.stringify(responseData));
+        cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), JSON.stringify(responseData));
       }
 
       // ── Cross-provider cascade (GH #38) ──
@@ -7505,7 +8900,7 @@ async function handleNonStreamingRequest(
             try {
               await acquireSlot('local', hop.model, hop.provider);
             } catch {
-              // Rate-limited locally — treat as 429 so cascade continues
+              // Rate-limited locally - treat as 429 so cascade continues
               return { status: 429, data: { error: `Local rate limit for ${hop.provider}` } };
             }
             const hopResult = await executeNonStreamingProviderRequest(
@@ -7527,7 +8922,7 @@ async function handleNonStreamingRequest(
           responseData = cascData;
           // Fall through to success handling below (don't return early)
         } else {
-          // All fallbacks exhausted — return the primary error
+          // All fallbacks exhausted - return the primary error
           const durationMs = Date.now() - startTime;
           const nsErrMsg = extractProviderErrorMessage(responseData, result.status);
           logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, `${routingMode}+cascade`, undefined, taskType, complexity, agentFingerprint, agentId, nsErrMsg, result.status);
@@ -7540,7 +8935,7 @@ async function handleNonStreamingRequest(
           return;
         }
       } else {
-        // No cascade — return error as-is
+        // No cascade - return error as-is
         const durationMs = Date.now() - startTime;
         const nsErrMsg = extractProviderErrorMessage(responseData, result.status);
         logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, agentFingerprint, agentId, nsErrMsg, result.status);
@@ -7557,7 +8952,7 @@ async function handleNonStreamingRequest(
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     if (cooldownsEnabled) {
-      cooldownManager.recordFailure(targetProvider, errorMsg);
+      cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), errorMsg);
     }
     const durationMs = Date.now() - startTime;
     logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity, agentFingerprint, agentId, errorMsg, 500);
@@ -7571,7 +8966,7 @@ async function handleNonStreamingRequest(
   }
 
   if (cooldownsEnabled) {
-    cooldownManager.recordSuccess(targetProvider);
+    cooldownManager.recordSuccess(cooldownKey(targetProvider, ctx.authHeader));
   }
 
   const durationMs = Date.now() - startTime;
@@ -7608,7 +9003,7 @@ async function handleNonStreamingRequest(
     } catch { /* never block hot path */ }
   }
 
-  // ── CAP 3: Deterministic Traces — emit request.end + finalize (chat non-streaming) ──
+  // ── CAP 3: Deterministic Traces - emit request.end + finalize (chat non-streaming) ──
   if (traceId && sessionId && recordTelemetry) {
     const tw = TraceWriter.getInstance();
     if (tw.isEnabled()) {
@@ -7643,7 +9038,7 @@ async function handleNonStreamingRequest(
         taskType,
         model: `${targetProvider}:${targetModel}`,
       });
-      // Backfill token/cost data — relay.run() has no adapters so records NULLs
+      // Backfill token/cost data - relay.run() has no adapters so records NULLs
       relay.patchRunTokens(runResult.runId, tokensIn, tokensOut, cost);
 
       // Add routing metadata to response
@@ -7696,3 +9091,76 @@ async function handleNonStreamingRequest(
 }
 
 // Note: CLI entry point is in cli.ts
+
+export async function startServer(port: number = 0): Promise<http.Server> {
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = req.url ?? '';
+      const pathname = url.split('?')[0] ?? '';
+
+      if (req.method === 'GET' && pathname === '/v1/tier') {
+        const qIdx = url.indexOf('?');
+        const searchParams = new URLSearchParams(qIdx >= 0 ? url.slice(qIdx + 1) : '');
+        const mockTier = searchParams.get('mock');
+        if (mockTier === 'mesh' || mockTier === 'free') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ tier: mockTier, anthropicAccountCount: mockTier === 'mesh' ? 2 : 0 }));
+          return;
+        }
+        try {
+          const configMod = await import('./config.js') as Record<string, unknown>;
+          const loader = (configMod['loadUserConfig'] ?? configMod['loadConfig']) as (() => unknown) | undefined;
+          const cfg = loader ? loader() : {};
+          const accounts = (cfg as { providers?: { anthropic?: { accounts?: unknown[] } } })?.providers?.anthropic?.accounts ?? [];
+          const count = Array.isArray(accounts) ? accounts.length : 0;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ tier: count > 1 ? 'mesh' : 'free', anthropicAccountCount: count }));
+        } catch {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ tier: 'free', anthropicAccountCount: 0 }));
+        }
+        return;
+      }
+
+      if (req.method === 'GET' && (pathname === '/' || pathname === '/dashboard')) {
+        const html = getDashboardHTML();
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(html);
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+    } catch {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal' }));
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', () => resolve()));
+  return server;
+}
+
+// Elite guardrails singleton (enabled so caps are enforced at routing time)
+const _eliteGuardrailsSingleton = new EliteGuardrails({
+  ...DEFAULT_ELITE_GUARDRAILS,
+  enabled: true,
+});
+
+export function getEliteGuardrailsInstance(): EliteGuardrails {
+  return _eliteGuardrailsSingleton;
+}
+
+export interface RouteWithGuardrailsParams {
+  sessionId: string;
+  classifiedTier: 'simple' | 'moderate' | 'complex' | 'elite';
+  estimatedTokens: number;
+}
+
+export function routeWithGuardrails(params: RouteWithGuardrailsParams): RouteDecision {
+  return _eliteGuardrailsSingleton.checkRoute({
+    sessionId: params.sessionId,
+    proposedTier: params.classifiedTier,
+    estimatedTokens: params.estimatedTokens,
+  });
+}

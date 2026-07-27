@@ -18,7 +18,7 @@ import type { RateLimitConfigSection, ProviderConfig } from './config.js';
 
 // ── Sanitizers (defence against Infinity / NaN / negative values) ────────────
 
-/** Maximum configurable RPM — prevents Infinity from bypassing the limiter. */
+/** Maximum configurable RPM, prevents Infinity from bypassing the limiter. */
 const MAX_RPM = 10_000;
 /** Maximum configurable queue depth. */
 const MAX_QUEUE_DEPTH = 10_000;
@@ -88,6 +88,7 @@ export class RateLimitError extends Error {
 // Default limits. Sonnet bumped to 60 RPM, Opus bumped to 30 RPM (GH #39).
 export const DEFAULT_LIMITS: Record<string, RateLimitConfig> = {
   // Anthropic models
+  'claude-opus-5': { rpm: 30, maxTokens: 4096 },
   'claude-opus-4-6': { rpm: 30, maxTokens: 4096 },
   'claude-opus': { rpm: 30, maxTokens: 4096 },
   'claude-sonnet-4-6': { rpm: 60 },
@@ -176,12 +177,12 @@ export class RateLimiter {
   }
 
   /**
-   * Synchronous check — returns immediately without queuing.
+   * Synchronous check, returns immediately without queuing.
    * Increments counter if allowed.
    *
    * @param provider  Optional provider name (e.g. "anthropic"). Used to look up
    *                  provider-level RPM limits when no model-specific override exists.
-   *                  Limits are isolated per-provider — one provider hitting its cap
+   *                  Limits are isolated per-provider, one provider hitting its cap
    *                  does NOT affect other providers.
    */
   checkLimit(workspaceId: string, model: string, provider?: string): RateLimitCheck {
@@ -316,7 +317,7 @@ export class RateLimiter {
     while (queue.length > 0) {
       const check = this.checkLimit(workspaceId, model, provider);
       if (!check.allowed) {
-        // Window filled up — schedule next drain at next window reset
+        // Window filled up, schedule next drain at next window reset
         this.scheduleDrain(queueKey, workspaceId, model, check.resetAt, provider, true);
         return;
       }
@@ -384,7 +385,7 @@ export class RateLimiter {
 
     // 2. Provider-level override (e.g. providers.anthropic.rateLimit.rpm)
     //    Applies to ALL models from this provider when no model-specific override exists.
-    //    Each provider maintains its own isolated bucket — limits don't cascade across providers.
+    //    Each provider maintains its own isolated bucket, limits don't cascade across providers.
     if (provider) {
       const providerNorm = provider.toLowerCase();
       if (this.providerOverrides[providerNorm]) {
@@ -456,7 +457,7 @@ export function configureRateLimiter(): void {
     rateLimiter.configure(cfg.getRateLimitConfig());
     rateLimiter.configureProviders(cfg.getProviderConfigs());
   } catch {
-    // Ignore — use defaults
+    // Ignore, use defaults
   }
 }
 

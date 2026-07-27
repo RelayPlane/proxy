@@ -2,9 +2,9 @@
  * Multi-account token pool for Anthropic (and future providers).
  *
  * Supports two registration paths:
- *  1. Auto-detected  — tokens seen in incoming Authorization headers are
+ *  1. Auto-detected: tokens seen in incoming Authorization headers are
  *     registered automatically with lower priority (priority = 10).
- *  2. Explicit config — accounts listed in ~/.relayplane/config.json under
+ *  2. Explicit config: accounts listed in ~/.relayplane/config.json under
  *     providers.anthropic.accounts[] are registered with the user-specified
  *     priority (default 0 = highest).
  *
@@ -124,9 +124,29 @@ export class TokenPool {
   /**
    * Select the best available token.
    * Returns `null` if all tokens are exhausted / rate-limited.
+   *
+   * `preferApiKey` (2026-07-05): honor a caller's explicit account choice.
+   * Auth-passthrough callers (e.g. the pipeline's oauth_creds.py, which
+   * already does its own rate-limit-aware account selection) send a
+   * specific token they've chosen deliberately. Without this, selectToken()
+   * silently substitutes whatever token round-robin/priority picks from the
+   * pool as soon as ANY token has ever been auto-detected, defeating the
+   * caller's choice entirely (a caller could explicitly send a healthy
+   * account's token and still get a different, exhausted one back). If the
+   * preferred token is registered and currently available, use it; only
+   * fall through to normal selection if it is not (missing, rate-limited,
+   * quarantined, or over its per-minute throttle).
    */
-  selectToken(now: number = Date.now()): TokenState | null {
+  selectToken(now: number = Date.now(), preferApiKey?: string): TokenState | null {
     this.tickWindows(now);
+
+    if (preferApiKey) {
+      const preferred = this.tokens.get(preferApiKey);
+      if (preferred && this.isAvailable(preferred, now)) {
+        preferred.requestsThisMinute += 1;
+        return preferred;
+      }
+    }
 
     const candidates = Array.from(this.tokens.values()).filter((t) =>
       this.isAvailable(t, now),
@@ -161,7 +181,7 @@ export class TokenPool {
   }
 
   /**
-   * Record a successful response — resets the consecutive auth failure counter.
+   * Record a successful response, resets the consecutive auth failure counter.
    */
   recordSuccess(apiKey: string): void {
     const state = this.tokens.get(apiKey);

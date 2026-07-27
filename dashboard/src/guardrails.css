@@ -1,0 +1,64 @@
+.gr-page {
+  padding: 1.5rem;
+}
+
+.gr-section {
+  margin-bottom: 1.5rem;
+}
+
+.gr-section__hd {
+  font-size: 1.125rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+}
+
+.gr-input {
+  padding: 0.5rem;
+  border: 1px solid var(--rp-border-soft, #333);
+  border-radius: 4px;
+  background: var(--rp-bg-card, #1a1a2e);
+  color: var(--rp-fg-1, #e0e0e0);
+}
+
+.gr-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.gr-table th,
+.gr-table td {
+  padding: 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid var(--rp-border-soft, #333);
+}
+
+.gr-ladder-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.gr-locked-preview {
+  text-align: center;
+  padding: 3rem 1.5rem;
+  border: 1px solid var(--rp-border-soft, #333);
+  border-radius: 8px;
+  background: var(--rp-bg-card, #1a1a2e);
+}
+
+.gr-apply-btn {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.gr-toast {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+}

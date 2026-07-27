@@ -30,7 +30,7 @@ describe('Auto-Downgrade', () => {
       const result = checkDowngrade('claude-opus-4-6', 80, config);
       expect(result.downgraded).toBe(true);
       expect(result.originalModel).toBe('claude-opus-4-6');
-      expect(result.newModel).toBe('claude-sonnet-4-6');
+      expect(result.newModel).toBe('claude-sonnet-5');
       expect(result.reason).toContain('80.0%');
     });
 
