@@ -1,8 +1,11 @@
 # @relayplane/proxy
 
-One local endpoint for every model your AI agents use. Route each task to
-the right model, see what every agent spends in real time, and stop
-runaway agents before they burn your budget.
+Your AI agents can run away with your money. RelayPlane stops them.
+
+A free, local proxy that meters every agent, caps what it spends, and
+kills runaway loops before they burn your budget. It caught a 72,900-token
+agent stuck in a 21-minute loop that produced nothing. One endpoint for
+every model is table stakes; stopping the spend is the point.
 
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
