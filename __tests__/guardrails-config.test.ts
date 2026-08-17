@@ -79,10 +79,13 @@ describe('Guardrails surface-sync checks', () => {
     expect(content).toContain('Cost Guardrails');
   });
 
-  it('test_proxy_readme_includes_cost_guardrails_section', () => {
+  it('test_proxy_readme_documents_spend_guardrails', () => {
     const readmePath = join(__dirname, '..', 'README.md');
     const content = readFileSync(readmePath, 'utf8');
-    expect(content).toContain('Cost Guardrails');
+    // Honest-positioning README renamed the section to "Spend guardrails";
+    // the surface-sync intent is that the README still documents guardrails.
+    expect(content).toMatch(/guardrails/i);
+    expect(content).toMatch(/budget cap/i);
   });
 
   it('test_guardrails_css_file_exists', () => {
