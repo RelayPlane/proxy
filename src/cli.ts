@@ -81,6 +81,7 @@ import { resolvePolicy } from './agent-policy.js';
 import { getResponseCache } from './response-cache.js';
 import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
+import { getKillAudit, type KillEvent } from './kill-audit.js';
 
 // __dirname is available natively in CJS
 
@@ -569,6 +570,8 @@ Commands:
   config                 Show configuration
   config set-key <key>   Set RelayPlane API key
   budget [status|set|reset]  Manage spend budgets and limits
+  cap [set|status]       Manage the hard daily spend cap (guardrail)
+  kills [--last <window>]  Show kill-switch / cost-cap kill history
   alerts [list|counts]   View cost alerts and anomaly history
   cache [on|off|status|clear|stats]  Manage response cache
   service [install|uninstall|status]  Manage system service (systemd/launchd)
@@ -1583,7 +1586,7 @@ async function main(): Promise<void> {
 
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'lifecycle', 'stats', 'config', 'login', 'logout', 'upgrade',
-    'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'alerts', 'enable', 'disable',
+    'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'cap', 'kills', 'alerts', 'enable', 'disable',
     'ensure-running', 'agents', 'policy', 'setup', 'watch',
   ]);
 
@@ -1655,6 +1658,16 @@ async function main(): Promise<void> {
 
   if (command === 'budget') {
     handleBudgetCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'cap') {
+    handleCapCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'kills') {
+    await handleKillsCommand(args.slice(1));
     process.exit(0);
   }
 
@@ -2193,7 +2206,9 @@ function handleBudgetCommand(args: string[]): void {
     try { budget.init(); } catch { /* ok */ }
     const status = budget.getStatus();
     const config = budget.getConfig();
-    const tracker = getBudgetTracker();
+    const rpConfig = loadRelayplaneConfig();
+    const persistedCap = typeof rpConfig.budget?.dailyCapUSD === 'number' ? rpConfig.budget.dailyCapUSD : undefined;
+    const tracker = getBudgetTracker(persistedCap !== undefined ? { dailyCapUSD: persistedCap } : undefined);
     try { tracker.init(); } catch { /* ok */ }
     const cap = tracker.getCap();
     const todaySpend = tracker.getDailySpend();
@@ -2273,6 +2288,102 @@ function handleBudgetCommand(args: string[]): void {
   console.log('  set --daily <usd> --hourly <usd> --per-request <usd>');
   console.log('  history [days]   Show daily spend history (default: 7 days)');
   budget.close();
+}
+
+// ─── cap command ──────────────────────────────────────────────────────────
+//
+// Thin CLI wrapper around the same `budget.dailyCapUSD` field that the
+// running proxy reads from ~/.relayplane/config.json (see
+// standalone-proxy.ts's budgetTracker init + config watcher), so a
+// `cap set` here takes effect on the live proxy without a restart.
+
+function handleCapCommand(args: string[]): void {
+  const sub = args[0] ?? 'status';
+
+  if (sub === 'set') {
+    const flagIdx = args.findIndex(a => a === '--day' || a === '--daily');
+    const raw = flagIdx !== -1 ? args[flagIdx + 1] : undefined;
+    const amount = raw !== undefined ? parseFloat(raw) : NaN;
+    if (!raw || isNaN(amount) || amount <= 0) {
+      console.error('Usage: relayplane cap set --day <usd>');
+      process.exit(1);
+    }
+
+    const config = loadRelayplaneConfig();
+    config.budget = { ...(config.budget ?? {}), dailyCapUSD: amount };
+    saveRelayplaneConfig(config);
+
+    console.log('');
+    console.log(`✅ Daily spend cap set to $${amount.toFixed(2)}`);
+    console.log('   The proxy reads the cap on the next request, no restart required.');
+    console.log('');
+    return;
+  }
+
+  // status (default)
+  const config = loadRelayplaneConfig();
+  const cap = config.budget?.dailyCapUSD;
+  console.log('');
+  console.log('🧢 Spend Cap');
+  console.log(`   Daily cap: ${typeof cap === 'number' ? '$' + cap.toFixed(2) : 'not set'}`);
+  console.log('');
+  console.log('   To set:  relayplane cap set --day <usd>');
+  console.log('');
+}
+
+// ─── kills command ────────────────────────────────────────────────────────
+//
+// Shows what the proxy killed (cost cap breach / runaway loop), why, and
+// how much it saved. Prefers the live proxy's /control/kills endpoint
+// (backed by kill-audit.ts); falls back to the in-process audit log when
+// the proxy isn't running (which will be empty for a freshly-started CLI).
+
+function parseWindowToSinceIso(window: string): string | undefined {
+  const match = /^(\d+)([dhm])$/.exec(window.trim());
+  if (!match) return undefined;
+  const amount = parseInt(match[1]!, 10);
+  const msPerUnit = match[2] === 'd' ? 86400000 : match[2] === 'h' ? 3600000 : 60000;
+  return new Date(Date.now() - amount * msPerUnit).toISOString();
+}
+
+function printKillEvents(events: KillEvent[], window?: string): void {
+  console.log('');
+  console.log(`🔪 Kill Switch History${window ? ` (last ${window})` : ''}`);
+  console.log('═════════════════════════');
+  if (events.length === 0) {
+    console.log(`  No kills recorded${window ? ` in the last ${window}` : ''}.`);
+  } else {
+    for (const e of events) {
+      console.log(`  [${e.timestamp}] ${e.agent} (${e.session_id}): ${e.reason}, saved $${e.saved_usd.toFixed(4)}`);
+    }
+  }
+  console.log('');
+}
+
+async function handleKillsCommand(args: string[]): Promise<void> {
+  const flagIdx = args.findIndex(a => a === '--last');
+  const window = flagIdx !== -1 ? args[flagIdx + 1] : undefined;
+  const sinceIso = window ? parseWindowToSinceIso(window) : undefined;
+
+  try {
+    const port = process.env['RELAYPLANE_PROXY_PORT'] ?? process.env['RELAYPLANE_PORT'] ?? '4100';
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const qs = new URLSearchParams({ limit: '100' });
+    if (sinceIso) qs.set('since', sinceIso);
+    const res = await fetch(`http://127.0.0.1:${port}/control/kills?${qs}`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = await res.json() as { events: KillEvent[] };
+      printKillEvents(data.events, window);
+      return;
+    }
+  } catch {
+    // Proxy not running, fall back to the in-process audit log below.
+  }
+
+  const events = getKillAudit().list(sinceIso ? { since: sinceIso } : {});
+  printKillEvents(events, window);
 }
 
 function handleCacheCommand(args: string[]): void {
