@@ -7,12 +7,17 @@ describe('model-catalog: new June 2026 aliases', () => {
     expect(MODEL_MAPPING['claude-opus-4-8']).toEqual({ provider: 'anthropic', model: 'claude-opus-4-8' });
   });
 
-  it('test_alias_claude_fable_5_resolves', () => {
-    expect(MODEL_MAPPING['claude-fable-5']).toEqual({ provider: 'anthropic', model: 'claude-fable-5' });
+  it('test_alias_claude_fable_5_1_resolves', () => {
+    expect(MODEL_MAPPING['claude-fable-5-1']).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
+  });
+
+  it('test_alias_claude_fable_5_remaps_to_5_1', () => {
+    // Fable 5.1 replaced claude-fable-5 on the API; the old id remaps forward.
+    expect(MODEL_MAPPING['claude-fable-5']).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
   });
 
   it('test_alias_claude_fable_short_resolves', () => {
-    expect(MODEL_MAPPING['claude-fable']).toEqual({ provider: 'anthropic', model: 'claude-fable-5' });
+    expect(MODEL_MAPPING['claude-fable']).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
   });
 
   it('test_alias_claude_mythos_5_preview_resolves', () => {
@@ -34,7 +39,12 @@ describe('model-catalog: new pricing entries', () => {
   });
 
   it('test_pricing_claude_fable_5', () => {
+    // Historical entry kept so logged claude-fable-5 traffic still prices.
     expect(MODEL_PRICING['claude-fable-5']).toEqual({ input: 10.0, output: 50.0 });
+  });
+
+  it('test_pricing_claude_fable_5_1', () => {
+    expect(MODEL_PRICING['claude-fable-5-1']).toEqual({ input: 10.0, output: 50.0 });
   });
 
   it('test_pricing_claude_mythos_5', () => {

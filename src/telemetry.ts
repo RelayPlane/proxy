@@ -166,6 +166,9 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
   'claude-sonnet-5': { input: 3.0,  output: 15.0 },
   'claude-opus-4-8': { input: 5.0,  output: 25.0 },
   'claude-fable-5':  { input: 10.0, output: 50.0 },
+  // Fable 5.1: replaces claude-fable-5 at the same pricing (1M ctx, 128k out).
+  // The claude-fable-5 row above stays for pricing historical logged traffic.
+  'claude-fable-5-1': { input: 10.0, output: 50.0 },
   'claude-mythos-5': { input: 10.0, output: 50.0 },
 
   // OpenAI

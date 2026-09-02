@@ -90,8 +90,10 @@ describe('shouldOverridePassthroughToAuto (BUG 1: X-RelayPlane-Bypass honored)',
 });
 
 describe('shouldOverridePassthroughToAuto (BUG 3: bare literal known model honored, not silently downgraded)', () => {
-  it('sanity: resolveExplicitModel resolves a bare literal model name like claude-fable-5', () => {
-    expect(resolveExplicitModel('claude-fable-5')).toEqual({ provider: 'anthropic', model: 'claude-fable-5' });
+  it('sanity: resolveExplicitModel resolves a bare literal model name like claude-fable-5-1', () => {
+    expect(resolveExplicitModel('claude-fable-5-1')).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
+    // The replaced id still resolves, remapped forward to Fable 5.1.
+    expect(resolveExplicitModel('claude-fable-5')).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
   });
 
   it('sanity: resolveExplicitModel returns null for an unresolvable/generic/placeholder name', () => {

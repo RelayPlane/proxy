@@ -47,7 +47,7 @@ curl -s localhost:4101/v1/credential-pool/status | jq
 
 - Normal request routes through account A (priority 1). Confirm via the health
   endpoint `request_count` incrementing on `newmax`.
-- Reserve-Fable: a request that routes to `claude-fable-5` should select B when A
+- Reserve-Fable: a request that routes to `claude-fable-5-1` should select B when A
   is low on Fable weekly (drive with a `~/.relayplane/headroom.json` fixture:
   `{"newmax":{"fableUsed":0.9},"default":{"fableUsed":0.1}}`).
 

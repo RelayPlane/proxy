@@ -9,7 +9,7 @@
  * no awareness of routing.allow_elite_auto at all.
  *
  * Net effect: an EXISTING install with complexity routing enabled but no
- * allow_elite_auto key gets 'elite' silently populated with claude-fable-5,
+ * allow_elite_auto key gets 'elite' silently populated with the Fable elite model,
  * and any request that classifies as 'elite' (score >= 16) is routed there
  * live - violating "no existing routing decision changes without opt-in."
  *
@@ -29,7 +29,7 @@ describe('PR B gap: allow_elite_auto gate must reach the live tier-building path
     expect(typeof mod['buildDefaultComplexityTiers']).toBe('function');
   });
 
-  it('an existing install without allow_elite_auto never gets claude-fable-5 in its built elite tier', () => {
+  it('an existing install without allow_elite_auto never gets a Fable model in its built elite tier', () => {
     const fn = mod['buildDefaultComplexityTiers'] as (
       providers: string[],
       existing?: Record<string, unknown>,
@@ -49,10 +49,12 @@ describe('PR B gap: allow_elite_auto gate must reach the live tier-building path
     const tiers = fn(['anthropic'], existingComplexity, { allow_elite_auto: false });
 
     // Must NOT silently expose the elite model to an ungated install.
+    // Guard both the old (claude-fable-5) and current (claude-fable-5-1) ids.
     expect(tiers.elite.model).not.toBe('claude-fable-5');
+    expect(tiers.elite.model).not.toBe('claude-fable-5-1');
   });
 
-  it('allow_elite_auto:true does allow the built elite tier to resolve to claude-fable-5', () => {
+  it('allow_elite_auto:true does allow the built elite tier to resolve to claude-fable-5-1', () => {
     const fn = mod['buildDefaultComplexityTiers'] as (
       providers: string[],
       existing?: Record<string, unknown>,
@@ -61,7 +63,7 @@ describe('PR B gap: allow_elite_auto gate must reach the live tier-building path
     expect(typeof fn).toBe('function');
 
     const tiers = fn(['anthropic'], undefined, { allow_elite_auto: true });
-    expect(tiers.elite.model).toBe('claude-fable-5');
+    expect(tiers.elite.model).toBe('claude-fable-5-1');
   });
 
   it('calling buildDefaultComplexityTiers with today\'s two-argument call signature must still gate elite off by default', () => {
@@ -82,5 +84,6 @@ describe('PR B gap: allow_elite_auto gate must reach the live tier-building path
     };
     const tiers = fn(['anthropic'], existingComplexity);
     expect(tiers.elite.model).not.toBe('claude-fable-5');
+    expect(tiers.elite.model).not.toBe('claude-fable-5-1');
   });
 });

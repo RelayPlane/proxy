@@ -59,7 +59,7 @@ describe('elite complexity tier (PR B)', () => {
   });
 
   describe('PROVIDER_COMPLEXITY_TIERS includes elite', () => {
-    it('classifyComplexity reaches the elite tier (anthropic elite = claude-fable-5, ban lifted 2026-07-02)', async () => {
+    it('classifyComplexity reaches the elite tier (anthropic elite = claude-fable-5-1, ban lifted 2026-07-02)', async () => {
       // We import the module and inspect the exported constant.
       // This will fail until PROVIDER_COMPLEXITY_TIERS is extended.
       const mod = await import('../src/standalone-proxy.js');
@@ -160,7 +160,7 @@ describe('elite complexity tier (PR B)', () => {
   //   1. resolveComplexityTier must be exported (does not exist yet)
   //   2. allow_elite_auto:true gates elite model routing
   //   3. allow_elite_auto absent/false suppresses elite -> falls back to complex
-  //   4. PROVIDER_COMPLEXITY_TIERS elite entries (claude-fable-5, gpt-5.5)
+  //   4. PROVIDER_COMPLEXITY_TIERS elite entries (claude-fable-5-1, gpt-5.5)
   //   5. Opus drift fix: complex -> claude-opus-4-8 when allow_elite_auto:true
   // ---------------------------------------------------------------------------
   describe('resolveComplexityTier (allow_elite_auto gate)', () => {
@@ -171,12 +171,12 @@ describe('elite complexity tier (PR B)', () => {
       expect(typeof mod['resolveComplexityTier']).toBe('function');
     });
 
-    it('elite + allow_elite_auto:true + anthropic resolves to claude-fable-5', () => {
+    it('elite + allow_elite_auto:true + anthropic resolves to claude-fable-5-1', () => {
       const fn = mod['resolveComplexityTier'] as (...args: unknown[]) => { provider: string; model: string };
       // Fails at this expect if function is not yet exported
       expect(typeof fn).toBe('function');
       const result = fn('elite', { provider: 'anthropic', allow_elite_auto: true });
-      expect(result).toMatchObject({ provider: 'anthropic', model: 'claude-fable-5' });
+      expect(result).toMatchObject({ provider: 'anthropic', model: 'claude-fable-5-1' });
     });
 
     it('elite + allow_elite_auto:true + openai resolves to gpt-5.5', () => {
@@ -190,8 +190,10 @@ describe('elite complexity tier (PR B)', () => {
       const fn = mod['resolveComplexityTier'] as (...args: unknown[]) => { provider: string; model: string };
       expect(typeof fn).toBe('function');
       const result = fn('elite', { provider: 'anthropic', allow_elite_auto: false });
-      // Must NOT route to the elite model when the gate is off
+      // Must NOT route to the elite model when the gate is off.
+      // Guard both the old and the new Fable id.
       expect(result.model).not.toBe('claude-fable-5');
+      expect(result.model).not.toBe('claude-fable-5-1');
       expect(result.model).not.toBe('gpt-5.5');
       // Must be a real model (non-empty string)
       expect(typeof result.model).toBe('string');
@@ -204,6 +206,7 @@ describe('elite complexity tier (PR B)', () => {
       // allow_elite_auto key is entirely absent - must behave identically to false
       const result = fn('elite', { provider: 'anthropic' });
       expect(result.model).not.toBe('claude-fable-5');
+      expect(result.model).not.toBe('claude-fable-5-1');
       expect(result.model).not.toBe('gpt-5.5');
     });
 
@@ -224,12 +227,12 @@ describe('elite complexity tier (PR B)', () => {
       expect(result.model).not.toBe('claude-opus-4-8');
     });
 
-    it('PROVIDER_COMPLEXITY_TIERS anthropic elite maps to claude-fable-5 (via resolveComplexityTier)', () => {
+    it('PROVIDER_COMPLEXITY_TIERS anthropic elite maps to claude-fable-5-1 (via resolveComplexityTier)', () => {
       const fn = mod['resolveComplexityTier'] as (...args: unknown[]) => { provider: string; model: string };
       expect(typeof fn).toBe('function');
       // Both Anthropic API-key and Max OAuth paths share 'anthropic' provider
       const result = fn('elite', { provider: 'anthropic', allow_elite_auto: true });
-      expect(result).toEqual({ provider: 'anthropic', model: 'claude-fable-5' });
+      expect(result).toEqual({ provider: 'anthropic', model: 'claude-fable-5-1' });
     });
 
     it('PROVIDER_COMPLEXITY_TIERS openai elite maps to gpt-5.5 (via resolveComplexityTier)', () => {
@@ -253,10 +256,10 @@ describe('elite complexity tier (PR B)', () => {
   // shape has no 'elite' field, so this import and these assertions fail today.
   // ---------------------------------------------------------------------------
   describe('PROVIDER_COMPLEXITY_TIERS table carries elite directly (not just via resolveComplexityTier)', () => {
-    it('anthropic tier table has an elite entry mapping to claude-fable-5 (covers both Anthropic auth paths)', () => {
+    it('anthropic tier table has an elite entry mapping to claude-fable-5-1 (covers both Anthropic auth paths)', () => {
       expect(PROVIDER_COMPLEXITY_TIERS.anthropic.elite).toEqual({
         provider: 'anthropic',
-        model: 'claude-fable-5',
+        model: 'claude-fable-5-1',
       });
     });
 

@@ -108,8 +108,13 @@ import { randomUUID, createHash } from 'node:crypto';
 let _credentialPool: CredentialPool | null = null;
 let _credentialPoolTenant: string | null = null;
 let _credRefreshManager: { stop: () => void; runOnce: () => Promise<void> } | null = null;
-/** The reserve model: elite requests avoid accounts low on its weekly headroom. */
-const CREDENTIAL_POOL_RESERVE_MODEL = 'claude-fable-5';
+/**
+ * The reserve model: elite requests avoid accounts low on its weekly headroom.
+ * Fable 5.1 replaced claude-fable-5 on the API (2026-09); requests naming the
+ * old id still count as elite because MODEL_MAPPING remaps claude-fable-5 to
+ * claude-fable-5-1 before isEliteModelName() compares.
+ */
+const CREDENTIAL_POOL_RESERVE_MODEL = 'claude-fable-5-1';
 
 /** Read per-account usage headroom from an optional ~/.relayplane/headroom.json. */
 function readCredentialHeadroom(credId: string): CredentialHeadroom | undefined {
@@ -353,8 +358,11 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
   'claude-opus-5':           { provider: 'anthropic', model: 'claude-opus-5' },
   'claude-sonnet-5':         { provider: 'anthropic', model: 'claude-sonnet-5' },
   'claude-opus-4-8':         { provider: 'anthropic', model: 'claude-opus-4-8' },
-  'claude-fable-5':          { provider: 'anthropic', model: 'claude-fable-5' },
-  'claude-fable':            { provider: 'anthropic', model: 'claude-fable-5' },
+  // Fable 5.1 (GA 2026-09) REPLACES claude-fable-5 on the Claude API, so the
+  // old id remaps forward (same pattern as claude-opus-4-5 above).
+  'claude-fable-5-1':        { provider: 'anthropic', model: 'claude-fable-5-1' },
+  'claude-fable-5':          { provider: 'anthropic', model: 'claude-fable-5-1' },
+  'claude-fable':            { provider: 'anthropic', model: 'claude-fable-5-1' },
   'claude-mythos-5-preview': { provider: 'anthropic', model: 'claude-mythos-5' },
   // OpenAI models
   'gpt-4o': { provider: 'openai', model: 'gpt-4o' },
@@ -653,7 +661,7 @@ interface ComplexityTiers {
 // Per-provider default complexity tier models.
 // elite = the strongest available reasoning model per provider.
 // Claude Fable 5's 2026-06 export-control suspension was lifted (2026-07-02),
-// so the anthropic elite tier routes to claude-fable-5 again for the hardest
+// so the anthropic elite tier routes to Fable again for the hardest
 // long-running-agent work. Complex agentic coding moves to Opus 5 (May 2026),
 // the direct successor to Opus 4.8 at the same $5/$25 price.
 export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
@@ -663,7 +671,8 @@ export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
     // complex is Opus 5 (May 2026), the flagship agentic-coding model;
     // resolveComplexityTier also resolves the elite auto-upgrade path to it.
     complex:  { provider: 'anthropic', model: 'claude-opus-5' },
-    elite:    { provider: 'anthropic', model: 'claude-fable-5' },
+    // Fable 5.1 replaced claude-fable-5 (same $10/$50, 1M context, 128k out).
+    elite:    { provider: 'anthropic', model: 'claude-fable-5-1' },
   },
   openai: {
     simple:   { provider: 'openai', model: 'gpt-4.1-mini' },
@@ -737,7 +746,7 @@ function detectAvailableProviders(userConfig?: Record<string, unknown>): Provide
  *
  * Governing rule: an install without an explicit allow_elite_auto:true opt-in
  * must never have its built elite tier resolve to the live elite model
- * (claude-fable-5 / gpt-5.5). Absent the opt-in, elite falls back to the
+ * (claude-fable-5-1 / gpt-5.5). Absent the opt-in, elite falls back to the
  * complex tier default, mirroring resolveComplexityTier's gated behavior.
  */
 export function buildDefaultComplexityTiers(
@@ -782,7 +791,7 @@ export function buildDefaultComplexityTiers(
  *
  * It must ALSO not fire when the caller named a real, concrete model that
  * this proxy already knows how to serve as a literal choice (e.g.
- * "claude-fable-5", resolveExplicitModel() returns non-null). A bare literal
+ * "claude-fable-5-1", resolveExplicitModel() returns non-null). A bare literal
  * model name with no bypass header and no routing suffix is a legitimate
  * "run exactly this model" request, not a vague/generic placeholder to
  * reinterpret. Only unresolvable/generic names (resolveExplicitModel()
@@ -1709,7 +1718,7 @@ export function resolveComplexityTier(
   if (complexity === 'elite') {
     if (eliteEnabled) {
       const eliteModels: Record<string, string> = {
-        anthropic: 'claude-fable-5',
+        anthropic: 'claude-fable-5-1',
         openai: 'gpt-5.5',
       };
       if (eliteModels[provider] !== undefined) {
@@ -4547,7 +4556,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (availableProviders.includes('anthropic') && hasRegularApiKey) {
           // Full Anthropic API key - enable haiku 4-tier routing
           console.log('[RelayPlane] Auto-config: ANTHROPIC_API_KEY detected - enabling 4-tier routing (haiku/sonnet/opus/fable-elite)');
-          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5' };
+          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
         } else if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
           // Non-Anthropic provider - use detected provider's tiers
           const providerTiers = buildDefaultComplexityTiers(availableProviders);
@@ -4561,7 +4570,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         } else {
           // OAuth only or no API key - skip Haiku (OAuth not supported for Haiku)
           console.warn('[RelayPlane] ⚠️  No ANTHROPIC_API_KEY (sk-ant-api*) - Haiku disabled. Set ANTHROPIC_API_KEY to enable full 4-tier routing.');
-          autoComplexity = { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5' };
+          autoComplexity = { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
         }
 
         const autoRouting = {
