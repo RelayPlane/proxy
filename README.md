@@ -1,13 +1,8 @@
-# @relayplane/proxy
+# RelayPlane
 
-Stop pinning your agents to one model. RelayPlane routes each request to
-the one that fits the task.
-
-A free, local proxy that sends every request to the right model by
-complexity, so your traffic costs a fraction of running it all on the
-frontier. It also meters each agent and kills runaway loops before they
-burn your budget. It caught a 72,900-token agent stuck in a 21-minute loop
-that produced nothing.
+One local endpoint for every model your AI agents use. Route each task
+to the right model, see what every agent spends in real time, and stop
+runaway agents before they burn your budget.
 
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
@@ -51,7 +46,8 @@ Anthropic, Google, xAI, Groq, and OpenRouter.
 - **Failover.** Circuit breaker and cross-provider cascade: a 429 on
   one provider fails over instead of failing your run.
 - **Local and private by default.** Passthrough is the default mode:
-  your credentials and traffic stay yours. No telemetry required.
+  your credentials and traffic stay yours. Per-request telemetry is
+  off by default.
 
 ## Why we built it (and how we know it works)
 
@@ -71,9 +67,9 @@ pane, and reverted nine hours later when the numbers said no:
 "coder": { "provider": "opencode", "model": "openrouter/moonshotai/kimi-k3" }
 ```
 
-If you run agents seriously, this is the control you are missing: one
-pane for spend, one seam for swapping models, one place to say "never
-spend more than this."
+If you run agents seriously, this is the control you are missing:
+one pane for spend, one seam for swapping models, one place to say
+"never spend more than this."
 
 ## How it compares
 
@@ -90,38 +86,23 @@ teams, OpenRouter is a hosted marketplace, claude-code-router focuses
 on multi-agent orchestration. RelayPlane is the local cost-and-control
 pane for people who run agents on their own machine.
 
-## Auto-start with Claude Code
-
-Add to `~/.claude/settings.json` so the proxy is always up when you open
-Claude Code:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:4100"
-  }
-}
-```
-
-In passthrough mode RelayPlane forwards your own credentials untouched,
-so Claude Code keeps its own login. RelayPlane observes, routes, and
-meters; it does not change your identity to the provider.
-
 ## Docs
 
 - [Quickstart](https://relayplane.com/docs/quickstart)
-- [Configuration](https://relayplane.com/docs) (routing, cascade,
+- [Configuration reference](docs/configuration.md) (routing, cascade,
   budgets, anomaly detection, cache, credential pool)
-- [Claude Code integration](https://relayplane.com/docs/claude-code)
-- [CLI reference](https://relayplane.com/docs/cli)
+- [Claude Code integration](docs/claude-code.md) (auto-start hook,
+  passthrough details)
+- [CLI reference](docs/cli.md)
 - [Changelog](https://github.com/RelayPlane/proxy/releases)
 
 ## Privacy
 
 Passthrough by default: RelayPlane forwards your own credentials and
-does not modify your traffic unless you turn routing on. The optional
-mesh (shared, anonymized routing signals) can be disabled with
-`relayplane mesh off`. Your prompts stay on your machine.
+does not modify your traffic unless you turn routing on. Per-request
+telemetry is off by default; the optional mesh (shared, anonymized
+routing signals) can be disabled with `relayplane mesh off`. Full
+details in [docs/privacy.md](docs/privacy.md).
 
 ## License
 
