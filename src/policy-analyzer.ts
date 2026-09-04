@@ -10,6 +10,7 @@ import * as fs from 'node:fs';
 import { LOG_FILE } from './routing-log.js';
 import { getAgentRegistry } from './agent-tracker.js';
 import type { RoutingLogEntry } from './routing-log.js';
+import { anthropicPricingRows, openaiPricingRows } from './model-pricing.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,13 +37,11 @@ export interface AgentAnalysis {
 // Costs in USD per 1M tokens. Input/output separately.
 // Update when provider pricing changes.
 export const MODEL_COST_PER_1M: Record<string, { input: number; output: number }> = {
-  'anthropic/claude-opus-5':         { input: 5.00,  output: 25.00 },
-  'anthropic/claude-opus-4-5':       { input: 15.00, output: 75.00 },
-  'anthropic/claude-opus-4':         { input: 15.00, output: 75.00 },
-  'anthropic/claude-sonnet-4-5':     { input: 3.00,  output: 15.00 },
-  'anthropic/claude-sonnet-4':       { input: 3.00,  output: 15.00 },
-  'anthropic/claude-haiku-4-5':      { input: 0.80,  output: 4.00  },
-  'anthropic/claude-haiku-4':        { input: 0.80,  output: 4.00  },
+  // Anthropic rows derive from ./model-pricing.ts (verified list prices).
+  ...anthropicPricingRows('anthropic/'),
+  // OpenAI tier defaults, same source.
+  ...openaiPricingRows('openai/'),
+  // Legacy rows below are unverified pre-2026 values.
   'openai/gpt-4o':                   { input: 2.50,  output: 10.00 },
   'openai/gpt-4o-mini':              { input: 0.15,  output: 0.60  },
   'google/gemini-2.0-flash':         { input: 0.10,  output: 0.40  },

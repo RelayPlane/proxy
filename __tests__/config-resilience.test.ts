@@ -57,7 +57,7 @@ describe('Config Resilience', () => {
   it('should create config on first load', async () => {
     const { loadConfig } = await getConfig();
     const config = loadConfig();
-    expect(config.device_id).toMatch(/^anon_/);
+    expect(config.device_id).toMatch(/^(anon|ci)_/); // ci_ under vitest (isCiEnvironment)
     expect(config.telemetry_enabled).toBe(false); // Off by default since v1.9.2
     expect(config.config_version).toBeGreaterThanOrEqual(1); // Migration bumps v1→v2 on first load
     expect(fs.existsSync(configFile)).toBe(true);
@@ -78,7 +78,7 @@ describe('Config Resilience', () => {
     fs.unlinkSync(configFile);
     expect(fs.existsSync(configFile)).toBe(false);
     
-    // Reload — should restore from backup
+    // Reload , should restore from backup
     vi.resetModules();
     const { loadConfig: loadConfig2 } = await getConfig();
     const restored = loadConfig2();
@@ -109,7 +109,7 @@ describe('Config Resilience', () => {
     
     const { loadConfig } = await getConfig();
     const config = loadConfig();
-    expect(config.device_id).toMatch(/^anon_/);
+    expect(config.device_id).toMatch(/^(anon|ci)_/); // ci_ under vitest (isCiEnvironment)
     // Fresh config starts at v1 but loadConfig() migration bumps it to v2
     expect(config.config_version).toBeGreaterThanOrEqual(1);
   });
@@ -150,7 +150,7 @@ describe('Config Resilience', () => {
     const config = loadConfig();
     const firstDeviceId = config.device_id;
     
-    // Save again — should create backup of original
+    // Save again , should create backup of original
     config.telemetry_enabled = true;
     saveConfig(config);
     
@@ -216,7 +216,7 @@ describe('Config Resilience', () => {
   });
 
   it('v3→v4 migration: enables lifecycle when missing, preserves explicit false', async () => {
-    // v3 config with no lifecycle field — should become true after load
+    // v3 config with no lifecycle field , should become true after load
     const v3Config = {
       device_id: 'anon_v3a',
       config_version: 3,
@@ -229,7 +229,7 @@ describe('Config Resilience', () => {
     expect(loadA().lifecycle_enabled).toBe(true);
     expect(loadA().config_version).toBe(4);
 
-    // v3 config with lifecycle_enabled: false — must NOT be flipped back on
+    // v3 config with lifecycle_enabled: false , must NOT be flipped back on
     const v3Opted = {
       device_id: 'anon_v3b',
       config_version: 3,
@@ -247,7 +247,7 @@ describe('Config Resilience', () => {
   });
 
   it('new config defaults: telemetry off, lifecycle on', async () => {
-    // No config file at all — createDefaultConfig should kick in
+    // No config file at all , createDefaultConfig should kick in
     if (fs.existsSync(configFile)) fs.unlinkSync(configFile);
     vi.resetModules();
     const { loadConfig } = await getConfig();

@@ -286,13 +286,54 @@ const CONFIG_TMP = CONFIG_FILE + '.tmp';
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, 'credentials.json');
 
 /**
- * Generate an anonymous device ID
- * Uses a random hash that cannot be traced back to the device
+ * Environment variables that mark a CI / automated test run. Any of
+ * these set to a non-empty, non-"false", non-"0" value counts.
+ * Covers GitHub Actions, GitLab, CircleCI, Buildkite, Travis, Jenkins,
+ * Azure Pipelines, vitest, and an explicit RELAYPLANE_CI override.
  */
-function generateDeviceId(): string {
+export const CI_ENV_MARKERS = [
+  'CI',
+  'GITHUB_ACTIONS',
+  'GITLAB_CI',
+  'CIRCLECI',
+  'BUILDKITE',
+  'TRAVIS',
+  'JENKINS_URL',
+  'TF_BUILD',
+  'VITEST',
+  'RELAYPLANE_CI',
+] as const;
+
+/**
+ * True when the proxy is running inside CI or an automated test.
+ *
+ * Why: lifecycle telemetry mints one random device id per config
+ * directory, so every CI job and test tmp dir used to look like a brand
+ * new install (3,881 of 3,904 "devices" since June 2026 were one-shot).
+ * In CI we (a) prefix device ids with `ci_` so analytics can exclude
+ * them, and (b) suppress lifecycle pings entirely.
+ */
+export function isCiEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  for (const key of CI_ENV_MARKERS) {
+    const v = env[key];
+    if (v === undefined || v === '') continue;
+    const lower = v.toLowerCase();
+    if (lower === 'false' || lower === '0') continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Generate an anonymous device ID
+ * Uses a random hash that cannot be traced back to the device.
+ * In CI the prefix is `ci_` instead of `anon_` (see isCiEnvironment).
+ */
+export function generateDeviceId(env: NodeJS.ProcessEnv = process.env): string {
   const randomBytes = crypto.randomBytes(16);
   const hash = crypto.createHash('sha256').update(randomBytes).digest('hex');
-  return `anon_${hash.slice(0, 16)}`;
+  const prefix = isCiEnvironment(env) ? 'ci' : 'anon';
+  return `${prefix}_${hash.slice(0, 16)}`;
 }
 
 /**
@@ -528,6 +569,8 @@ export function disableTelemetry(): void {
  * missing (new install, or pre-v4 config that hasn't been migrated yet).
  */
 export function isLifecycleEnabled(): boolean {
+  // CI and test runs never send lifecycle telemetry; they are not installs.
+  if (isCiEnvironment()) return false;
   const config = loadConfig();
   return config.lifecycle_enabled !== false;
 }

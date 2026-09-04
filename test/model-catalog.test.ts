@@ -44,7 +44,7 @@ describe('model-catalog: new pricing entries', () => {
   });
 
   it('test_pricing_claude_fable_5_1', () => {
-    expect(MODEL_PRICING['claude-fable-5-1']).toEqual({ input: 10.0, output: 50.0 });
+    expect(MODEL_PRICING['claude-fable-5-1']).toMatchObject({ input: 10.0, output: 50.0 });
   });
 
   it('test_pricing_claude_mythos_5', () => {

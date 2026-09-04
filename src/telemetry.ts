@@ -23,6 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDeviceId, isTelemetryEnabled, getConfigDir } from './config.js';
+import { anthropicPricingRows, openaiPricingRows, type ModelPrice } from './model-pricing.js';
 
 /**
  * Telemetry event schema (matches PITCH-v2.md)
@@ -126,54 +127,21 @@ export function inferTaskType(
 }
 
 /**
- * Estimate cost based on model and token counts
- * Pricing as of 2024 (USD per 1M tokens)
+ * Estimate cost based on model and token counts (USD per 1M tokens).
+ *
+ * Anthropic and current OpenAI rows come from ./model-pricing.ts, the
+ * single verified source of truth. Do not hand-edit a Claude or GPT-5
+ * price here; edit model-pricing.ts and its doc table together.
+ * Remaining rows (older OpenAI, Google) are legacy and unverified.
  */
-export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  // Anthropic , versioned IDs
-  'claude-opus-4-20250514': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-20250514': { input: 3.0, output: 15.0 },
-  'claude-3-7-sonnet-20250219': { input: 3.0, output: 15.0 },
-  'claude-3-5-sonnet-20241022': { input: 3.0, output: 15.0 },
-  'claude-3-5-sonnet-20240620': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku-20241022': { input: 0.8, output: 4.0 },
-  'claude-3-opus-20240229': { input: 15.0, output: 75.0 },
-  'claude-3-sonnet-20240229': { input: 3.0, output: 15.0 },
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
-  // Anthropic , generation-versioned aliases (e.g. claude-opus-4-6 = Opus 4 snapshot 6)
-  'claude-opus-4-6': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-6': { input: 3.0, output: 15.0 },
-  'claude-haiku-4-6': { input: 0.8, output: 4.0 },
-  'claude-opus-4-5': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-5': { input: 3.0, output: 15.0 },
-  'claude-haiku-4-5': { input: 1.0, output: 5.0 },
-  // Anthropic , -latest aliases (resolve to same tier)
-  'claude-opus-4-latest': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4-latest': { input: 3.0, output: 15.0 },
-  'claude-3-7-sonnet-latest': { input: 3.0, output: 15.0 },
-  'claude-3-5-sonnet-latest': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku-latest': { input: 0.8, output: 4.0 },
-  'claude-3-haiku-latest': { input: 0.25, output: 1.25 },
-  // Anthropic , short aliases used in proxy MODEL_MAPPING
-  'claude-opus-4': { input: 15.0, output: 75.0 },
-  'claude-sonnet-4': { input: 3.0, output: 15.0 },
-  'claude-haiku-4': { input: 0.8, output: 4.0 },
-  'claude-3-7-sonnet': { input: 3.0, output: 15.0 },
-  'claude-3-5-sonnet': { input: 3.0, output: 15.0 },
-  'claude-3-5-haiku': { input: 0.8, output: 4.0 },
-  // Anthropic June-July 2026 additions
-  'claude-opus-5':   { input: 5.0,  output: 25.0 },
-  'claude-sonnet-5': { input: 3.0,  output: 15.0 },
-  'claude-opus-4-8': { input: 5.0,  output: 25.0 },
-  'claude-fable-5':  { input: 10.0, output: 50.0 },
-  // Fable 5.1: replaces claude-fable-5 at the same pricing (1M ctx, 128k out).
-  // The claude-fable-5 row above stays for pricing historical logged traffic.
-  'claude-fable-5-1': { input: 10.0, output: 50.0 },
-  'claude-mythos-5': { input: 10.0, output: 50.0 },
+export const MODEL_PRICING: Record<string, ModelPrice> = {
+  // Anthropic: canonical ids + dated/-latest/dotted aliases (verified)
+  ...anthropicPricingRows(),
 
-  // OpenAI
-  'gpt-5.5':      { input: 2.0, output: 8.0 }, // TODO confirm gpt-5.5 pricing
-  'gpt-5.4-mini': { input: 2.0, output: 8.0 }, // TODO confirm gpt-5.4-mini pricing
+  // OpenAI routing-tier defaults (verified via OpenRouter listing)
+  ...openaiPricingRows(),
+
+  // OpenAI legacy (unverified, pre-2026 values)
   'gpt-4o': { input: 2.5, output: 10.0 },
   'gpt-4o-mini': { input: 0.15, output: 0.60 },
   'gpt-4.1': { input: 2.0, output: 8.0 },
@@ -181,12 +149,12 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
   'gpt-4': { input: 30.0, output: 60.0 },
   'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
 
-  // Google
+  // Google (unverified, pre-2026 values)
   'gemini-1.5-pro': { input: 1.25, output: 5.0 },
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-2.0-flash': { input: 0.10, output: 0.40 },
   'gemini-2.5-pro': { input: 1.25, output: 10.0 },
-  
+
   // Default for unknown models
   'default': { input: 1.0, output: 3.0 },
 };
@@ -202,7 +170,7 @@ export function estimateCost(model: string, inputTokens: number, outputTokens: n
     const baseInput = Math.max(0, inputTokens - creation - read);
     const regularInputCost = (baseInput / 1_000_000) * pricing.input;
     const cacheCreationCost = (creation / 1_000_000) * pricing.input * 1.25;
-    const cacheReadCost = (read / 1_000_000) * pricing.input * 0.1;
+    const cacheReadCost = (read / 1_000_000) * pricing.input * (pricing.cacheReadMultiplier ?? 0.1);
     return regularInputCost + cacheCreationCost + cacheReadCost + outputCost;
   }
 
