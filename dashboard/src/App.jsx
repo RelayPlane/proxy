@@ -351,6 +351,32 @@ export function App() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [paused, setPaused] = React.useState(false);
   const [killArmed, setKillArmed] = React.useState(false);
+  const [killedAt, setKilledAt] = React.useState(null);
+  // The KILL button drives the proxy's real global kill switch. Before this it
+  // only froze the live feed in the browser while traffic kept flowing.
+  const armKill = React.useCallback(() => {
+    fetch('/control/kill', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ all: true, reason: 'dashboard' }),
+    })
+      .then((r) => r.json())
+      .then((j) => { setKillArmed(true); setKilledAt(j && j.activated_at ? j.activated_at : new Date().toISOString()); })
+      .catch(() => setKillArmed(true));
+  }, []);
+  const unarmKill = React.useCallback(() => {
+    fetch('/control/resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(() => { setKillArmed(false); setKilledAt(null); })
+      .catch(() => setKillArmed(false));
+  }, []);
+  React.useEffect(() => {
+    fetch('/control/status')
+      .then((r) => r.json())
+      .then((st) => {
+        if (st && st.killSwitch && st.killSwitch.active) { setKillArmed(true); setKilledAt(st.killSwitch.activatedAt || null); }
+      })
+      .catch(() => {});
+  }, []);
   const [clearStamp, setClearStamp] = React.useState('');
   const [frozen, setFrozen] = React.useState(null);
   const [days, setDays] = React.useState(() => {
@@ -399,8 +425,8 @@ export function App() {
         version={status.version}
         plan={tier}
         killArmed={killArmed}
-        onArmKill={() => setKillArmed(true)}
-        onUnarmKill={() => setKillArmed(false)}
+        onArmKill={armKill}
+        onUnarmKill={unarmKill}
         days={days}
         onDaysChange={handleDaysChange}
         activeTab={activeTab}
@@ -410,8 +436,8 @@ export function App() {
       {killArmed && (
         <div className="killband">
           <span className="killband__icon">■</span>
-          <b>traffic halted.</b> 0 routed since 14:32:14. issue <code>DELETE /v1/tenants/*/kill</code> resolved in 0.71s.
-          <button className="ghostbtn killband__btn" onClick={() => setKillArmed(false)}>resume routing</button>
+          <b>traffic halted.</b> every /v1 request gets <code>503 kill_switch_active</code>{killedAt ? ` since ${new Date(killedAt).toLocaleTimeString()}` : ''}. nothing is forwarded to any provider.
+          <button className="ghostbtn killband__btn" onClick={unarmKill}>resume routing</button>
         </div>
       )}
 

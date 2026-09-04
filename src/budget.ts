@@ -332,7 +332,19 @@ export class BudgetManager {
    * Pre-request budget check. Must be <5ms.
    * Uses in-memory cache, never touches SQLite.
    */
-  checkBudget(estimatedCost?: number): BudgetCheckResult {
+  checkBudget(
+    estimatedCost?: number,
+    opts?: {
+      /**
+       * Best-effort cost of the request about to be sent (prompt tokens at
+       * the target model's input price). When spend-so-far PLUS this would
+       * cross the cap, the request is treated as a breach. This closes the
+       * fail-open window where a $0.000001 cap still let the first request
+       * through because nothing had been spent yet.
+       */
+      projectedCost?: number;
+    },
+  ): BudgetCheckResult {
     if (!this.config.enabled) {
       return {
         allowed: true, breached: false, breachType: 'none',
@@ -357,8 +369,10 @@ export class BudgetManager {
       };
     }
 
-    // Hourly check
-    if (this.hourlySpendCache >= this.config.hourlyUsd) {
+    const projected = Math.max(0, opts?.projectedCost ?? 0);
+
+    // Hourly check (spend so far, or spend so far plus what this request would add)
+    if (this.hourlySpendCache >= this.config.hourlyUsd || (projected > 0 && this.hourlySpendCache + projected > this.config.hourlyUsd)) {
       return {
         allowed: this.config.onBreach !== 'block',
         breached: true,
@@ -370,8 +384,8 @@ export class BudgetManager {
       };
     }
 
-    // Daily check
-    if (this.dailySpendCache >= this.config.dailyUsd) {
+    // Daily check (spend so far, or spend so far plus what this request would add)
+    if (this.dailySpendCache >= this.config.dailyUsd || (projected > 0 && this.dailySpendCache + projected > this.config.dailyUsd)) {
       return {
         allowed: this.config.onBreach !== 'block',
         breached: true,
@@ -847,14 +861,15 @@ export class BudgetTracker {
    * Pre-request check. Always <5ms, reads in-memory cache only.
    * Call `init()` before first use.
    */
-  check(): BudgetCapCheckResult {
+  check(projectedCost?: number): BudgetCapCheckResult {
     if (this.dailyCapUSD === null) {
       return { allowed: true, warn: false, spent: 0, cap: null, warningThreshold: this.warningThreshold };
     }
     this._ensureDay();
     const cap = this.dailyCapUSD;
     const spent = this.dailySpend;
-    const allowed = spent < cap;
+    const projected = Math.max(0, projectedCost ?? 0);
+    const allowed = spent < cap && !(projected > 0 && spent + projected > cap);
     const warn = allowed && cap > 0 && (spent / cap) >= this.warningThreshold;
     return { allowed, warn, spent, cap, warningThreshold: this.warningThreshold };
   }

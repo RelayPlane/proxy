@@ -37,7 +37,7 @@
  * @packageDocumentation
  */
 
-import { startProxy } from './standalone-proxy.js';
+import { startProxy, resolveFirstRunComplexityTiers, detectAvailableProviders as detectProxyProviders } from './standalone-proxy.js';
 import { fireDashboardLinked } from './lifecycle-telemetry.js';
 import {
   loadConfig,
@@ -563,14 +563,16 @@ Commands:
   logout                 Clear stored credentials
   status                 Show proxy status, plan, and cloud sync
   upgrade                Open pricing page in browser
-  enable                 Enable RelayPlane proxy routing
-  disable                Disable RelayPlane proxy routing (passthrough mode)
+  enable                 Enable RelayPlane routing
+  disable                Disable routing (passthrough: traffic STILL flows and costs money)
+  kill [--reason <txt>]  Halt ALL routed traffic (503 kill_switch_active) until resume
+  resume                 Lift the kill switch
   telemetry [on|off|status]  Manage telemetry settings
   stats                  Show usage statistics
   config                 Show configuration
   config set-key <key>   Set RelayPlane API key
   budget [status|set|reset]  Manage spend budgets and limits
-  cap [set|status]       Manage the hard daily spend cap (guardrail)
+  cap [set|status]       Hard daily spend cap: cap set --day <usd> (429 budget_exceeded past it)
   kills [--last <window>]  Show kill-switch / cost-cap kill history
   alerts [list|counts]   View cost alerts and anomaly history
   cache [on|off|status|clear|stats]  Manage response cache
@@ -770,30 +772,77 @@ function getOpenClawConfigPath(): string {
 }
 
 function handleEnableDisableCommand(enable: boolean): void {
-  const configPath = getOpenClawConfigPath();
-  const dir = dirname(configPath);
+  // The proxy reads ~/.relayplane/config.json (hot-reloaded), so that is what
+  // must change. Before this, only ~/.openclaw/openclaw.json was written,
+  // which nothing in the proxy reads, and the file was created on machines
+  // without OpenClaw (install test 2026-09-04 row 3m).
+  const rpConfig = loadRelayplaneConfig();
+  rpConfig.enabled = enable;
+  saveRelayplaneConfig(rpConfig);
 
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true });
-  }
-
-  let config: Record<string, unknown> = {};
-  if (existsSync(configPath)) {
-    try {
-      config = JSON.parse(readFileSync(configPath, 'utf8'));
-    } catch {
-      // start fresh
+  // Keep the OpenClaw plugin flag in sync only where OpenClaw is installed.
+  const openclawPath = getOpenClawConfigPath();
+  if (existsSync(dirname(openclawPath))) {
+    let config: Record<string, unknown> = {};
+    if (existsSync(openclawPath)) {
+      try {
+        config = JSON.parse(readFileSync(openclawPath, 'utf8'));
+      } catch {
+        // start fresh
+      }
     }
+    if (!config.relayplane || typeof config.relayplane !== 'object') {
+      config.relayplane = {};
+    }
+    (config.relayplane as Record<string, unknown>).enabled = enable;
+    writeFileSync(openclawPath, JSON.stringify(config, null, 2) + '\n');
   }
 
-  if (!config.relayplane || typeof config.relayplane !== 'object') {
-    config.relayplane = {};
+  console.log('');
+  if (enable) {
+    console.log('✅ RelayPlane routing enabled');
+    console.log(`   Updated ${RELAYPLANE_CONFIG_PATH}`);
+  } else {
+    console.log('⚠️  RelayPlane routing disabled: the proxy is now in PASSTHROUGH mode.');
+    console.log('   Traffic still flows to your providers unmodified, and still costs money.');
+    console.log('   This does not stop spend. To halt ALL routed traffic: relayplane kill');
+    console.log(`   Updated ${RELAYPLANE_CONFIG_PATH}`);
   }
-  (config.relayplane as Record<string, unknown>).enabled = enable;
+  console.log('');
+}
 
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
-  console.log(`✅ RelayPlane ${enable ? 'enabled' : 'disabled'}`);
-  console.log(`   Updated ${configPath}`);
+/**
+ * `relayplane kill` / `relayplane resume`: the global kill switch. Drives the
+ * running proxy via POST /control/kill {all:true} / POST /control/resume and
+ * persists the flag in ~/.relayplane/config.json so it survives a restart
+ * (and applies at next start when the proxy is not running).
+ */
+async function handleKillSwitchCommand(activate: boolean, args: string[]): Promise<void> {
+  const reasonIdx = args.findIndex((a) => a === '--reason');
+  const reason = reasonIdx !== -1 ? (args[reasonIdx + 1] ?? 'manual') : 'manual';
+  const live = activate
+    ? await fetchProxyJson<{ halted: boolean }>('/control/kill', { method: 'POST', body: { all: true, reason } })
+    : await fetchProxyJson<{ halted: boolean }>('/control/resume', { method: 'POST', body: {} });
+
+  if (!live) {
+    // Proxy not running: persist so the next start comes up in that state.
+    const rpConfig = loadRelayplaneConfig();
+    rpConfig.killSwitch = activate
+      ? { active: true, reason, activatedAt: new Date().toISOString() }
+      : { active: false };
+    saveRelayplaneConfig(rpConfig);
+  }
+
+  console.log('');
+  if (activate) {
+    console.log('🛑 Kill switch ACTIVE: all routed traffic halted.');
+    console.log('   Every /v1/messages and /v1/chat/completions request now gets 503 kill_switch_active.');
+    console.log('   Nothing is forwarded to any provider until you run: relayplane resume');
+  } else {
+    console.log('▶️  Kill switch lifted: routed traffic resumed.');
+  }
+  console.log(live ? `   Applied to the running proxy on :${proxyControlPort()} and persisted to ${RELAYPLANE_CONFIG_PATH}` : `   Proxy not reachable on :${proxyControlPort()}; persisted to ${RELAYPLANE_CONFIG_PATH}, applies at next start.`);
+  console.log('');
 }
 
 function handleConfigCommand(args: string[]): void {
@@ -1587,6 +1636,7 @@ async function main(): Promise<void> {
   const knownCommands = new Set([
     'init', 'start', 'telemetry', 'lifecycle', 'stats', 'config', 'login', 'logout', 'upgrade',
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'cap', 'kills', 'alerts', 'enable', 'disable',
+    'kill', 'resume',
     'ensure-running', 'agents', 'policy', 'setup', 'watch',
   ]);
 
@@ -1657,7 +1707,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'budget') {
-    handleBudgetCommand(args.slice(1));
+    await handleBudgetCommand(args.slice(1));
     process.exit(0);
   }
 
@@ -1683,6 +1733,16 @@ async function main(): Promise<void> {
 
   if (command === 'disable') {
     handleEnableDisableCommand(false);
+    process.exit(0);
+  }
+
+  if (command === 'kill') {
+    await handleKillSwitchCommand(true, args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'resume') {
+    await handleKillSwitchCommand(false, args.slice(1));
     process.exit(0);
   }
 
@@ -1840,10 +1900,16 @@ async function main(): Promise<void> {
   try {
     await startProxy({ port, host, verbose });
     
-    console.log('  Ready. Point Claude Code at the proxy:');
+    const hasOpenAIStyleKey = hasOpenAIKey || hasOpenRouterKey || hasGeminiKey || hasXAIKey || hasDeepSeekKey || hasGroqKey;
+    console.log(hasOpenAIStyleKey ? '  Ready. Point your agent at the proxy:' : '  Ready. Point Claude Code at the proxy:');
     console.log('');
     console.log(`    export ANTHROPIC_BASE_URL=http://localhost:${port}`);
     console.log('    # then run: claude (Max plan, no API key needed)');
+    if (hasOpenAIStyleKey) {
+      console.log('');
+      console.log(`    export OPENAI_BASE_URL=http://localhost:${port}`);
+      console.log('    # OpenAI SDK / any OpenAI-compatible client: POST /v1/chat/completions');
+    }
     console.log('');
     console.log(`  Dashboard → http://localhost:${port}`);
     console.log('');
@@ -1956,11 +2022,12 @@ async function handleInitWizard(): Promise<void> {
         const routing = (rawCfg['routing'] as Record<string, unknown> | undefined) ?? {};
         if (!('preferred_provider' in routing)) {
           routing['preferred_provider'] = 'auto';
+          // Real, parseable tiers for the providers this machine has keys for.
+          // (1.9.51 wrote { description } objects here; the proxy could not
+          // parse them and every start logged "Unknown provider undefined".)
           routing['complexity'] = {
-            simple: { description: 'Quick lookups, short answers, trivial edits' },
-            moderate: { description: 'Standard reasoning, multi-step tasks' },
-            complex: { description: 'Hard reasoning, refactors, deep analysis' },
-            elite: { description: 'Frontier-class problems, research-grade tasks' },
+            enabled: true,
+            ...resolveFirstRunComplexityTiers(detectProxyProviders()),
           };
           rawCfg['routing'] = routing;
           writeFileSync(configPath, JSON.stringify(rawCfg, null, 2));
@@ -2198,11 +2265,84 @@ async function handleInitWizard(): Promise<void> {
   void baseConfig; // suppress unused warning
 }
 
-function handleBudgetCommand(args: string[]): void {
+function proxyControlPort(): string {
+  return process.env['RELAYPLANE_PROXY_PORT'] ?? process.env['RELAYPLANE_PORT'] ?? '4100';
+}
+
+async function fetchProxyJson<T>(path: string, init?: { method?: string; body?: unknown }): Promise<T | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2000);
+    const res = await fetch(`http://127.0.0.1:${proxyControlPort()}${path}`, {
+      method: init?.method ?? 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+interface ControlBudgetResponse {
+  today_usd: number;
+  limit_usd: number;
+  pct_used: number;
+  remaining_usd: number;
+  enabled: boolean;
+  on_breach: string;
+  hourly_usd: number;
+  hourly_limit_usd: number;
+  hourly_pct_used: number;
+  breached: boolean;
+  breach_type?: string;
+}
+
+async function handleBudgetCommand(args: string[]): Promise<void> {
   const sub = args[0] ?? 'status';
   const budget = getBudgetManager();
 
   if (sub === 'status') {
+    // The running proxy is the source of truth (it holds the live spend
+    // cache and the reloaded config). Reading budget.db from a second
+    // process showed "Enabled: ❌" while the proxy was blocking (install
+    // test 2026-09-04 row 3k).
+    // Only trust a running proxy that serves THIS config file. The live
+    // instance on the default port may belong to another user/HOME (HARD
+    // RULE 2: the CLI must never report or touch :4100 state by accident).
+    const myConfigPath = (process.env['RELAYPLANE_CONFIG_PATH'] ?? '').trim() || RELAYPLANE_CONFIG_PATH;
+    const liveStatus = await fetchProxyJson<{ configPath?: string }>('/control/status');
+    const servesMyConfig = !!liveStatus && liveStatus.configPath === myConfigPath;
+    const live = servesMyConfig ? await fetchProxyJson<ControlBudgetResponse>('/control/budget') : null;
+    if (liveStatus && !servesMyConfig) {
+      console.log('');
+      console.log(`   (proxy on :${proxyControlPort()} serves ${liveStatus.configPath ?? 'an older build / unknown config'}, not ${myConfigPath}; showing on-disk config and local spend log)`);
+    }
+    if (live) {
+      const pct = live.pct_used;
+      const bar = !live.enabled ? '' : pct >= 100 ? ' 🚫 BLOCKED' : pct >= 80 ? ' ⚠️  warning' : ' ✅ ok';
+      console.log('');
+      console.log(`💰 Budget Status (live proxy on :${proxyControlPort()})`);
+      console.log(`   Enabled:     ${live.enabled ? '✅' : '❌'}`);
+      console.log(`   Daily:       $${live.today_usd.toFixed(4)} / $${live.limit_usd} (${pct.toFixed(1)}%)${bar}`);
+      console.log(`   Hourly:      $${live.hourly_usd.toFixed(4)} / $${live.hourly_limit_usd} (${live.hourly_pct_used.toFixed(1)}%)`);
+      console.log(`   On breach:   ${live.on_breach}`);
+      if (live.breached) {
+        console.log(`   ⚠️  BREACHED: ${live.breach_type ?? 'daily'}`);
+      }
+      if (!live.enabled) {
+        console.log('   Set a cap:   relayplane cap set --day <usd>');
+      }
+      console.log('');
+      return;
+    }
+    if (!liveStatus) {
+      console.log('');
+      console.log(`   (proxy not reachable on :${proxyControlPort()}; showing on-disk config and local spend log)`);
+    }
     try { budget.init(); } catch { /* ok */ }
     const status = budget.getStatus();
     const config = budget.getConfig();
@@ -2310,12 +2450,24 @@ function handleCapCommand(args: string[]): void {
     }
 
     const config = loadRelayplaneConfig();
-    config.budget = { ...(config.budget ?? {}), dailyCapUSD: amount };
+    const existing = (config.budget ?? {}) as Record<string, unknown>;
+    const onBreach = typeof existing['onBreach'] === 'string' ? (existing['onBreach'] as string) : 'block';
+    // Write BOTH the BudgetManager form (enabled/dailyUsd/onBreach, the one
+    // that returns 429 budget_exceeded) and the BudgetTracker mirror
+    // (dailyCapUSD). Before this, only dailyCapUSD was written and nothing
+    // blocked (install test 2026-09-04 row 3i).
+    config.budget = { ...existing, enabled: true, dailyUsd: amount, dailyCapUSD: amount, onBreach };
     saveRelayplaneConfig(config);
 
     console.log('');
-    console.log(`✅ Daily spend cap set to $${amount.toFixed(2)}`);
-    console.log('   The proxy reads the cap on the next request, no restart required.');
+    console.log(`✅ Daily spend cap set to $${amount.toFixed(2)} (on breach: ${onBreach})`);
+    if (onBreach === 'block') {
+      console.log('   Requests that would push today\'s spend past the cap get 429 budget_exceeded.');
+    } else {
+      console.log(`   budget.onBreach is "${onBreach}", so requests are ${onBreach === 'downgrade' ? 'downgraded' : 'allowed with a warning'} past the cap. Set it to "block" to hard-stop.`);
+    }
+    console.log('   A running proxy reloads the config within seconds; no restart needed.');
+    console.log('   Check it: relayplane budget status');
     console.log('');
     return;
   }
@@ -2354,7 +2506,8 @@ function printKillEvents(events: KillEvent[], window?: string): void {
     console.log(`  No kills recorded${window ? ` in the last ${window}` : ''}.`);
   } else {
     for (const e of events) {
-      console.log(`  [${e.timestamp}] ${e.agent} (${e.session_id}): ${e.reason}, saved $${e.saved_usd.toFixed(4)}`);
+      const saved = e.saved_usd > 0 && e.saved_usd < 0.001 ? e.saved_usd.toFixed(7) : e.saved_usd.toFixed(4);
+      console.log(`  [${e.timestamp}] ${e.agent} (${e.session_id}): ${e.reason}, saved $${saved}`);
     }
   }
   console.log('');

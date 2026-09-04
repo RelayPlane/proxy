@@ -441,9 +441,9 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
       via: 'openrouter',
       aliases: {
         'rp:best': { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
-        'rp:fast': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
+        'rp:fast': { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
         'rp:cheap': { provider: 'openrouter', model: 'google/gemini-2.5-flash-lite' },
-        'rp:balanced': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
+        'rp:balanced': { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
       },
     };
   }
@@ -452,9 +452,9 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
       via: 'anthropic',
       aliases: {
         'rp:best': { provider: 'anthropic', model: 'claude-sonnet-5' },
-        'rp:fast': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-        'rp:cheap': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
-        'rp:balanced': { provider: 'anthropic', model: 'claude-3-5-haiku-latest' },
+        'rp:fast': { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        'rp:cheap': { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        'rp:balanced': { provider: 'anthropic', model: 'claude-haiku-4-5' },
       },
     };
   }
@@ -480,6 +480,34 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
       'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-5' },
     },
   };
+}
+
+/**
+ * Rebuild SMART_ALIASES from the current environment. Called once at proxy
+ * startup; exported so tests (and any embedder) can re-resolve after
+ * changing provider keys. Returns the human-readable "via" label.
+ */
+export function refreshSmartAliases(): string {
+  const { aliases, via } = buildSmartAliases();
+  SMART_ALIASES = aliases;
+  return via;
+}
+
+/**
+ * Provider-aware fallback for the cost/fast/quality resolvers on installs
+ * that have no Anthropic credentials. SMART_ALIASES already encodes "which
+ * provider does this install actually have keys for" (see
+ * buildSmartAliases), so on an OpenAI-only or OpenRouter-only box the
+ * fallback lands on a routable model instead of a hardcoded claude-* name
+ * that would 401 (OpenAI-only) or, worse, crash resolution (OpenRouter-only,
+ * install test 2026-09-04 rows 1c/1f).
+ * Returns undefined on Anthropic installs so their long-standing fallback
+ * chain is untouched.
+ */
+function nonAnthropicAliasFallback(alias: 'rp:cheap' | 'rp:fast' | 'rp:best'): string | undefined {
+  const target = SMART_ALIASES[alias];
+  if (!target || target.provider === 'anthropic') return undefined;
+  return `${target.provider}/${target.model}`;
 }
 
 /**
@@ -710,7 +738,7 @@ export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
  * Detect which AI providers are available based on env vars and user config.
  * Returns providers in priority order: anthropic > openai > google > xai > deepseek > openrouter > groq
  */
-function detectAvailableProviders(userConfig?: Record<string, unknown>): Provider[] {
+export function detectAvailableProviders(userConfig?: Record<string, unknown>): Provider[] {
   const cfg = (userConfig ?? {}) as Record<string, Record<string, string> | undefined>;
   const auth = (cfg['auth'] ?? {}) as Record<string, string>;
   const available: Provider[] = [];
@@ -773,6 +801,35 @@ export function buildDefaultComplexityTiers(
     : (eliteEnabled ? defaults.elite : complex);
 
   return { simple, moderate, complex, elite };
+}
+
+/**
+ * The 4-tier complexity scheme a fresh install should start with, as plain
+ * config strings. Mirrors the first-run auto-config in startProxy so that
+ * `relayplane init` (non-interactive) and a keyless first `relayplane start`
+ * write the same thing. Install test 2026-09-04 row 4a: init used to write
+ * `{ description: ... }` objects here, which the proxy could not parse.
+ */
+export function resolveFirstRunComplexityTiers(
+  availableProviders: Provider[],
+): { simple: string; moderate: string; complex: string; elite: string } {
+  const envAnthropicKey = process.env['ANTHROPIC_API_KEY'];
+  const hasRegularApiKey = !!envAnthropicKey && envAnthropicKey.startsWith('sk-ant-api');
+  if (availableProviders.includes('anthropic') && hasRegularApiKey) {
+    // Full Anthropic API key: Haiku is available, use the 4-tier ladder.
+    return { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
+  }
+  if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
+    const t = buildDefaultComplexityTiers(availableProviders);
+    return {
+      simple: `${t.simple.provider}/${t.simple.model}`,
+      moderate: `${t.moderate.provider}/${t.moderate.model}`,
+      complex: `${t.complex.provider}/${t.complex.model}`,
+      elite: `${t.elite.provider}/${t.elite.model}`,
+    };
+  }
+  // OAuth / Max plan / no key: Haiku is not served on OAuth, so start at Sonnet.
+  return { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
 }
 
 /**
@@ -972,6 +1029,15 @@ interface HybridAuthConfig {
 
 interface RelayPlaneProxyConfigFile {
   enabled?: boolean;
+  /**
+   * Global kill switch. While `active` is true every /v1/messages and
+   * /v1/chat/completions request is answered with 503 kill_switch_active
+   * and nothing is forwarded. Driven by POST /control/kill {all:true},
+   * POST /control/resume, `relayplane kill` / `relayplane resume`, and the
+   * dashboard KILL button. Unlike `enabled: false` (passthrough), this
+   * actually stops spend.
+   */
+  killSwitch?: { active?: boolean; reason?: string; activatedAt?: string };
   modelOverrides?: Record<string, string>;
   mode?: string;
   strategies?: Record<string, unknown>;
@@ -1098,6 +1164,8 @@ interface RequestHistoryEntry {
   tokensIn: number;
   tokensOut: number;
   costUsd: number;
+  /** True when tokens/cost were estimated from text length because the upstream stream carried no usage. */
+  costEstimated?: boolean;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
   taskType?: string;
@@ -1333,6 +1401,13 @@ function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: nu
   }
 }
 
+/** Flag the most recent history entry as carrying estimated (not provider-reported) usage. */
+function markLastHistoryEntryEstimated(): void {
+  if (requestHistory.length > 0) {
+    requestHistory[requestHistory.length - 1]!.costEstimated = true;
+  }
+}
+
 /**
  * Extract request content for logging. Handles Anthropic and OpenAI formats.
  */
@@ -1461,11 +1536,82 @@ function getProxyConfigPath(): string {
   return path.join(os.homedir(), '.relayplane', 'config.json');
 }
 
-function normalizeProxyConfig(config: RelayPlaneProxyConfigFile | null): RelayPlaneProxyConfigFile {
+const COMPLEXITY_TIER_KEYS = ['simple', 'moderate', 'complex', 'elite'] as const;
+
+/** A tier value the proxy can actually route on: a non-empty model string or {provider, model}. */
+function isUsableComplexityTier(val: unknown): val is string | { provider: string; model: string } {
+  if (typeof val === 'string') return val.trim().length > 0;
+  if (val && typeof val === 'object' && !Array.isArray(val)) {
+    const o = val as { provider?: unknown; model?: unknown };
+    return typeof o.model === 'string' && o.model.trim().length > 0 && typeof o.provider === 'string' && o.provider.trim().length > 0;
+  }
+  return false;
+}
+
+/**
+ * Default complexity tiers for a config that does not set its own. Installs
+ * with no Anthropic credentials get their detected provider's ladder (as
+ * "provider/model" strings) instead of the historical claude-* defaults,
+ * which on an OpenAI-only or OpenRouter-only box are unroutable.
+ */
+function defaultRoutingForEnv(): { complexity: Record<string, string>; cascadeModels?: string[] } {
+  const providers = detectAvailableProviders();
+  if (providers.length > 0 && !providers.includes('anthropic')) {
+    const t = PROVIDER_COMPLEXITY_TIERS[providers[0]!];
+    if (t) {
+      const simple = `${t.simple.provider}/${t.simple.model}`;
+      const moderate = `${t.moderate.provider}/${t.moderate.model}`;
+      const complex = `${t.complex.provider}/${t.complex.model}`;
+      // The default routing.mode is "cascade", so its model list must be
+      // routable too, or relayplane:auto lands on Anthropic and 401s
+      // (install test 2026-09-04 row 1g).
+      return { complexity: { simple, moderate, complex }, cascadeModels: [simple, complex] };
+    }
+  }
+  const d = (DEFAULT_PROXY_CONFIG.routing as RoutingConfig).complexity as unknown as Record<string, unknown>;
+  const out: Record<string, string> = {};
+  for (const k of COMPLEXITY_TIER_KEYS) if (typeof d[k] === 'string') out[k] = d[k] as string;
+  return { complexity: out };
+}
+
+/**
+ * Validate and normalize the on-disk config. Exported for tests.
+ *
+ * Tier validation: routing.complexity.{simple,moderate,complex,elite} must be
+ * a "provider/model" string, a bare model name, or {provider, model}. Anything
+ * else (the `{ description: ... }` objects 1.9.51's init wrote, numbers,
+ * empty strings) is dropped with an actionable warning instead of flowing
+ * into routing as provider "undefined" and crashing the process.
+ */
+export function normalizeProxyConfig(config: RelayPlaneProxyConfigFile | null): RelayPlaneProxyConfigFile {
   const defaultRouting = DEFAULT_PROXY_CONFIG.routing as RoutingConfig;
   const configRouting = (config?.routing ?? {}) as Partial<RoutingConfig>;
-  const cascade = { ...defaultRouting.cascade, ...(configRouting.cascade ?? {}) };
-  const complexity = { ...defaultRouting.complexity, ...(configRouting.complexity ?? {}) };
+  const envDefaults = defaultRoutingForEnv();
+  const cascade = {
+    ...defaultRouting.cascade,
+    ...(envDefaults.cascadeModels ? { models: envDefaults.cascadeModels } : {}),
+    ...(configRouting.cascade ?? {}),
+  };
+  const rawComplexity = { ...((configRouting.complexity ?? {}) as Record<string, unknown>) };
+  for (const tier of COMPLEXITY_TIER_KEYS) {
+    const v = rawComplexity[tier];
+    if (v === undefined || v === null) {
+      delete rawComplexity[tier];
+      continue;
+    }
+    if (!isUsableComplexityTier(v)) {
+      let shown = '';
+      try { shown = JSON.stringify(v); } catch { shown = String(v); }
+      if (shown.length > 80) shown = shown.slice(0, 77) + '...';
+      console.warn(
+        `[RelayPlane] config: routing.complexity.${tier} is not a model (got ${shown}). Ignoring it. ` +
+        `Set it to a "provider/model" string such as "openrouter/google/gemini-2.5-flash-lite" or "openai/gpt-4.1-mini", ` +
+        `or delete the key to use the auto-detected default.`,
+      );
+      delete rawComplexity[tier];
+    }
+  }
+  const complexity = { ...defaultRouting.complexity, ...envDefaults.complexity, ...rawComplexity };
   const routing: RoutingConfig = {
     ...defaultRouting,
     ...configRouting,
@@ -1497,17 +1643,48 @@ function normalizeProxyConfig(config: RelayPlaneProxyConfigFile | null): RelayPl
   };
 }
 
+let _envDailyCapLogged = false;
+
+/**
+ * RELAYPLANE_DAILY_CAP_USD=<usd> (documented on /docs/budget-cap) enables the
+ * daily budget with onBreach=block unless the file already chose an action.
+ * Applied on every load so a config hot-reload cannot silently drop it.
+ */
+let _proxyConfigLoads = 0;
+
+function applyEnvDailyCap(cfg: RelayPlaneProxyConfigFile, initialLoad: boolean): RelayPlaneProxyConfigFile {
+  const raw = process.env['RELAYPLANE_DAILY_CAP_USD'];
+  if (raw === undefined || raw.trim() === '') return cfg;
+  // After startup, a cap written to the file (cap set, /control/budget/set,
+  // the dashboard) is a deliberate runtime change and wins over the env var.
+  if (!initialLoad && typeof cfg.budget?.dailyUsd === 'number') return cfg;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    if (!_envDailyCapLogged) {
+      console.warn(`[RelayPlane] RELAYPLANE_DAILY_CAP_USD="${raw}" is not a positive number, ignoring it`);
+      _envDailyCapLogged = true;
+    }
+    return cfg;
+  }
+  const onBreach = (cfg.budget?.onBreach as BudgetConfig['onBreach'] | undefined) ?? 'block';
+  if (!_envDailyCapLogged) {
+    console.log(`[RelayPlane] RELAYPLANE_DAILY_CAP_USD=${n}: daily budget cap enabled (onBreach=${onBreach})`);
+    _envDailyCapLogged = true;
+  }
+  return { ...cfg, budget: { ...(cfg.budget ?? {}), enabled: true, dailyUsd: n, dailyCapUSD: n, onBreach } };
+}
+
 async function loadProxyConfig(configPath: string, log: (msg: string) => void): Promise<RelayPlaneProxyConfigFile> {
   try {
     const raw = await fs.promises.readFile(configPath, 'utf8');
     const parsed = JSON.parse(raw) as RelayPlaneProxyConfigFile;
-    return normalizeProxyConfig(parsed);
+    return applyEnvDailyCap(normalizeProxyConfig(parsed), _proxyConfigLoads++ === 0);
   } catch (err) {
     const error = err as NodeJS.ErrnoException;
     if (error.code !== 'ENOENT') {
       log(`Failed to load config: ${error.message}`);
     }
-    return normalizeProxyConfig(null);
+    return applyEnvDailyCap(normalizeProxyConfig(null), _proxyConfigLoads++ === 0);
   }
 }
 
@@ -2150,7 +2327,7 @@ async function forwardToOpenAI(
     stream: false,
   };
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetch(`${providerBaseUrl('openai')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2160,6 +2337,17 @@ async function forwardToOpenAI(
   });
 
   return response;
+}
+
+/**
+ * Base URL for an OpenAI-compatible provider. RELAYPLANE_<PROVIDER>_BASE_URL
+ * (e.g. RELAYPLANE_OPENROUTER_BASE_URL) overrides the default so the proxy
+ * can be pointed at a local mock or a private gateway.
+ */
+export function providerBaseUrl(provider: string): string {
+  const override = process.env[`RELAYPLANE_${provider.toUpperCase()}_BASE_URL`];
+  if (override && override.trim()) return override.trim().replace(/\/+$/, '');
+  return DEFAULT_ENDPOINTS[provider]?.baseUrl ?? 'https://openrouter.ai/api/v1';
 }
 
 /**
@@ -2174,9 +2362,12 @@ async function forwardToOpenAIStream(
     ...request,
     model: targetModel,
     stream: true,
+    // Always ask for the usage chunk so the ledger can cost the stream.
+    // The client-facing stream strips it again unless the client asked.
+    stream_options: { ...((request['stream_options'] as Record<string, unknown> | undefined) ?? {}), include_usage: true },
   };
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetch(`${providerBaseUrl('openai')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2202,7 +2393,7 @@ async function forwardToXAI(
     stream: false,
   };
 
-  const response = await fetch('https://api.x.ai/v1/chat/completions', {
+  const response = await fetch(`${providerBaseUrl('xai')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2226,9 +2417,10 @@ async function forwardToXAIStream(
     ...request,
     model: targetModel,
     stream: true,
+    stream_options: { ...((request['stream_options'] as Record<string, unknown> | undefined) ?? {}), include_usage: true },
   };
 
-  const response = await fetch('https://api.x.ai/v1/chat/completions', {
+  const response = await fetch(`${providerBaseUrl('xai')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2255,7 +2447,7 @@ async function forwardToOpenAICompatible(
     stream: false,
   };
 
-  const response = await fetch(`${DEFAULT_ENDPOINTS[provider]?.baseUrl || "https://openrouter.ai/api/v1"}/chat/completions`, {
+  const response = await fetch(`${providerBaseUrl(provider)}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2280,9 +2472,10 @@ async function forwardToOpenAICompatibleStream(
     ...request,
     model: targetModel,
     stream: true,
+    stream_options: { ...((request['stream_options'] as Record<string, unknown> | undefined) ?? {}), include_usage: true },
   };
 
-  const response = await fetch(`${DEFAULT_ENDPOINTS[provider]?.baseUrl || "https://openrouter.ai/api/v1"}/chat/completions`, {
+  const response = await fetch(`${providerBaseUrl(provider)}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -3383,22 +3576,24 @@ function getCooldownConfig(config: RelayPlaneProxyConfigFile): CooldownConfig {
 }
 
 function complexityValToString(val: string | { provider: string; model: string } | undefined): string | undefined {
-  if (val == null) return undefined;
+  if (!isUsableComplexityTier(val)) return undefined;
   if (typeof val === 'string') return val;
   return `${val.provider}/${val.model}`;
 }
 
-function getCostModel(config: RelayPlaneProxyConfigFile): string {
+export function getCostModel(config: RelayPlaneProxyConfigFile): string {
   return (
     complexityValToString(config.routing?.complexity?.simple) ||
+    nonAnthropicAliasFallback('rp:cheap') ||
     config.routing?.cascade?.models?.[0] ||
     'claude-haiku-4-5'
   );
 }
 
-function getFastModel(config: RelayPlaneProxyConfigFile): string {
+export function getFastModel(config: RelayPlaneProxyConfigFile): string {
   return (
     complexityValToString(config.routing?.complexity?.simple) ||
+    nonAnthropicAliasFallback('rp:fast') ||
     config.routing?.cascade?.models?.[0] ||
     'claude-haiku-4-5'
   );
@@ -3415,6 +3610,7 @@ export function getQualityModel(config: RelayPlaneProxyConfigFile): string {
   return (
     eliteModel ||
     complexityValToString(complexityConfig?.complex) ||
+    nonAnthropicAliasFallback('rp:best') ||
     config.routing?.cascade?.models?.[config.routing?.cascade?.models?.length ? config.routing.cascade.models.length - 1 : 0] ||
     process.env['RELAYPLANE_QUALITY_MODEL'] ||
     'claude-sonnet-4-6'
@@ -4445,8 +4641,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   };
 
   // Resolve smart aliases based on available env vars
-  const { aliases: resolvedAliases, via: aliasVia } = buildSmartAliases();
-  SMART_ALIASES = resolvedAliases;
+  const aliasVia = refreshSmartAliases();
   console.log(`[RelayPlane] Smart aliases resolved via: ${aliasVia}`);
 
   // Load persistent history from disk
@@ -4761,16 +4956,46 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
    * Returns the (possibly downgraded) model and extra response headers.
    * If the request should be blocked, returns { blocked: true }.
    */
+  /**
+   * Best-effort cost of the request about to be forwarded: prompt text at
+   * the target model's input price, zero output. Used so a cap blocks the
+   * request that would cross it instead of the one after (install test
+   * 2026-09-04 row 3g: the first request after enabling was let through).
+   */
+  function projectedRequestCost(model: string, promptText: string): number {
+    const inputTokens = Math.ceil((promptText?.length ?? 0) / 4);
+    if (inputTokens <= 0) return 0;
+    try {
+      return estimateCost(model, inputTokens, 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Record a cap block in the kill audit so `relayplane kills` / /control/kills show it. */
+  function recordCapKill(sessionId: string | undefined, agent: string | undefined, savedUsd: number): void {
+    try {
+      getKillAudit().record({
+        timestamp: new Date().toISOString(),
+        session_id: sessionId ?? 'unknown',
+        agent: agent ?? 'unknown',
+        reason: 'cap_exceeded',
+        saved_usd: Math.max(0, savedUsd),
+      });
+    } catch { /* audit must never block */ }
+  }
+
   function preRequestBudgetCheck(
     model: string,
     estimatedCost?: number,
+    projectedCost?: number,
   ): { blocked: boolean; model: string; headers: Record<string, string>; downgraded: boolean } {
     const headers: Record<string, string> = {};
     let finalModel = model;
     let downgraded = false;
 
     // Budget check
-    const budgetResult = budgetManager.checkBudget(estimatedCost);
+    const budgetResult = budgetManager.checkBudget(estimatedCost, { projectedCost });
     if (budgetResult.breached) {
       // Fire breach alert
       const limit = budgetResult.breachType === 'hourly'
@@ -4819,7 +5044,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // BudgetTracker: enforce dailyCapUSD
-    const trackerResult = budgetTracker.check();
+    const trackerResult = budgetTracker.check(projectedCost);
     if (!trackerResult.allowed) {
       headers['x-relayplane-budget-exceeded'] = 'daily-cap';
       return { blocked: true, model: finalModel, headers, downgraded: false };
@@ -4877,6 +5102,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     proxyConfig = await loadProxyConfig(configPath, log);
     cooldownManager.updateConfig(getCooldownConfig(proxyConfig));
     budgetManager.updateConfig({ ...budgetManager.getConfig(), ...(proxyConfig.budget ?? {}) });
+    if (proxyConfig.budget?.enabled) {
+      try { budgetManager.init(); } catch (err) { log(`Budget manager init on reload failed: ${err}`); }
+    }
     budgetTracker.updateConfig({
       dailyCapUSD: proxyConfig.budget?.dailyCapUSD,
       warningThreshold: proxyConfig.budget?.warningThreshold,
@@ -5020,6 +5248,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             enabled,
             mode: proxyConfig.mode ?? (enabled ? 'enabled' : 'disabled'),
             modelOverrides: proxyConfig.modelOverrides ?? {},
+            // Which config file this proxy serves, so a CLI in another HOME
+            // (or a test HOME) can tell it is not talking about its own config.
+            configPath,
+            killSwitch: {
+              active: proxyConfig.killSwitch?.active === true,
+              reason: proxyConfig.killSwitch?.reason ?? null,
+              activatedAt: proxyConfig.killSwitch?.activatedAt ?? null,
+            },
           })
         );
         return;
@@ -5145,9 +5381,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           }
           budgetManager.setLimits({ dailyUsd: amount });
           budgetManager.updateConfig({ enabled: true });
+          // Keep the BudgetTracker mirror (dailyCapUSD) in step, otherwise a
+          // stale lower cap there keeps blocking after the cap was raised here.
+          budgetTracker.updateConfig({ dailyCapUSD: amount });
           proxyConfig = normalizeProxyConfig({
             ...proxyConfig,
-            budget: { ...proxyConfig.budget, dailyUsd: amount, enabled: true },
+            budget: { ...proxyConfig.budget, dailyUsd: amount, dailyCapUSD: amount, enabled: true },
           });
           await saveProxyConfig(configPath, proxyConfig);
           startConfigWatcher();
@@ -5325,16 +5564,34 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
+    if (req.method === 'POST' && pathname === '/control/resume') {
+      proxyConfig = normalizeProxyConfig({ ...proxyConfig, killSwitch: { active: false } });
+      await saveProxyConfig(configPath, proxyConfig);
+      startConfigWatcher();
+      console.log('[RelayPlane] Kill switch lifted: routed traffic resumed');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ halted: false }));
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/control/kill') {
       try {
         const body = await readJsonBody(req) as { sessionKey?: string; all?: boolean };
         
         if (body.all) {
+          const activatedAt = new Date().toISOString();
+          const reason = typeof (body as { reason?: unknown }).reason === 'string' ? (body as { reason: string }).reason : 'manual';
+          proxyConfig = normalizeProxyConfig({ ...proxyConfig, killSwitch: { active: true, reason, activatedAt } });
+          await saveProxyConfig(configPath, proxyConfig);
+          startConfigWatcher();
+          getKillAudit().record({ timestamp: activatedAt, session_id: 'all', agent: 'all', reason: 'manual', saved_usd: 0 });
+          console.log(`[RelayPlane] KILL SWITCH ACTIVE (${reason}): every routed request now gets 503 until POST /control/resume`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ 
-            killed: 0, 
-            sessions: [],
-            note: 'Local proxy mode: session kill not applicable'
+          res.end(JSON.stringify({
+            killed: 'all',
+            halted: true,
+            activated_at: activatedAt,
+            note: 'Kill switch active: every /v1/messages and /v1/chat/completions request gets 503 kill_switch_active until POST /control/resume (or `relayplane resume`).',
           }));
         } else if (body.sessionKey) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -5639,6 +5896,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             taskType: r.taskType || 'general',
             complexity: r.complexity || 'simple',
             costUsd: r.costUsd,
+            costEstimated: r.costEstimated === true,
             latencyMs: r.latencyMs,
             tokensIn: r.tokensIn,
             tokensOut: r.tokensOut,
@@ -6418,6 +6676,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     const relayplaneEnabled = proxyConfig.enabled !== false;
     const recordTelemetry = relayplaneEnabled && !relayplaneBypass;
 
+    // Global kill switch: halt every routed request. This is the only surface
+    // that actually stops spend; `enabled: false` is passthrough and forwards.
+    if (
+      proxyConfig.killSwitch?.active === true &&
+      req.method === 'POST' &&
+      (url.includes('/v1/messages') || url.includes('/chat/completions'))
+    ) {
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '30' });
+      res.end(JSON.stringify({
+        error: 'RelayPlane kill switch is active: all routed traffic is halted. Run `relayplane resume` or POST /control/resume to lift it.',
+        type: 'kill_switch_active',
+        reason: proxyConfig.killSwitch.reason ?? 'manual',
+        activated_at: proxyConfig.killSwitch.activatedAt ?? null,
+      }));
+      return;
+    }
+
     // === Token pool: auto-detect incoming token ===
     const incomingToken = ctx.authHeader
       ? ctx.authHeader.replace(/^Bearer\s+/i, '')
@@ -6790,13 +7065,26 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         targetModel = resolved.model;
       }
 
+      // Guard: a routable request must never leave this block without a model.
+      // (Install test 2026-09-04 rows 1f/1j: a bad tier config turned into
+      // targetModel=undefined and a TypeError took the whole process down.)
+      if (!useCascade && (typeof targetModel !== 'string' || targetModel.length === 0 || targetModel.includes('undefined'))) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: `Could not resolve a model for "${originalModel}" (mode: ${routingMode}). Check routing.complexity in ~/.relayplane/config.json; every tier must be a "provider/model" string.`,
+          type: 'model_resolution_failed',
+          suggestions: getAvailableModelNames().slice(0, 12),
+        }));
+        return;
+      }
+
       // Guard: Sonnet has a 200K standard context window. Requests larger than that
       // require "extra usage" on Max plan, which most users haven't enabled.
       // If we routed to Sonnet but the conversation exceeds 200K tokens, upgrade to Opus
       // so the request doesn't fail. Opus 1M context is included in Max plan.
       if (
         targetProvider === 'anthropic' &&
-        targetModel.includes('sonnet') &&
+        (typeof targetModel === 'string' && targetModel.includes('sonnet')) &&
         messages.length > 0
       ) {
         const allText = extractMessageText(messages);
@@ -6814,7 +7102,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // Sonnet 1M requires "extra usage" on Max plan; without it Anthropic rejects the request.
       // Opus 1M is included in Max plan. Stripping the beta falls back to Sonnet's 200K window.
       let effectiveCtx = ctx;
-      if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
+      if ((typeof targetModel === 'string' && targetModel.includes('sonnet')) && ctx.betaHeaders?.includes('context-1m')) {
         effectiveCtx = {
           ...ctx,
           betaHeaders: ctx.betaHeaders
@@ -6839,12 +7127,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // ── Budget check + auto-downgrade ──
       const budgetExtraHeaders: Record<string, string> = {};
       {
-        const budgetCheck = preRequestBudgetCheck(targetModel || requestedModel);
+        const nativeProjectedCost = projectedRequestCost(targetModel || requestedModel, promptText);
+        const budgetCheck = preRequestBudgetCheck(targetModel || requestedModel, undefined, nativeProjectedCost);
         if (budgetCheck.blocked) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
+          recordCapKill(nativeSessionId, nativeExplicitAgentId ?? nativeAgentFingerprint, nativeProjectedCost);
+          res.writeHead(429, { 'Content-Type': 'application/json', 'x-relayplane-budget-exceeded': 'daily-cap' });
           res.end(JSON.stringify({
             error: 'Budget limit exceeded. Request blocked.',
             type: 'budget_exceeded',
+            hint: 'Raise the cap with `relayplane cap set --day <usd>` or set budget.onBreach to "warn" in ~/.relayplane/config.json.',
           }));
           return;
         }
@@ -8008,7 +8299,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // Guard: Sonnet 200K context limit - upgrade to Opus for large contexts
     if (
       targetProvider === 'anthropic' &&
-      targetModel.includes('sonnet') &&
+      (typeof targetModel === 'string' && targetModel.includes('sonnet')) &&
       request.messages?.length > 0
     ) {
       const allText = extractMessageText(request.messages as Array<{ role?: string; content?: unknown }>);
@@ -8024,7 +8315,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // Strip 1M context beta header when routing to Sonnet (same as native handler above)
     let effectiveCtx = ctx;
-    if (targetModel.includes('sonnet') && ctx.betaHeaders?.includes('context-1m')) {
+    if ((typeof targetModel === 'string' && targetModel.includes('sonnet')) && ctx.betaHeaders?.includes('context-1m')) {
       effectiveCtx = {
         ...ctx,
         betaHeaders: ctx.betaHeaders
@@ -8075,6 +8366,19 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
     // ── End defaultProvider override ──
 
+    // Guard: a routable request must never leave this block without a model.
+    // (Install test 2026-09-04 rows 1f/1j: a bad tier config turned into
+    // targetModel=undefined and a TypeError took the whole process down.)
+    if (!useCascade && (typeof targetModel !== 'string' || targetModel.length === 0 || targetModel.includes('undefined'))) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: `Could not resolve a model for "${request.model}" (mode: ${routingMode}). Check routing.complexity in ~/.relayplane/config.json; every tier must be a "provider/model" string.`,
+        type: 'model_resolution_failed',
+        suggestions: getAvailableModelNames().slice(0, 12),
+      }));
+      return;
+    }
+
     if (!useCascade) {
       log(`Routing to: ${targetProvider}/${targetModel}`);
     } else {
@@ -8101,12 +8405,15 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
     // ── Budget check + auto-downgrade (chat/completions) ──
     {
-      const chatBudgetCheck = preRequestBudgetCheck(targetModel);
+      const chatProjectedCost = projectedRequestCost(targetModel, promptText);
+      const chatBudgetCheck = preRequestBudgetCheck(targetModel, undefined, chatProjectedCost);
       if (chatBudgetCheck.blocked) {
-        res.writeHead(429, { 'Content-Type': 'application/json' });
+        recordCapKill(chatSessionId, chatExplicitAgentId ?? chatAgentFingerprint, chatProjectedCost);
+        res.writeHead(429, { 'Content-Type': 'application/json', 'x-relayplane-budget-exceeded': 'daily-cap' });
         res.end(JSON.stringify({
           error: 'Budget limit exceeded. Request blocked.',
           type: 'budget_exceeded',
+          hint: 'Raise the cap with `relayplane cap set --day <usd>` or set budget.onBreach to "warn" in ~/.relayplane/config.json.',
         }));
         return;
       }
@@ -8314,10 +8621,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             cascadeErrMsg = err instanceof Error ? err.message : String(err);
             cascadeErrStatus = 500;
           }
-          logRequest(originalRequestedModel ?? 'unknown', targetModel || 'unknown', targetProvider, durationMs, false, 'cascade', undefined, taskType, complexity, chatAgentFingerprint, chatExplicitAgentId, cascadeErrMsg, cascadeErrStatus);
+          // Name the model the cascade actually tried last, not "anthropic/unknown"
+          // (the placeholder that made an OpenRouter 401 look like an Anthropic route).
+          const cascadeAttempted = getCascadeModels(proxyConfig)
+            .map((m) => resolveConfigModel(m))
+            .filter((r): r is { provider: Provider; model: string } => r !== null);
+          const lastAttempt = cascadeAttempted[cascadeAttempted.length - 1];
+          const failedModel = targetModel || lastAttempt?.model || 'unknown';
+          const failedProvider: Provider = targetModel ? targetProvider : (lastAttempt?.provider ?? targetProvider);
+          logRequest(originalRequestedModel ?? 'unknown', failedModel, failedProvider, durationMs, false, 'cascade', undefined, taskType, complexity, chatAgentFingerprint, chatExplicitAgentId, cascadeErrMsg, cascadeErrStatus);
           if (recordTelemetry) {
-            sendCloudTelemetry(taskType, targetModel || 'unknown', 0, 0, durationMs, false, 0, originalRequestedModel ?? undefined);
-            meshCapture(targetModel || 'unknown', targetProvider, taskType, 0, 0, 0, durationMs, false, cascadeErrMsg);
+            sendCloudTelemetry(taskType, failedModel, 0, 0, durationMs, false, 0, originalRequestedModel ?? undefined);
+            meshCapture(failedModel, failedProvider, taskType, 0, 0, 0, durationMs, false, cascadeErrMsg);
           }
           if (err instanceof ProviderResponseError) {
             res.writeHead(err.status, { 'Content-Type': 'application/json' });
@@ -8689,6 +9004,36 @@ async function handleStreamingRequest(
   let streamCacheRead = 0;
   const shouldCacheStream = !!(cacheHash && !cacheBypass);
   const rawChunks: string[] = [];
+  // OpenAI-compatible streams: we always request the usage chunk upstream
+  // (see forwardToOpenAIStream & co). Forward it only if the client asked,
+  // so the wire format the client sees is unchanged.
+  const clientWantsUsage = (request['stream_options'] as { include_usage?: boolean } | undefined)?.include_usage === true;
+  let streamUsageSeen = false;
+  let streamedContentChars = 0;
+  let streamCostEstimated = false;
+  /** Returns the SSE event text to forward, or null to drop it. */
+  const processOpenAIStreamEvent = (rawEvent: string): string | null => {
+    let drop = false;
+    for (const line of rawEvent.split('\n')) {
+      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+      try {
+        const evt = JSON.parse(line.slice(6)) as { usage?: { prompt_tokens?: number; completion_tokens?: number }; choices?: Array<{ delta?: { content?: unknown } }> };
+        if (evt.usage) {
+          streamUsageSeen = true;
+          streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
+          streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
+          if (!clientWantsUsage && Array.isArray(evt.choices) && evt.choices.length === 0) drop = true;
+        }
+        if (Array.isArray(evt.choices)) {
+          for (const c of evt.choices) {
+            const content = c?.delta?.content;
+            if (typeof content === 'string') streamedContentChars += content.length;
+          }
+        }
+      } catch { /* skip parse errors */ }
+    }
+    return drop ? null : rawEvent;
+  };
 
   try {
     // Stream the response based on provider format
@@ -8735,27 +9080,44 @@ async function handleStreamingRequest(
           } catch { /* skip parse errors */ }
         }
         break;
-      default:
-        // xAI, OpenRouter, DeepSeek, Groq, OpenAI all use OpenAI-compatible streaming format
+      default: {
+        // xAI, OpenRouter, DeepSeek, Groq, OpenAI all use OpenAI-compatible streaming format.
+        // Re-frame on SSE event boundaries so a usage chunk split across reads is still parsed.
+        let sseBuffer = '';
+        const emit = (rawEvent: string) => {
+          const out = processOpenAIStreamEvent(rawEvent);
+          if (out === null) return;
+          res.write(out);
+          if (shouldCacheStream) rawChunks.push(out);
+        };
         for await (const chunk of pipeOpenAIStream(providerResponse)) {
-          res.write(chunk);
-          if (shouldCacheStream) rawChunks.push(chunk);
-          try {
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ') && line !== 'data: [DONE]') {
-                const evt = JSON.parse(line.slice(6));
-                if (evt.usage) {
-                  streamTokensIn = evt.usage.prompt_tokens ?? streamTokensIn;
-                  streamTokensOut = evt.usage.completion_tokens ?? streamTokensOut;
-                }
-              }
-            }
-          } catch { /* skip parse errors */ }
+          sseBuffer += chunk;
+          let boundary = sseBuffer.indexOf('\n\n');
+          while (boundary !== -1) {
+            emit(sseBuffer.slice(0, boundary + 2));
+            sseBuffer = sseBuffer.slice(boundary + 2);
+            boundary = sseBuffer.indexOf('\n\n');
+          }
         }
+        if (sseBuffer.length > 0) emit(sseBuffer);
+      }
     }
   } catch (err) {
     log(`Streaming error: ${err}`);
+  }
+
+  // No usage from upstream (provider ignored stream_options, or a non-OpenAI
+  // format without usage): estimate from text so the ledger never records a
+  // silent $0 for a request that cost money. Flagged as estimated.
+  if (!streamUsageSeen && streamTokensIn === 0 && streamTokensOut === 0) {
+    const estIn = Math.ceil((promptText?.length ?? 0) / 4);
+    const estOut = Math.max(1, Math.ceil(streamedContentChars / 4));
+    if (estIn > 0 || streamedContentChars > 0) {
+      streamTokensIn = estIn;
+      streamTokensOut = estOut;
+      streamCostEstimated = true;
+      log(`Stream carried no usage; estimated ${estIn} in / ${estOut} out tokens from text length`);
+    }
   }
 
   // ── Cache: store streaming response ──
@@ -8796,6 +9158,7 @@ async function handleStreamingRequest(
   // Update token/cost info on the history entry (with cache token discount)
   const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut, streamCacheCreation || undefined, streamCacheRead || undefined);
   updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost, undefined, streamCacheCreation || undefined, streamCacheRead || undefined, agentFingerprint, agentId);
+  if (streamCostEstimated) markLastHistoryEntryEstimated();
   if (agentFingerprint && agentFingerprint !== 'unknown') updateAgentCost(agentFingerprint, streamCost);
   if (sessionId && sessionSource) upsertSession(sessionId, sessionSource, streamCost, streamTokensIn, streamTokensOut);
 
