@@ -1,6 +1,7 @@
 import React from 'react';
 
 // Polls /v1/memory/episodic and shapes events into RequestStream rows.
+// Rows carry run_id and agent_label when the request was attributed to a run.
 // Falls back to empty list on error. Newest event last (RequestStream reverses).
 
 function fmtTime(ts) {
@@ -46,6 +47,10 @@ async function fetchRecent(limit) {
       latMs: Number(e.duration_ms) || 0,
       reason: e.outcome_detail || '',
       cache: 0,
+      // Run attribution, present once the episodic row was stamped by
+      // run-attribution.ts. Drives the run chip in RequestStream.
+      runId: e.run_id || null,
+      agentLabel: e.agent_label || null,
     };
   });
 }

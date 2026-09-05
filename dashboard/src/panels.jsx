@@ -71,6 +71,28 @@ export function ProviderStrip({ providers }) {
 }
 
 // ---- Live request stream ----------------------------------------------------
+
+// Run attribution chip. Clicking it writes the SPA's only route, `#run=<id>`,
+// which App picks up on hashchange and opens in the runs tab.
+export function RunChip({ runId, agentLabel }) {
+  if (!runId) return null;
+  const tail = String(runId).split('/').pop() || String(runId);
+  const short = tail.length > 14 ? `${tail.slice(0, 13)}\u2026` : tail;
+  return (
+    <button
+      className="runchip"
+      title={`run ${runId}${agentLabel ? `, agent ${agentLabel}` : ''}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        window.location.hash = `#run=${encodeURIComponent(runId)}`;
+      }}
+    >
+      <span className="runchip__id">{short}</span>
+      {agentLabel && <span className="runchip__agent">{agentLabel}</span>}
+    </button>
+  );
+}
+
 function ReqRow({ r }) {
   const statusClass = "req__status req__status--" + r.status;
   return (
@@ -94,7 +116,10 @@ function ReqRow({ r }) {
       <span className="req__tok"><b>{r.tokIn.toLocaleString()}</b><span className="dim">/{r.tokOut.toLocaleString()}</span></span>
       <span className="req__cost">${r.cost.toFixed(4)}</span>
       <span className="req__lat">{r.latMs}ms</span>
-      <span className="req__reason">{r.reason}</span>
+      <span className="req__reason">
+        <RunChip runId={r.runId} agentLabel={r.agentLabel} />
+        {r.reason}
+      </span>
     </div>
   );
 }

@@ -14,10 +14,29 @@ import { useLiveSpendCurve } from './useLiveSpendCurve';
 import { useLiveProviders } from './useLiveProviders.js';
 import { Guardrails } from './Guardrails';
 import { useTier } from './useTier';
+import { Runs } from './Runs';
+import { RunDetail } from './RunDetail';
+import { useLiveRuns } from './useLiveRuns';
+import { useRunAlerts } from './useRunAlerts';
 
-// Tabs exposed by the dashboard header. Only `overview` is wired today; the
-// rest render a placeholder until their data layer lands.
-const TABS = ['overview', 'requests', 'routing', 'tokens', 'sessions', 'policies', 'audit', 'config'];
+// Tabs exposed by the dashboard header. `overview`, `runs` and `config` are
+// wired; the rest render a placeholder until their data layer lands.
+const TABS = ['overview', 'runs', 'requests', 'routing', 'tokens', 'sessions', 'policies', 'audit', 'config'];
+
+// Deep link contract: `#run=<id>` opens the runs tab on that run. The CLI
+// prints this URL at run start and the request stream's run chip writes it.
+const RUN_HASH = /^#run=(.+)$/;
+
+export function parseRunHash(hash) {
+  const raw = typeof hash === 'string' ? hash : (typeof window === 'undefined' ? '' : window.location.hash);
+  const m = RUN_HASH.exec(raw || '');
+  if (!m) return null;
+  try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+}
+
+// A run alert only earns the strip while it is fresh; ten minutes is the
+// window where you can still do something about it.
+const RUN_ALERT_MAX_AGE_MS = 10 * 60 * 1000;
 
 function ComingSoon({ tabName }) {
   return (
@@ -157,7 +176,27 @@ function HeroStat({ eyebrow, value, unit, sub, delta, deltaDir, accent, footer, 
   );
 }
 
-function HeroStats({ today }) {
+// The fourth line under the tiles: what is burning right now, per run, with a
+// jump into the ledger. Live runs are the only number here that can change
+// between two blinks, so it gets its own rule rather than a fifth tile.
+function RunsInFlight({ runs, onOpen }) {
+  const inFlight = runs.reduce((a, r) => a + (Number(r.cost_usd) || 0), 0);
+  const burn = runs.reduce((a, r) => a + (Number(r.cost_per_minute) || 0), 0);
+  const waves = runs.filter(r => r.rate_limit_wave).length;
+  return (
+    <button className={'runsline' + (runs.length > 0 ? ' is-live' : '')} onClick={onOpen} title="open the runs ledger">
+      <span className="runsline__dot" />
+      <span className="runsline__lead">
+        <b>{runs.length}</b> {runs.length === 1 ? 'run' : 'runs'} active, <b>${inFlight.toFixed(2)}</b> in flight
+      </span>
+      {burn > 0 && <span className="runsline__burn">${burn.toFixed(2)}/min combined burn</span>}
+      {waves > 0 && <span className="runpill runpill--wave">{waves} in a 429 wave</span>}
+      <span className="runsline__go">open runs ▸</span>
+    </button>
+  );
+}
+
+function HeroStats({ today, activeRuns, onOpenRuns }) {
   return (
     <section className="hero-stats" data-screen-label="hero-stats">
       <HeroStat
@@ -192,6 +231,7 @@ function HeroStats({ today }) {
         sub={`p95 ${today.latencyP95.toFixed(2)}s`}
         footer={<span>across {today.requests.toLocaleString()} requests</span>}
       />
+      <RunsInFlight runs={activeRuns || []} onOpen={onOpenRuns} />
     </section>
   );
 }
@@ -387,7 +427,30 @@ export function App() {
     setDays(d);
     try { localStorage.setItem('rp_tf', String(d)); } catch {}
   };
-  const [activeTab, setActiveTab] = React.useState('overview');
+  const [activeTab, setActiveTab] = React.useState(() => (parseRunHash() ? 'runs' : 'overview'));
+  const [runId, setRunId] = React.useState(() => parseRunHash());
+  // `#run=<id>` is the only route this SPA has. Sync it on mount and on every
+  // hashchange so the CLI's printed URL, the request-stream chip and the
+  // browser back button all land on the same run.
+  React.useEffect(() => {
+    const apply = () => {
+      const id = parseRunHash();
+      setRunId(id);
+      if (id) setActiveTab('runs');
+    };
+    apply();
+    window.addEventListener('hashchange', apply);
+    return () => window.removeEventListener('hashchange', apply);
+  }, []);
+  const openRun = React.useCallback((id) => {
+    if (id) {
+      window.location.hash = `#run=${encodeURIComponent(id)}`;
+    } else if (window.location.hash) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+    setRunId(id || null);
+    setActiveTab('runs');
+  }, []);
   const today = useLiveToday(5000, days);
   const liveReqs = useLiveRequests({ intervalMs: Math.max(1000, t.tickRate), limit: Math.max(50, t.streamCap), days });
   const liveSessions = useLiveSessions({ intervalMs: 5000, limit: 20, days });
@@ -396,6 +459,20 @@ export function App() {
   const { curve: spendCurve, nowHr } = useLiveSpendCurve(30000, days);
   const { providers: liveProviders } = useLiveProviders({ intervalMs: 10000, days });
   const breakdown = useLiveBreakdown({ intervalMs: 10000, days });
+  const { runs: activeRuns } = useLiveRuns({ intervalMs: 5000, active: true });
+  const { alerts: runAlerts } = useRunAlerts({ intervalMs: 15000, since: '1h', limit: 50 });
+
+  // Newest critical run alert, only while it is still actionable.
+  const criticalRunAlert = React.useMemo(() => {
+    const cutoff = Date.now() - RUN_ALERT_MAX_AGE_MS;
+    let newest = null;
+    for (const a of runAlerts) {
+      if (a.severity !== 'critical') continue;
+      if (!(Number(a.ts) > cutoff)) continue;
+      if (!newest || Number(a.ts) > Number(newest.ts)) newest = a;
+    }
+    return newest;
+  }, [runAlerts]);
 
   const reqs = React.useMemo(() => {
     if (paused || killArmed) return frozen ?? [];
@@ -441,10 +518,20 @@ export function App() {
         </div>
       )}
 
+      {criticalRunAlert && (
+        <div className="runband" data-screen-label="run-alert-strip">
+          <span className="runband__icon">▲</span>
+          <b>{String(criticalRunAlert.kind || 'run alert').replace(/_/g, ' ')}.</b>
+          <span className="runband__msg">{criticalRunAlert.message}</span>
+          <code className="runband__id" title={criticalRunAlert.run_id}>{criticalRunAlert.run_id}</code>
+          <button className="ghostbtn runband__btn" onClick={() => openRun(criticalRunAlert.run_id)}>open run</button>
+        </div>
+      )}
+
       <main className="body">
         {activeTab === 'overview' ? (
           <>
-            <HeroStats today={today} />
+            <HeroStats today={today} activeRuns={activeRuns} onOpenRuns={() => openRun(null)} />
 
             <section className="row row--full">
               <BudgetMeter
@@ -476,6 +563,10 @@ export function App() {
 
             <Sessions sessions={liveSessions} />
           </>
+        ) : activeTab === 'runs' ? (
+          runId
+            ? <RunDetail id={runId} onBack={() => openRun(null)} onOpenRun={openRun} />
+            : <Runs days={days} onOpenRun={openRun} />
         ) : activeTab === 'config' ? (
           <Guardrails />
         ) : (
