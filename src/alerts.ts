@@ -26,7 +26,7 @@ export interface AlertsConfig {
   maxHistory: number;
 }
 
-export type AlertType = 'threshold' | 'anomaly' | 'breach';
+export type AlertType = 'threshold' | 'anomaly' | 'breach' | 'run';
 
 export interface Alert {
   id: string;
@@ -168,6 +168,20 @@ export class AlertManager {
   }
 
   /**
+   * Fire a run attribution alert (band, cap, 429 wave, drift, cost).
+   * Deduplicated per (kind, run_id) inside the configured cooldown. The
+   * `run_alerts` table in runs.db stays the source of truth for runs; this is
+   * the mirror for users who already point `alerts.webhookUrl` somewhere.
+   */
+  fireRun(kind: string, message: string, severity: 'info' | 'warning' | 'critical', data: Record<string, unknown>): Alert | null {
+    if (!this.config.enabled) return null;
+    const dedupKey = `run:${kind}:${String(data['run_id'])}`;
+    if (this.isDuplicate(dedupKey)) return null;
+
+    return this.createAlert('run', message, severity, { kind, ...data });
+  }
+
+  /**
    * Get recent alerts
    */
   getRecent(limit: number = 20): Alert[] {
@@ -192,7 +206,7 @@ export class AlertManager {
    * Get alert count by type
    */
   getCounts(): Record<AlertType, number> {
-    const counts: Record<AlertType, number> = { threshold: 0, anomaly: 0, breach: 0 };
+    const counts: Record<AlertType, number> = { threshold: 0, anomaly: 0, breach: 0, run: 0 };
     if (this.db) {
       const rows = this.db.prepare('SELECT type, COUNT(*) as c FROM alerts GROUP BY type').all() as Array<{ type: string; c: number }>;
       for (const r of rows) {
@@ -289,7 +303,7 @@ export class AlertManager {
         }
       } catch { /* SQLite failure non-fatal */ }
     }).catch(() => {
-      // Webhook delivery failure — non-fatal
+      // Webhook delivery failure, non-fatal
     });
   }
 }

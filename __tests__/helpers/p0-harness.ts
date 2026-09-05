@@ -159,7 +159,29 @@ export interface MockAnthropicUpstream {
   calls: UpstreamCall[];
   /** Prompt-substring to delay-ms, same contract as MockUpstream.delays. */
   delays: Map<string, number>;
+  /**
+   * When set, every /v1/messages call answers with this HTTP status and an
+   * Anthropic-shaped error body instead of a completion. The proxy parses the
+   * error body as JSON on the failure path, so the body stays valid JSON.
+   */
+  failStatus: number | null;
+  /**
+   * Prompt-substring to remaining failure count. Takes precedence over
+   * `failStatus` and decrements on each matching call, so a test can fail the
+   * first N requests of one agent and let the rest through.
+   */
+  failures: Map<string, number>;
   close(): Promise<void>;
+}
+
+/** Longest matching key wins, same rule as the delay table. */
+function failureKeyFor(failures: Map<string, number>, text: string): string | null {
+  let best: string | null = null;
+  for (const [needle, remaining] of failures) {
+    if (!needle || remaining <= 0 || !text.includes(needle)) continue;
+    if (best === null || needle.length > best.length) best = needle;
+  }
+  return best;
 }
 
 /**
@@ -179,6 +201,8 @@ export function anthropicMockUsage(userText: string): { input_tokens: number; ou
 export function startMockAnthropicUpstream(): Promise<MockAnthropicUpstream> {
   const calls: UpstreamCall[] = [];
   const delays = new Map<string, number>();
+  const failures = new Map<string, number>();
+  const state: { failStatus: number | null } = { failStatus: null };
   const server = http.createServer((req, res) => {
     const path = req.url ?? '';
     const pathname = path.split('?')[0] ?? '';
@@ -202,6 +226,20 @@ export function startMockAnthropicUpstream(): Promise<MockAnthropicUpstream> {
       const model = String(body['model'] ?? 'claude-sonnet-4-6');
       const usage = anthropicMockUsage(allUserText(body));
       const wait = delayFor(delays, firstUserText(body));
+      const failureKey = failureKeyFor(failures, allUserText(body));
+      const failStatus = failureKey !== null ? 429 : state.failStatus;
+      if (failureKey !== null) failures.set(failureKey, (failures.get(failureKey) ?? 1) - 1);
+      if (failStatus !== null) {
+        const fail = (): void => {
+          res.writeHead(failStatus, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: failStatus === 429 ? 'rate_limit_error' : 'api_error', message: `mock upstream ${failStatus}` },
+          }));
+        };
+        if (wait > 0) setTimeout(fail, wait); else fail();
+        return;
+      }
       const answer = (): void => {
         if (body['stream'] === true) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -252,6 +290,9 @@ export function startMockAnthropicUpstream(): Promise<MockAnthropicUpstream> {
         url: `http://127.0.0.1:${addr.port}`,
         calls,
         delays,
+        failures,
+        get failStatus() { return state.failStatus; },
+        set failStatus(v: number | null) { state.failStatus = v; },
         close: () => new Promise<void>((r) => { server.closeAllConnections?.(); server.close(() => r()); }),
       });
     });
@@ -583,10 +624,23 @@ export interface RunsDbAgentRow {
   last_status_code: number | null;
 }
 
+export interface RunsDbAlertRow {
+  id: number;
+  ts: number;
+  kind: string;
+  run_id: string;
+  agent_label: string | null;
+  severity: string;
+  message: string;
+  data: string;
+  delivered: number;
+}
+
 export interface RunsDbDump {
   runs: RunsDbRunRow[];
   requests: RunsDbRequestRow[];
   agents: RunsDbAgentRow[];
+  alerts: RunsDbAlertRow[];
 }
 
 interface SqliteStatement {
@@ -607,7 +661,7 @@ type SqliteCtor = new (path: string, opts?: { readonly?: boolean; fileMustExist?
  */
 export function readRunsDb(home: string): RunsDbDump {
   const file = join(home, '.relayplane', 'runs.db');
-  const empty: RunsDbDump = { runs: [], requests: [], agents: [] };
+  const empty: RunsDbDump = { runs: [], requests: [], agents: [], alerts: [] };
   if (!existsSync(file)) return empty;
   const requireFrom = createRequire(__filename);
   let Database: SqliteCtor;
@@ -630,6 +684,7 @@ export function readRunsDb(home: string): RunsDbDump {
       runs: table<RunsDbRunRow>('runs'),
       requests: table<RunsDbRequestRow>('run_requests'),
       agents: table<RunsDbAgentRow>('run_agents'),
+      alerts: table<RunsDbAlertRow>('run_alerts'),
     };
   } catch {
     return empty;

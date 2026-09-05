@@ -92,9 +92,14 @@ import {
   runCtx, newRunRequestContext, attachRunIdentity, setRunTraceId, stampRunFields, recordRunRequest,
   checkRunCap, withRunHeaders, endRun, registerRun, configureRunAttribution, startRunAttributionTimers,
   stopRunAttributionTimers, RUN_REQUEST_HEADERS, RUN_RESPONSE_HEADERS, DEFAULT_ATTRIBUTION_CONFIG,
+  getAttributionConfig, isRateLimitWave, suggestedBands, LABEL_STATS_WINDOW_DAYS,
   type AttributionConfig,
 } from './run-attribution.js';
-import { getRunStore } from './run-store.js';
+import { getRunStore, type RunListFilter, type RunRequestRow, type RunRow } from './run-store.js';
+import {
+  renderExport, exportContentType, exportFilename, isExportFormat,
+  type ExportContent, type ExportRun,
+} from './run-export.js';
 import { getToolRouter, extractToolContext } from './tool-router.js';
 import { getTokenPool, type PoolAccountConfig } from './token-pool.js';
 import {
@@ -5001,6 +5006,19 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     configureRunAttribution(proxyConfig.attribution, {
       log,
       resolveAgentName: (fingerprint: string) => getAgentRegistry()[fingerprint]?.name,
+      // Mirror every run alert into the existing AlertManager so users who
+      // already configured `alerts.webhookUrl` see them without new plumbing.
+      forwardAlert: (alert) => {
+        try {
+          alertManager.fireRun(alert.kind, alert.message, alert.severity, {
+            ...alert.data,
+            run_id: alert.run_id,
+            agent_label: alert.agent_label,
+          });
+        } catch (err) {
+          log(`Run alert forward failed: ${err}`);
+        }
+      },
     });
   };
   applyAttributionConfig();
@@ -6519,6 +6537,210 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         res.end(JSON.stringify(body));
       };
       const dashboardUrlFor = (id: string) => `http://localhost:${port}/dashboard#run=${encodeURIComponent(id)}`;
+      const runsStore = getRunStore();
+      const runsParams = new URLSearchParams(url.includes('?') ? url.split('?')[1] ?? '' : '');
+      const runsIntParam = (name: string, fallback: number, max: number): number => {
+        const raw = runsParams.get(name);
+        if (raw === null) return fallback;
+        const parsed = Number.parseInt(raw, 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+        return Math.min(parsed, max);
+      };
+      /** `since` accepts a ms epoch, an ISO timestamp, or a `1h` / `30m` / `2d` offset. */
+      const parseSince = (raw: string | null, now: number): number | undefined => {
+        if (!raw) return undefined;
+        const trimmed = raw.trim();
+        const relative = /^(\d+)\s*([smhd])$/i.exec(trimmed);
+        if (relative) {
+          const amount = Number.parseInt(relative[1] ?? '0', 10);
+          const unit = (relative[2] ?? 'h').toLowerCase();
+          const scale = unit === 's' ? 1000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000;
+          return now - amount * scale;
+        }
+        if (/^\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10);
+        const parsed = Date.parse(trimmed);
+        return Number.isFinite(parsed) ? parsed : undefined;
+      };
+      /** Join the in-memory request content onto a page of request rows, by history id. */
+      const runsContentByTrace = (rows: RunRequestRow[]): Map<string, ExportContent> => {
+        const traceByHistoryId = new Map<string, string>();
+        for (const row of rows) {
+          if (row.history_id) traceByHistoryId.set(row.history_id, row.trace_id);
+        }
+        const out = new Map<string, ExportContent>();
+        if (traceByHistoryId.size === 0) return out;
+        for (const entry of getRequestHistory()) {
+          const traceId = traceByHistoryId.get(entry.id);
+          if (!traceId || !entry.requestContent) continue;
+          const content: ExportContent = {};
+          if (entry.requestContent.systemPrompt !== undefined) content.systemPrompt = entry.requestContent.systemPrompt;
+          if (entry.requestContent.userMessage !== undefined) content.userMessage = entry.requestContent.userMessage;
+          if (entry.requestContent.responsePreview !== undefined) content.responsePreview = entry.requestContent.responsePreview;
+          out.set(traceId, content);
+        }
+        return out;
+      };
+      const enrichRun = (row: RunRow) => ({
+        ...row,
+        agent_count: runsStore.agentsForRun(row.run_id).length,
+        savings_usd: Math.max(0, row.baseline_usd - row.cost_usd),
+        retry_pct: row.cost_usd > 0 ? row.retry_cost_usd / row.cost_usd : 0,
+        band_status: row.band_status,
+      });
+      /** Shared by GET /v1/runs/:id and POST /v1/runs/:id/end. */
+      const buildRunDetail = (id: string) => {
+        const run = runsStore.getRun(id);
+        if (!run) return null;
+        const agents = runsStore.agentsForRun(id).slice().sort((a, b) => b.cost_usd - a.cost_usd);
+        const allRequests = runsStore.listRequests(id, { limit: 10_000 }).requests;
+        const byModel = new Map<string, { model: string; request_count: number; cost_usd: number; tokens_in: number; tokens_out: number }>();
+        const drift = new Map<string, { agent_label: string; requested_model: string; model: string; count: number }>();
+        for (const row of allRequests) {
+          const bucket = byModel.get(row.model) ?? { model: row.model, request_count: 0, cost_usd: 0, tokens_in: 0, tokens_out: 0 };
+          bucket.request_count += 1;
+          bucket.cost_usd += row.cost_usd;
+          bucket.tokens_in += row.tokens_in;
+          bucket.tokens_out += row.tokens_out;
+          byModel.set(row.model, bucket);
+          if (row.requested_model && row.requested_model !== row.model) {
+            const key = `${row.agent_label}|${row.requested_model}|${row.model}`;
+            const seen = drift.get(key) ?? { agent_label: row.agent_label, requested_model: row.requested_model, model: row.model, count: 0 };
+            seen.count += 1;
+            drift.set(key, seen);
+          }
+        }
+        const children = runsStore.childrenOf(id);
+        return {
+          run,
+          agents,
+          by_model: [...byModel.values()].sort((a, b) => b.cost_usd - a.cost_usd),
+          children,
+          retries: {
+            count: run.retry_count,
+            cost_usd: run.retry_cost_usd,
+            pct: run.cost_usd > 0 ? run.retry_cost_usd / run.cost_usd : 0,
+          },
+          band: { lo: run.band_lo, hi: run.band_hi, status: run.band_status, cache_state: run.cache_state },
+          drift: [...drift.values()].sort((a, b) => b.count - a.count),
+          alerts: runsStore.listAlerts({ run_id: id, limit: 200 }),
+          total_with_children_usd: run.cost_usd + children.reduce((sum, child) => sum + child.cost_usd, 0),
+        };
+      };
+
+      // --- fixed paths, matched BEFORE the :id regexes -----------------------
+      if (req.method === 'GET' && pathname === '/v1/runs') {
+        const now = Date.now();
+        const days = runsIntParam('days', 7, 3650);
+        const limit = runsIntParam('limit', 50, 500);
+        const filter: RunListFilter = { limit, sinceMs: now - days * 86_400_000 };
+        const status = runsParams.get('status');
+        if (status === 'running' || status === 'completed' || status === 'stale_closed' || status === 'failed') {
+          filter.status = status;
+        }
+        const label = runsParams.get('label');
+        if (label) filter.label = label;
+        const tag = runsParams.get('tag');
+        if (tag) filter.tag = tag;
+        const source = runsParams.get('source');
+        if (source === 'header' || source === 'inferred_cc' || source === 'inferred_gap') filter.source = source;
+        const cursor = runsParams.get('cursor');
+        if (cursor) filter.cursor = cursor;
+        const page = runsStore.listRuns(filter);
+        runsJson(200, { runs: page.runs.map(enrichRun), next_cursor: page.next_cursor });
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/v1/runs/active') {
+        const now = Date.now();
+        const windowMs = 5 * 60 * 1000;
+        const idleCloseSeconds = getAttributionConfig().idleCloseSeconds;
+        const runs = runsStore.activeRuns(now - windowMs).map((row) => {
+          const recent = runsStore.requestsSince(row.run_id, now - windowMs);
+          const costPerMinute = recent.reduce((sum, r) => sum + r.cost_usd, 0) / 5;
+          return {
+            ...enrichRun(row),
+            cost_per_minute: costPerMinute,
+            projected_cost_at_idle_close: row.cost_usd + (costPerMinute * idleCloseSeconds) / 60,
+            rate_limit_wave: isRateLimitWave(row.run_id, now),
+          };
+        });
+        runsJson(200, { runs, total: runs.length });
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/v1/runs/bands') {
+        const attributionCfg = getAttributionConfig();
+        const label = runsParams.get('label');
+        if (!label) {
+          runsJson(200, {
+            label: null,
+            configured: attributionCfg.bands['*'] ?? null,
+            suggested: null,
+            n: { cold: 0, warm: 0 },
+          });
+          return;
+        }
+        const cold = runsStore.getLabelStats(label, 'cold', LABEL_STATS_WINDOW_DAYS);
+        const warm = runsStore.getLabelStats(label, 'warm', LABEL_STATS_WINDOW_DAYS);
+        const suggestedCold = suggestedBands(cold);
+        const suggestedWarm = suggestedBands(warm);
+        runsJson(200, {
+          label,
+          configured: attributionCfg.bands[label] ?? attributionCfg.bands['*'] ?? null,
+          suggested: suggestedCold || suggestedWarm ? { cold: suggestedCold, warm: suggestedWarm } : null,
+          n: { cold: cold?.n ?? 0, warm: warm?.n ?? 0 },
+        });
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/v1/runs/alerts') {
+        const now = Date.now();
+        const limit = runsIntParam('limit', 100, 1000);
+        const sinceTs = parseSince(runsParams.get('since'), now);
+        const opts: { sinceTs?: number; limit: number; run_id?: string } = { limit };
+        if (sinceTs !== undefined) opts.sinceTs = sinceTs;
+        const runIdFilter = runsParams.get('run_id');
+        if (runIdFilter) opts.run_id = runIdFilter;
+        runsJson(200, { alerts: runsStore.listAlerts(opts) });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/v1/runs/export') {
+        let body: Record<string, unknown> = {};
+        try { body = await readJsonBody(req); } catch { runsJson(400, { error: 'Invalid JSON' }); return; }
+        const format = body['format'] ?? 'json';
+        if (!isExportFormat(format)) {
+          runsJson(400, { error: 'format must be one of: csv, json, jsonl' });
+          return;
+        }
+        const includeContent = body['include_content'] === true;
+        const rawIds = body['run_ids'];
+        const selected: RunRow[] = [];
+        if (Array.isArray(rawIds)) {
+          for (const raw of rawIds) {
+            if (typeof raw !== 'string') continue;
+            const row = runsStore.getRun(raw);
+            if (row) selected.push(row);
+          }
+        } else {
+          const days = typeof body['days'] === 'number' && body['days'] > 0 ? body['days'] : 7;
+          selected.push(...runsStore.listRuns({ limit: 500, sinceMs: Date.now() - days * 86_400_000 }).runs);
+        }
+        const payload: ExportRun[] = selected.map((row) => {
+          const requests = runsStore.listRequests(row.run_id, { limit: 10_000 }).requests;
+          const entry: ExportRun = { run: row, requests };
+          if (includeContent) entry.content = runsContentByTrace(requests);
+          return entry;
+        });
+        const rendered = renderExport(payload, format, includeContent);
+        res.writeHead(200, {
+          'Content-Type': exportContentType(format),
+          'Content-Disposition': `attachment; filename="${exportFilename(format)}"`,
+        });
+        res.end(rendered);
+        return;
+      }
+
       if (req.method === 'POST' && pathname === '/v1/runs') {
         let body: Record<string, unknown> = {};
         try { body = await readJsonBody(req); } catch { runsJson(400, { error: 'Invalid JSON' }); return; }
@@ -6541,33 +6763,57 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const exitCode = typeof body['exit_code'] === 'number' ? body['exit_code'] : null;
         const run = endRun(id, { exitCode });
         if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
-        const store = getRunStore();
-        runsJson(200, { run, agents: store.agentsForRun(id), children: store.childrenOf(id) });
+        const detail = buildRunDetail(id);
+        if (!detail) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+        runsJson(200, detail);
+        return;
+      }
+      const requestsMatch = /^\/v1\/runs\/(.+)\/requests$/.exec(pathname);
+      if (req.method === 'GET' && requestsMatch) {
+        const id = decodeURIComponent(requestsMatch[1]!);
+        if (!runsStore.getRun(id)) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+        const limit = runsIntParam('limit', 100, 1000);
+        const cursor = runsParams.get('cursor');
+        const opts: { limit: number; cursor?: string } = { limit };
+        if (cursor) opts.cursor = cursor;
+        const page = runsStore.listRequests(id, opts);
+        // Content is opt-in: `dashboard.showRequestContent` must be explicitly true.
+        if (proxyConfig.dashboard?.showRequestContent !== true) {
+          runsJson(200, { requests: page.requests, next_cursor: page.next_cursor });
+          return;
+        }
+        const content = runsContentByTrace(page.requests);
+        runsJson(200, {
+          requests: page.requests.map((row) => {
+            const joined = content.get(row.trace_id);
+            return joined ? { ...row, content: joined } : { ...row };
+          }),
+          next_cursor: page.next_cursor,
+        });
         return;
       }
       const idMatch = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
       if (idMatch) {
         const id = decodeURIComponent(idMatch[1]!);
-        const store = getRunStore();
         if (req.method === 'POST') {
           let body: Record<string, unknown> = {};
           try { body = await readJsonBody(req); } catch { runsJson(400, { error: 'Invalid JSON' }); return; }
-          let run = store.getRun(id);
+          let run = runsStore.getRun(id);
           if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
-          if (typeof body['cap_usd'] === 'number' && body['cap_usd'] > 0) run = store.setCap(id, body['cap_usd']) ?? run;
-          if (body['cap_usd'] === null) run = store.setCap(id, null) ?? run;
-          if (typeof body['label'] === 'string' && body['label'].trim()) run = store.setLabel(id, body['label'].trim().slice(0, 80)) ?? run;
+          if (typeof body['cap_usd'] === 'number' && body['cap_usd'] > 0) run = runsStore.setCap(id, body['cap_usd']) ?? run;
+          if (body['cap_usd'] === null) run = runsStore.setCap(id, null) ?? run;
+          if (typeof body['label'] === 'string' && body['label'].trim()) run = runsStore.setLabel(id, body['label'].trim().slice(0, 80)) ?? run;
           runsJson(200, { run });
           return;
         }
         if (req.method === 'GET') {
-          const run = store.getRun(id);
-          if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
-          runsJson(200, { run, agents: store.agentsForRun(id), children: store.childrenOf(id) });
+          const detail = buildRunDetail(id);
+          if (!detail) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+          runsJson(200, detail);
           return;
         }
       }
-      runsJson(404, { error: 'not_found', hint: 'PR2 ships GET /v1/runs, /v1/runs/active, /bands, /alerts, /export' });
+      runsJson(404, { error: 'not_found', run_path: pathname });
       return;
     }
 

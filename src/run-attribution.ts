@@ -22,10 +22,13 @@ import { sha256Hex } from './trace-writer.js';
 import { estimateCost } from './telemetry.js';
 import {
   getRunStore,
+  nearestRankPercentile,
   _resetRunStore,
   type BandStatus,
   type CacheState,
+  type LabelStatsRow,
   type RetryReason,
+  type RunAgentRow,
   type RunAlertRow,
   type RunRequestRow,
   type RunRow,
@@ -225,11 +228,20 @@ export const runCtx = new AsyncLocalStorage<RunRequestContext>();
 const MAX_MAP_ENTRIES = 5000;
 const RETRY_WINDOW_MS = 120_000;
 const BASELINE_MODEL = 'claude-opus-4-6';
+/** Rate-limit ring depth and the per-run re-alert cooldown for the 429 wave. */
+const WAVE_RING_SIZE = 50;
+const WAVE_COOLDOWN_MS = 300_000;
+/** Label stats are always computed over the trailing 30 days. */
+export const LABEL_STATS_WINDOW_DAYS = 30;
+const DAY_MS = 86_400_000;
 
 const gapRuns = new Map<string, { runId: string; lastSeen: number }>();
 const lastPromptByThread = new Map<string, { hash: string; ts: number }>();
 const baselineByTrace = new Map<string, number>();
 const cacheTallyByRun = new Map<string, { cold: number; warm: number }>();
+/** Last 50 rate-limited failures per run, newest last. */
+const rateLimitRingByRun = new Map<string, { ts: number; agent_label: string }[]>();
+const waveFiredAtByRun = new Map<string, number>();
 let lastInvalidRunLogAt = 0;
 
 let idleTimer: NodeJS.Timeout | null = null;
@@ -685,31 +697,266 @@ function updateCacheState(run: RunRow, row: RunRequestRow, prev: RunRequestRow |
   }
 }
 
+// ---------------------------------------------------------------------------
+// Evaluators: bands (4.5), 429 wave (4.7), drift (4.8)
+// ---------------------------------------------------------------------------
+
 /**
- * PR1 implements the `alerts.runCostUsd` check only.
- * PR2: band / wave / drift evaluators land here (they consume `agent` and `prev`).
+ * Configured band for a run: `bands[label]` first, then the `"*"` fallback.
+ * A warm run reads the `warm` pair, everything else reads `cold`.
  */
+export function bandForRun(run: Pick<RunRow, 'label' | 'cache_state'>): [number, number] | null {
+  const bands = _config.bands;
+  const entry = (run.label !== null ? bands[run.label] : undefined) ?? bands['*'];
+  if (!entry) return null;
+  const pair = run.cache_state === 'warm' ? entry.warm : entry.cold;
+  if (!pair) return null;
+  const [lo, hi] = pair;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) return null;
+  return [lo, hi];
+}
+
+/** `[p25, p75]` from a stats row, or null while the sample is still too small. */
+export function suggestedBands(stats: LabelStatsRow | null): [number, number] | null {
+  if (!stats || stats.p25 === null || stats.p75 === null) return null;
+  return [stats.p25, stats.p75];
+}
+
+/** Highest request_count model per agent label, across one run's agents. */
+export function dominantModels(agents: RunAgentRow[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  const best = new Map<string, { model: string; count: number }>();
+  for (const agent of agents) {
+    for (const [model, count] of Object.entries(agent.models_seen)) {
+      const current = best.get(agent.agent_label);
+      if (!current || count > current.count || (count === current.count && model < current.model)) {
+        best.set(agent.agent_label, { model, count });
+      }
+    }
+  }
+  for (const [label, pick] of best) out[label] = pick.model;
+  return out;
+}
+
+/** Live band evaluation, on every recorded request. */
+function evaluateBands(run: RunRow, agentLabel: string, ts: number): void {
+  const band = bandForRun(run);
+  if (!band) return;
+  const [lo, hi] = band;
+  const store = getRunStore();
+  let status: BandStatus = run.band_status;
+  let crossed = false;
+  if (run.cost_usd > hi) {
+    if (status !== 'over') {
+      status = 'over';
+      crossed = true;
+    }
+  } else if (run.cost_usd >= lo && (status === 'none' || status === 'under')) {
+    status = 'in';
+  }
+  store.setBandStatus(run.run_id, status, lo, hi);
+  run.band_status = status;
+  run.band_lo = lo;
+  run.band_hi = hi;
+  if (!crossed || !_config.alerts.overBand) return;
+  if (store.hasAlert(run.run_id, 'run.over_band')) return;
+  deliverAlert(
+    store.addAlert({
+      ts,
+      kind: 'run.over_band',
+      run_id: run.run_id,
+      agent_label: agentLabel,
+      severity: 'warning',
+      message: `Run ${run.run_id} is over its expected band: $${run.cost_usd.toFixed(4)} vs $${lo}-$${hi}`,
+      data: { run_id: run.run_id, cost_usd: run.cost_usd, band_lo: lo, band_hi: hi, label: run.label },
+    }),
+  );
+}
+
+/** Rate-limited failures feed a bounded per-run ring, newest last. */
+function pushRateLimitEvent(runId: string, agentLabel: string, ts: number): void {
+  const ring = rateLimitRingByRun.get(runId) ?? [];
+  ring.push({ ts, agent_label: agentLabel });
+  while (ring.length > WAVE_RING_SIZE) ring.shift();
+  setBounded(rateLimitRingByRun, runId, ring);
+}
+
+function waveWindow(runId: string, now: number): { ts: number; agent_label: string }[] {
+  const ring = rateLimitRingByRun.get(runId);
+  if (!ring) return [];
+  const cutoff = now - _config.rateLimitWave.windowSeconds * 1000;
+  return ring.filter((e) => e.ts >= cutoff);
+}
+
+/** True while the configured count of 429/529s sits inside the configured window. */
+export function isRateLimitWave(runId: string, now?: number): boolean {
+  if (!_config.rateLimitWave.enabled) return false;
+  return waveWindow(runId, now ?? Date.now()).length >= _config.rateLimitWave.count;
+}
+
+function evaluateRateLimitWave(run: RunRow, row: RunRequestRow): void {
+  if (!_config.rateLimitWave.enabled) return;
+  if (row.success === 1) return;
+  if (row.status_code !== 429 && row.status_code !== 529) return;
+  pushRateLimitEvent(run.run_id, row.agent_label, row.ts);
+  const inWindow = waveWindow(run.run_id, row.ts);
+  if (inWindow.length < _config.rateLimitWave.count) return;
+  const lastFired = waveFiredAtByRun.get(run.run_id);
+  if (lastFired !== undefined && row.ts - lastFired < WAVE_COOLDOWN_MS) return;
+  setBounded(waveFiredAtByRun, run.run_id, row.ts);
+  const agentsAffected = [...new Set(inWindow.map((e) => e.agent_label))];
+  const store = getRunStore();
+  deliverAlert(
+    store.addAlert({
+      ts: row.ts,
+      kind: 'run.rate_limit_wave',
+      run_id: run.run_id,
+      agent_label: row.agent_label,
+      severity: 'warning',
+      message: `Run ${run.run_id} hit ${inWindow.length} rate limits in ${_config.rateLimitWave.windowSeconds}s`,
+      data: {
+        run_id: run.run_id,
+        count: inWindow.length,
+        window: _config.rateLimitWave.windowSeconds,
+        agents_affected: agentsAffected,
+        cost_so_far: run.cost_usd,
+      },
+    }),
+  );
+}
+
+function evaluateRunCost(run: RunRow, agentLabel: string, ts: number): void {
+  const threshold = _config.alerts.runCostUsd;
+  if (threshold === null || run.cost_usd < threshold) return;
+  const store = getRunStore();
+  if (store.hasAlert(run.run_id, 'run.cost_exceeded')) return;
+  deliverAlert(
+    store.addAlert({
+      ts,
+      kind: 'run.cost_exceeded',
+      run_id: run.run_id,
+      agent_label: agentLabel,
+      severity: 'warning',
+      message: `Run ${run.run_id} crossed $${threshold.toFixed(2)}, now $${run.cost_usd.toFixed(4)}`,
+      data: { run_id: run.run_id, cost_usd: run.cost_usd, threshold, request_count: run.request_count },
+    }),
+  );
+}
+
+/** Every per-request evaluator, in the order the plan lists them. */
 function evaluateRunSignals(
   run: RunRow,
   agent: { agent_label: string },
   row: RunRequestRow,
   prev: RunRequestRow | null,
 ): void {
-  const threshold = _config.alerts.runCostUsd;
-  if (threshold === null || run.cost_usd < threshold) return;
-  const store = getRunStore();
-  if (store.hasAlert(run.run_id, 'run.cost_exceeded')) return;
-  const alert = store.addAlert({
-    ts: row.ts,
-    kind: 'run.cost_exceeded',
-    run_id: run.run_id,
-    agent_label: agent.agent_label,
-    severity: 'warning',
-    message: `Run ${run.run_id} crossed $${threshold.toFixed(2)}, now $${run.cost_usd.toFixed(4)}`,
-    data: { run_id: run.run_id, cost_usd: run.cost_usd, threshold, request_count: run.request_count },
-  });
-  deliverAlert(alert);
+  evaluateRunCost(run, agent.agent_label, row.ts);
+  evaluateBands(run, agent.agent_label, row.ts);
+  evaluateRateLimitWave(run, row);
   void prev;
+}
+
+/**
+ * Cross-run model drift: this run's per-agent dominant model against the
+ * previous window's. Fired BEFORE label_stats is overwritten.
+ */
+function evaluateModelDrift(
+  run: RunRow,
+  cacheKey: string,
+  dominant: Record<string, string>,
+  now: number,
+): void {
+  if (!_config.alerts.modelDrift) return;
+  const store = getRunStore();
+  const previous = store.getLabelStats(run.label ?? '', cacheKey, LABEL_STATS_WINDOW_DAYS);
+  if (!previous) return;
+  for (const [agentLabel, model] of Object.entries(dominant)) {
+    const from = previous.dominant_models[agentLabel];
+    if (!from || from === model) continue;
+    deliverAlert(
+      store.addAlert({
+        ts: now,
+        kind: 'run.model_drift',
+        run_id: run.run_id,
+        agent_label: agentLabel,
+        severity: 'info',
+        message: `Agent ${agentLabel} in ${run.label ?? run.run_id} moved from ${from} to ${model}`,
+        data: { run_id: run.run_id, label: run.label, agent_label: agentLabel, from, to: model },
+      }),
+    );
+  }
+}
+
+/**
+ * Rebuild `label_stats` for every cache state of this run's label from the
+ * completed runs of the last 30 days. `n` and `dominant_models` are written
+ * from the first run onward; the percentiles need `n >= 5` to mean anything.
+ */
+function rebuildLabelStats(run: RunRow, dominant: Record<string, string>, now: number): void {
+  const label = run.label;
+  if (!label) return;
+  const store = getRunStore();
+  const cacheKey = run.cache_state ?? 'cold';
+  const grouped = new Map<string, number[]>();
+  for (const completed of store.completedRunsForLabel(label, now - LABEL_STATS_WINDOW_DAYS * DAY_MS)) {
+    const key = completed.cache_state ?? 'cold';
+    const bucket = grouped.get(key) ?? [];
+    bucket.push(completed.cost_usd);
+    grouped.set(key, bucket);
+  }
+  if (!grouped.has(cacheKey)) grouped.set(cacheKey, [run.cost_usd]);
+  for (const [key, costs] of grouped) {
+    costs.sort((a, b) => a - b);
+    const enough = costs.length >= 5;
+    const existing = store.getLabelStats(label, key, LABEL_STATS_WINDOW_DAYS);
+    store.upsertLabelStats({
+      label,
+      cache_state: key,
+      window_days: LABEL_STATS_WINDOW_DAYS,
+      n: costs.length,
+      p25: enough ? nearestRankPercentile(costs, 25) : null,
+      p50: enough ? nearestRankPercentile(costs, 50) : null,
+      p75: enough ? nearestRankPercentile(costs, 75) : null,
+      p90: enough ? nearestRankPercentile(costs, 90) : null,
+      dominant_models: key === cacheKey ? dominant : (existing?.dominant_models ?? {}),
+      updated_at: now,
+    });
+  }
+}
+
+/**
+ * Shared close path for `endRun` and `sweepIdleRuns`: under-band check, then
+ * cross-run drift, then the label_stats rebuild.
+ */
+function onRunClosed(run: RunRow, now: number): void {
+  try {
+    const store = getRunStore();
+    const band = bandForRun(run);
+    if (band && run.cost_usd < band[0]) {
+      const [lo, hi] = band;
+      store.setBandStatus(run.run_id, 'under', lo, hi);
+      run.band_status = 'under';
+      run.band_lo = lo;
+      run.band_hi = hi;
+      if (_config.alerts.overBand && !store.hasAlert(run.run_id, 'run.under_band')) {
+        deliverAlert(
+          store.addAlert({
+            ts: now,
+            kind: 'run.under_band',
+            run_id: run.run_id,
+            agent_label: null,
+            severity: 'info',
+            message: `Run ${run.run_id} came in under its expected band ($${run.cost_usd.toFixed(4)} vs $${lo}), something was skipped`,
+            data: { run_id: run.run_id, cost_usd: run.cost_usd, band_lo: lo, band_hi: hi, label: run.label },
+          }),
+        );
+      }
+    }
+    if (!run.label) return;
+    const dominant = dominantModels(store.agentsForRun(run.run_id));
+    evaluateModelDrift(run, run.cache_state ?? 'cold', dominant, now);
+    rebuildLabelStats(run, dominant, now);
+  } catch { /* closing a run must never throw into a request or a timer */ }
 }
 
 export function recordRunRequest(entry: RunHistoryEntryLike, rc: RunRequestContext): void {
@@ -834,8 +1081,11 @@ export function endRun(
 ): RunRow | null {
   const exitCode = opts?.exitCode ?? null;
   const status: RunStatus = opts?.status ?? (exitCode !== null && exitCode !== 0 ? 'failed' : 'completed');
+  const now = opts?.now ?? Date.now();
   try {
-    return getRunStore().closeRun(runId, { status, exit_code: exitCode, now: opts?.now ?? Date.now() });
+    const run = getRunStore().closeRun(runId, { status, exit_code: exitCode, now });
+    if (run) onRunClosed(run, now);
+    return run;
   } catch {
     return null;
   }
@@ -900,6 +1150,7 @@ export function sweepIdleRuns(now?: number): RunRow[] {
       const row = store.closeRun(idle.run_id, { status: 'stale_closed', now: at });
       if (!row) continue;
       closed.push(row);
+      onRunClosed(row, at);
       const alert = store.addAlert({
         ts: at,
         kind: 'run.stale_closed',
@@ -953,6 +1204,8 @@ export function _resetRunAttributionForTests(): void {
   lastPromptByThread.clear();
   baselineByTrace.clear();
   cacheTallyByRun.clear();
+  rateLimitRingByRun.clear();
+  waveFiredAtByRun.clear();
   lastInvalidRunLogAt = 0;
   _config = resolveAttributionConfig(undefined);
   _deps = {};
