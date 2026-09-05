@@ -31,6 +31,8 @@ describe('CLI command surface', () => {
     expect(res.stdout).toContain('start');
     expect(res.stdout).toContain('budget');
     expect(res.stdout).toContain('alerts');
+    expect(res.stdout).toContain('run ');
+    expect(res.stdout).toContain('runs');
   });
 
   it('prints version', () => {

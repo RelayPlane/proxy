@@ -82,6 +82,17 @@ import { getResponseCache } from './response-cache.js';
 import { getBudgetManager, getBudgetTracker } from './budget.js';
 import { getAlertManager } from './alerts.js';
 import { getKillAudit, type KillEvent } from './kill-audit.js';
+import {
+  mintRunId,
+  parseRunArgs,
+  buildChildEnv,
+  formatRunSummary,
+  formatUsd,
+  formatDuration,
+  type RunHeaderOpts,
+  type RunSummaryRun,
+  type RunSummaryAgent,
+} from './run-wrapper.js';
 
 // __dirname is available natively in CJS
 
@@ -574,6 +585,8 @@ Commands:
   budget [status|set|reset]  Manage spend budgets and limits
   cap [set|status]       Hard daily spend cap: cap set --day <usd> (429 budget_exceeded past it)
   kills [--last <window>]  Show kill-switch / cost-cap kill history
+  run [--label X] [--tag k:v] [--cap USD] -- <cmd...>  Wrap any command as one attributed run (zero code)
+  runs [list|show|export|band|alerts] [...]  List runs, inspect one, export CSV/JSON, band suggestions, alerts
   alerts [list|counts]   View cost alerts and anomaly history
   cache [on|off|status|clear|stats]  Manage response cache
   service [install|uninstall|status]  Manage system service (systemd/launchd)
@@ -1608,14 +1621,19 @@ async function handleWatchCommand(subArgs: string[]): Promise<void> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
+  // `relayplane run -- claude --help` has to forward --help to the wrapped
+  // command, so only flags BEFORE the `--` separator count as ours.
+  const runSeparator = args[0] === 'run' ? args.indexOf('--') : -1;
+  const ownFlags = runSeparator === -1 ? args : args.slice(0, runSeparator);
+
   // Check for help
-  if (args.includes('-h') || args.includes('--help')) {
+  if (ownFlags.includes('-h') || ownFlags.includes('--help')) {
     printHelp();
     process.exit(0);
   }
 
   // Check for version
-  if (args.includes('--version')) {
+  if (ownFlags.includes('--version')) {
     printVersion();
     process.exit(0);
   }
@@ -1638,6 +1656,7 @@ async function main(): Promise<void> {
     'status', 'autostart', 'service', 'mesh', 'cache', 'budget', 'cap', 'kills', 'alerts', 'enable', 'disable',
     'kill', 'resume',
     'ensure-running', 'agents', 'policy', 'setup', 'watch',
+    'run', 'runs',
   ]);
 
   if (command && !command.startsWith('-') && !knownCommands.has(command)) {
@@ -1718,6 +1737,16 @@ async function main(): Promise<void> {
 
   if (command === 'kills') {
     await handleKillsCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  if (command === 'run') {
+    // handleRunCommand owns the exit code: it mirrors the wrapped child's.
+    await handleRunCommand(args.slice(1));
+  }
+
+  if (command === 'runs') {
+    await handleRunsCommand(args.slice(1));
     process.exit(0);
   }
 
@@ -3387,6 +3416,550 @@ async function handleSetupCommand(): Promise<void> {
   console.log('    relayplane policy suggest  # preview recommendations');
   console.log('');
   console.log('  Docs: https://relayplane.com/docs');
+  console.log('');
+}
+
+// ===========================================================================
+// Run attribution: `relayplane run` and `relayplane runs`
+// ===========================================================================
+
+type ProxyResult<T> = { ok: true; data: T } | { ok: false; status: number | null };
+type ProxyTextResult = { ok: true; text: string; contentType: string } | { ok: false; status: number | null };
+
+interface ProxyFetchInit {
+  method?: string;
+  body?: unknown;
+  timeoutMs?: number;
+}
+
+/** Default run API base: the proxy this shell would talk to (HARD RULE 2). */
+function defaultProxyBaseUrl(): string {
+  return `http://127.0.0.1:${proxyControlPort()}`;
+}
+
+async function proxyJsonAt<T>(baseUrl: string, path: string, init?: ProxyFetchInit): Promise<ProxyResult<T>> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), init?.timeoutMs ?? 5000);
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: init?.method ?? 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, data: (await res.json()) as T };
+  } catch {
+    return { ok: false, status: null };
+  }
+}
+
+async function proxyTextAt(baseUrl: string, path: string, init?: ProxyFetchInit): Promise<ProxyTextResult> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), init?.timeoutMs ?? 15000);
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: init?.method ?? 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return { ok: false, status: res.status };
+    return { ok: true, text: await res.text(), contentType: res.headers.get('content-type') ?? '' };
+  } catch {
+    return { ok: false, status: null };
+  }
+}
+
+function proxyPortLabel(baseUrl: string): string {
+  try {
+    const parsed = new URL(baseUrl);
+    return parsed.port !== '' ? parsed.port : parsed.protocol === 'https:' ? '443' : '80';
+  } catch {
+    return proxyControlPort();
+  }
+}
+
+/** One shared failure voice for every `runs` subcommand. Always exits 1. */
+function failRunsRequest(baseUrl: string, status: number | null, what: string): never {
+  if (status === null) {
+    console.error(`Proxy not reachable on :${proxyPortLabel(baseUrl)}`);
+    console.error('Start it with `relayplane start`, or point at another one with --proxy URL.');
+  } else if (status === 404) {
+    console.error(`${what} is not available on the proxy at :${proxyPortLabel(baseUrl)} (HTTP 404).`);
+    console.error('This proxy build predates the run API. Upgrade it, then try again.');
+  } else {
+    console.error(`${what} failed on the proxy at :${proxyPortLabel(baseUrl)} (HTTP ${status}).`);
+  }
+  process.exit(1);
+}
+
+/** The honesty line: list price is a counterfactual, nobody is billed it. */
+const NOTIONAL_NOTE = 'Costs are notional (list price for the traffic), not an invoice.';
+
+function formatAgo(ts: number, now: number): string {
+  const delta = Math.max(0, now - ts);
+  if (delta < 60_000) return `${Math.round(delta / 1000)}s ago`;
+  if (delta < 3_600_000) return `${Math.round(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)}h ago`;
+  return `${Math.round(delta / 86_400_000)}d ago`;
+}
+
+function renderTable(headers: string[], rows: string[][]): string {
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] ?? '').length)));
+  const line = (cells: string[]): string =>
+    cells.map((c, i) => c.padEnd(widths[i] ?? 0)).join('  ').trimEnd();
+  return [line(headers), line(widths.map((w) => '-'.repeat(w))), ...rows.map(line)].join('\n');
+}
+
+interface RunListRow {
+  run_id: string;
+  label?: string | null;
+  status?: string;
+  run_source?: string;
+  started_at?: number;
+  last_seen_at?: number;
+  ended_at?: number | null;
+  request_count?: number;
+  cost_usd?: number;
+  retry_cost_usd?: number;
+  band_status?: string;
+  agent_count?: number;
+  rate_limit_wave?: boolean;
+  cost_per_minute?: number;
+  top_agent?: string | null;
+}
+
+interface RunDetailAgent extends RunSummaryAgent {
+  tokens_in?: number;
+  tokens_out?: number;
+  retry_cost_usd?: number;
+  agent_source?: string;
+}
+
+interface RunDriftRow {
+  agent_label?: string;
+  requested_model?: string;
+  model?: string;
+  count?: number;
+}
+
+interface RunDetailResponse {
+  run: RunSummaryRun;
+  agents?: RunDetailAgent[];
+  drift?: RunDriftRow[];
+  dashboard_url?: string;
+}
+
+interface RunBandsResponse {
+  label: string;
+  configured: { cold?: [number, number]; warm?: [number, number] } | null;
+  suggested: { cold?: [number, number]; warm?: [number, number] } | null;
+  n: { cold?: number; warm?: number };
+}
+
+interface RunAlertsResponse {
+  alerts: {
+    ts?: number;
+    kind?: string;
+    run_id?: string;
+    agent_label?: string | null;
+    severity?: string;
+    message?: string;
+  }[];
+}
+
+/**
+ * `relayplane run [flags] -- <command...>`
+ *
+ * Mints a run id, tells the proxy about it (best effort: the proxy may be
+ * down, and a wrapper that refuses to run your command because telemetry is
+ * offline is a wrapper nobody uses), runs the command with the attribution
+ * env contract in place, then closes the run and prints the rollup.
+ *
+ * stdout belongs to the child. Everything this wrapper says goes to stderr,
+ * unless --json is set, in which case the machine readable rollup goes to
+ * stdout after the child is done.
+ */
+async function handleRunCommand(argv: string[]): Promise<void> {
+  const parsed = parseRunArgs(argv);
+  if ('error' in parsed) {
+    console.error(`Error: ${parsed.error}`);
+    console.error('Example: relayplane run --label nightly-backfill -- ./scripts/backfill.sh');
+    process.exit(1);
+  }
+
+  const { opts, command } = parsed;
+  const executable = command[0] ?? '';
+  const proxyUrl = opts.proxyUrl ?? defaultProxyBaseUrl();
+  const runId = opts.runId ?? mintRunId(opts.label);
+  const headerOpts: RunHeaderOpts = {
+    runId,
+    label: opts.label,
+    tags: opts.tags,
+    capUsd: opts.capUsd,
+    parentRunId: opts.parentRunId,
+    agent: opts.agent,
+  };
+
+  let dashboardUrl = `${proxyUrl}/dashboard#run=${encodeURIComponent(runId)}`;
+  process.stderr.write(`▶ run ${runId}  dashboard ${dashboardUrl}\n`);
+
+  const opened = await proxyJsonAt<{ run_id?: string; dashboard_url?: string }>(proxyUrl, '/v1/runs', {
+    method: 'POST',
+    timeoutMs: 2000,
+    body: {
+      run_id: runId,
+      label: opts.label,
+      parent_run_id: opts.parentRunId,
+      tags: Object.keys(opts.tags).length > 0 ? opts.tags : undefined,
+      cap_usd: opts.capUsd,
+    },
+  });
+  if (opened.ok && typeof opened.data.dashboard_url === 'string' && opened.data.dashboard_url.length > 0) {
+    dashboardUrl = opened.data.dashboard_url;
+  }
+
+  const child = spawn(executable, command.slice(1), {
+    stdio: 'inherit',
+    env: buildChildEnv(process.env, { ...headerOpts, proxyUrl }),
+  });
+
+  const forward = (signal: NodeJS.Signals) => (): void => {
+    try { child.kill(signal); } catch { /* already gone */ }
+  };
+  const onSigint = forward('SIGINT');
+  const onSigterm = forward('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+
+  const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }>((resolvePromise) => {
+    child.on('error', (error: Error) => resolvePromise({ code: null, signal: null, error }));
+    child.on('close', (code, signal) => resolvePromise({ code, signal }));
+  });
+
+  process.removeListener('SIGINT', onSigint);
+  process.removeListener('SIGTERM', onSigterm);
+
+  if (outcome.error) {
+    console.error(`Error: cannot run "${executable}": ${outcome.error.message}`);
+    process.exit(127);
+  }
+
+  const exitCode = outcome.code ?? 1;
+
+  const ended = await proxyJsonAt<RunDetailResponse>(proxyUrl, `/v1/runs/${encodeURIComponent(runId)}/end`, {
+    method: 'POST',
+    timeoutMs: 2000,
+    body: { exit_code: exitCode },
+  });
+
+  if (ended.ok && ended.data.run) {
+    const agents = ended.data.agents ?? [];
+    if (opts.json === true) {
+      process.stdout.write(`${JSON.stringify({ run: ended.data.run, agents, dashboard_url: dashboardUrl }, null, 2)}\n`);
+    } else {
+      process.stderr.write(`${formatRunSummary({ run: ended.data.run, agents, dashboardUrl })}\n`);
+    }
+  } else if (!opts.json) {
+    process.stderr.write(`Run ${runId} finished with exit code ${exitCode} (no rollup: the proxy did not answer).\n`);
+  }
+
+  process.exit(exitCode);
+}
+
+function printRunsHelp(): void {
+  console.log('');
+  console.log('Usage: relayplane runs <subcommand> [options]');
+  console.log('');
+  console.log('  list [--active] [--days N] [--label X] [--json]   List runs (default subcommand)');
+  console.log('  show <id> [--json]                                Rollup, agents and model drift for one run');
+  console.log('  export <id | --days N> [--format csv|json] [--out FILE]  Export run request rows');
+  console.log('  band <label> [--apply] [--json]                   Suggested cost band for a label');
+  console.log('  alerts [--since 1h] [--json]                      Recent run alerts');
+  console.log('');
+  console.log('  --proxy URL   Talk to a proxy other than the local default');
+  console.log('');
+}
+
+/** Flags shared by every `runs` subcommand. */
+function extractRunsCommonFlags(args: string[]): { rest: string[]; proxyUrl: string; json: boolean } {
+  const rest: string[] = [];
+  let proxyUrl = defaultProxyBaseUrl();
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
+    if (arg === '--json') { json = true; continue; }
+    if (arg === '--proxy') {
+      const value = args[i + 1];
+      if (value !== undefined) { proxyUrl = value.replace(/\/+$/, ''); i++; }
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { rest, proxyUrl, json };
+}
+
+function flagValue(args: string[], name: string): string | undefined {
+  const idx = args.indexOf(name);
+  if (idx === -1) return undefined;
+  return args[idx + 1];
+}
+
+async function handleRunsCommand(argv: string[]): Promise<void> {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    printRunsHelp();
+    return;
+  }
+
+  const known = new Set(['list', 'show', 'export', 'band', 'alerts']);
+  const first = argv[0];
+  const sub = first !== undefined && known.has(first) ? first : 'list';
+  const tail = first !== undefined && known.has(first) ? argv.slice(1) : argv;
+  const { rest, proxyUrl, json } = extractRunsCommonFlags(tail);
+
+  if (sub === 'list') { await runsList(rest, proxyUrl, json); return; }
+  if (sub === 'show') { await runsShow(rest, proxyUrl, json); return; }
+  if (sub === 'export') { await runsExport(rest, proxyUrl); return; }
+  if (sub === 'band') { await runsBand(rest, proxyUrl, json); return; }
+  await runsAlerts(rest, proxyUrl, json);
+}
+
+async function runsList(args: string[], proxyUrl: string, json: boolean): Promise<void> {
+  const active = args.includes('--active');
+  const days = flagValue(args, '--days');
+  const label = flagValue(args, '--label');
+  const status = flagValue(args, '--status');
+
+  const query = new URLSearchParams();
+  if (!active) {
+    query.set('days', days !== undefined && Number.isFinite(Number(days)) ? String(Number(days)) : '7');
+    if (label !== undefined) query.set('label', label);
+    if (status !== undefined) query.set('status', status);
+  }
+  const path = active ? '/v1/runs/active' : `/v1/runs?${query.toString()}`;
+  const result = await proxyJsonAt<{ runs?: RunListRow[] }>(proxyUrl, path);
+  if (!result.ok) failRunsRequest(proxyUrl, result.status, active ? 'runs list --active' : 'runs list');
+
+  const runs = result.data.runs ?? [];
+  if (json) {
+    console.log(JSON.stringify(result.data, null, 2));
+    return;
+  }
+
+  console.log('');
+  if (runs.length === 0) {
+    console.log(active ? 'No active runs.' : 'No runs in that window.');
+    console.log('Wrap something with `relayplane run --label my-job -- ./my-script.sh` to make one.');
+    console.log('');
+    return;
+  }
+
+  const now = Date.now();
+  const showWave = runs.some((r) => r.rate_limit_wave === true);
+  const headers = ['RUN', 'STATUS', 'SOURCE', 'STARTED', 'DURATION', 'REQ', 'COST', 'RETRIES', 'BAND'];
+  if (showWave) headers.push('429');
+  headers.push('AGENTS');
+
+  const rows = runs.map((run) => {
+    const startedAt = run.started_at ?? 0;
+    const endedAt = run.ended_at ?? run.last_seen_at ?? startedAt;
+    const cells = [
+      run.label && run.label.length > 0 ? `${run.label} (${run.run_id})` : run.run_id,
+      run.status ?? 'unknown',
+      run.run_source ?? '-',
+      startedAt > 0 ? formatAgo(startedAt, now) : '-',
+      formatDuration(Math.max(0, endedAt - startedAt)),
+      String(run.request_count ?? 0),
+      `$${formatUsd(run.cost_usd ?? 0)}`,
+      `$${formatUsd(run.retry_cost_usd ?? 0)}`,
+      run.band_status ?? 'none',
+    ];
+    if (showWave) cells.push(run.rate_limit_wave === true ? 'wave' : '');
+    cells.push(run.top_agent ?? String(run.agent_count ?? 0));
+    return cells;
+  });
+
+  console.log(renderTable(headers, rows));
+  console.log('');
+  console.log(NOTIONAL_NOTE);
+  console.log('');
+}
+
+async function runsShow(args: string[], proxyUrl: string, json: boolean): Promise<void> {
+  const runId = args.find((a) => !a.startsWith('-'));
+  if (runId === undefined) {
+    console.error('Usage: relayplane runs show <run-id> [--json]');
+    process.exit(1);
+  }
+
+  const result = await proxyJsonAt<RunDetailResponse>(proxyUrl, `/v1/runs/${encodeURIComponent(runId)}`);
+  if (!result.ok) {
+    if (result.status === 404) {
+      console.error(`No run "${runId}" on the proxy at :${proxyPortLabel(proxyUrl)}.`);
+      process.exit(1);
+    }
+    failRunsRequest(proxyUrl, result.status, 'runs show');
+  }
+
+  if (json) {
+    console.log(JSON.stringify(result.data, null, 2));
+    return;
+  }
+
+  const agents = result.data.agents ?? [];
+  const dashboardUrl = result.data.dashboard_url ?? `${proxyUrl}/dashboard#run=${encodeURIComponent(runId)}`;
+  console.log('');
+  console.log(formatRunSummary({ run: result.data.run, agents, dashboardUrl }));
+  console.log('');
+
+  if (agents.length > 0) {
+    const rows = agents.map((agent) => [
+      agent.agent_label,
+      String(agent.request_count),
+      `$${formatUsd(agent.cost_usd)}`,
+      `$${formatUsd(agent.retry_cost_usd ?? 0)}`,
+      Object.entries(agent.models_seen ?? {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([model, count]) => `${model} x${count}`)
+        .join(', '),
+    ]);
+    console.log(renderTable(['AGENT', 'REQ', 'COST', 'RETRY $', 'MODELS'], rows));
+    console.log('');
+  }
+
+  const drift = result.data.drift ?? [];
+  if (drift.length > 0) {
+    console.log('Model drift (requested vs served):');
+    for (const row of drift) {
+      console.log(`  ${row.agent_label ?? 'unknown'}: ${row.requested_model ?? '?'} -> ${row.model ?? '?'} x${row.count ?? 1}`);
+    }
+    console.log('');
+  }
+}
+
+async function runsExport(args: string[], proxyUrl: string): Promise<void> {
+  const format = (flagValue(args, '--format') ?? 'csv').toLowerCase();
+  if (format !== 'csv' && format !== 'json' && format !== 'jsonl') {
+    console.error(`Unsupported --format "${format}". Use csv, json or jsonl.`);
+    process.exit(1);
+  }
+  const out = flagValue(args, '--out');
+  const days = flagValue(args, '--days');
+  const flagValues = new Set(['--format', '--out', '--days'].map((f) => flagValue(args, f)).filter((v): v is string => v !== undefined));
+  const runId = args.find((a) => !a.startsWith('-') && !flagValues.has(a));
+
+  if (runId === undefined && days === undefined) {
+    console.error('Usage: relayplane runs export <run-id> | --days N [--format csv|json] [--out FILE]');
+    process.exit(1);
+  }
+
+  const body: Record<string, unknown> = { format };
+  if (runId !== undefined) body['run_ids'] = [runId];
+  else body['days'] = Number(days);
+
+  const result = await proxyTextAt(proxyUrl, '/v1/runs/export', { method: 'POST', body });
+  if (!result.ok) failRunsRequest(proxyUrl, result.status, 'runs export');
+
+  if (out !== undefined) {
+    writeFileSync(out, result.text, 'utf-8');
+    console.log(`Wrote ${result.text.length} bytes to ${out} (${format}).`);
+    console.log(NOTIONAL_NOTE);
+    return;
+  }
+  process.stdout.write(result.text.endsWith('\n') ? result.text : `${result.text}\n`);
+}
+
+function formatBandRange(range: [number, number] | undefined): string {
+  if (!range) return 'none';
+  return `[$${formatUsd(range[0])}, $${formatUsd(range[1])}]`;
+}
+
+async function runsBand(args: string[], proxyUrl: string, json: boolean): Promise<void> {
+  const label = args.find((a) => !a.startsWith('-'));
+  if (label === undefined) {
+    console.error('Usage: relayplane runs band <label> [--apply] [--json]');
+    process.exit(1);
+  }
+  const apply = args.includes('--apply');
+
+  const result = await proxyJsonAt<RunBandsResponse>(proxyUrl, `/v1/runs/bands?label=${encodeURIComponent(label)}`);
+  if (!result.ok) failRunsRequest(proxyUrl, result.status, 'runs band');
+
+  if (json && !apply) {
+    console.log(JSON.stringify(result.data, null, 2));
+    return;
+  }
+
+  const suggested = result.data.suggested;
+  const counts = result.data.n ?? {};
+  console.log('');
+  console.log(`Label ${label}`);
+  console.log(`  configured  cold ${formatBandRange(result.data.configured?.cold)}   warm ${formatBandRange(result.data.configured?.warm)}`);
+  console.log(`  suggested   cold ${formatBandRange(suggested?.cold)}   warm ${formatBandRange(suggested?.warm)}`);
+  console.log(`  samples     cold ${counts.cold ?? 0}   warm ${counts.warm ?? 0}`);
+  console.log('');
+
+  if (!suggested || (!suggested.cold && !suggested.warm)) {
+    console.log(`No suggestion yet for "${label}". Run it five times first, then ask again.`);
+    console.log('');
+    return;
+  }
+
+  if (!apply) {
+    console.log(NOTIONAL_NOTE);
+    console.log(`Apply it with: relayplane runs band ${label} --apply`);
+    console.log('');
+    return;
+  }
+
+  const band: Record<string, [number, number]> = {};
+  if (suggested.cold) band['cold'] = suggested.cold;
+  if (suggested.warm) band['warm'] = suggested.warm;
+  const patch = { attribution: { bands: { [label]: band } } };
+
+  const written = await proxyJsonAt<{ ok?: boolean }>(proxyUrl, '/control/config', { method: 'POST', body: patch });
+  if (!written.ok) failRunsRequest(proxyUrl, written.status, 'runs band --apply');
+
+  if (json) {
+    console.log(JSON.stringify(patch, null, 2));
+    return;
+  }
+  console.log(`Wrote attribution.bands["${label}"] = ${JSON.stringify(band)}`);
+  console.log(NOTIONAL_NOTE);
+  console.log('');
+}
+
+async function runsAlerts(args: string[], proxyUrl: string, json: boolean): Promise<void> {
+  const since = flagValue(args, '--since') ?? '1h';
+  const result = await proxyJsonAt<RunAlertsResponse>(proxyUrl, `/v1/runs/alerts?since=${encodeURIComponent(since)}`);
+  if (!result.ok) failRunsRequest(proxyUrl, result.status, 'runs alerts');
+
+  if (json) {
+    console.log(JSON.stringify(result.data, null, 2));
+    return;
+  }
+
+  const alerts = result.data.alerts ?? [];
+  console.log('');
+  if (alerts.length === 0) {
+    console.log(`No run alerts in the last ${since}.`);
+    console.log('');
+    return;
+  }
+
+  const rows = alerts.map((alert) => [
+    alert.ts !== undefined ? new Date(alert.ts).toISOString() : '-',
+    alert.severity ?? 'info',
+    alert.kind ?? '-',
+    alert.run_id ?? '-',
+    alert.message ?? '',
+  ]);
+  console.log(renderTable(['WHEN', 'SEVERITY', 'KIND', 'RUN', 'MESSAGE'], rows));
+  console.log('');
+  console.log(NOTIONAL_NOTE);
   console.log('');
 }
 
