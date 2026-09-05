@@ -1,5 +1,5 @@
 /**
- * TraceWriter — deterministic per-request trace files for RelayPlane.
+ * TraceWriter, deterministic per-request trace files for RelayPlane.
  *
  * Writes structured JSONL trace files to ~/.relayplane/traces/{sessionId}/{YYYY-MM-DD}/{traceId}.jsonl
  * and maintains a SQLite index at ~/.relayplane/traces/index.db.
@@ -32,6 +32,10 @@ export type TraceEventType =
   | 'session.end';
 
 export interface TracePayload {
+  /** Run attribution (request.start) */
+  runId?: string;
+  agentLabel?: string;
+  threadId?: string;
   model?: string;
   modelUsed?: string;
   systemPromptHash?: string;
@@ -92,7 +96,7 @@ export interface SessionGraph {
 
 export interface TracesConfig {
   enabled: boolean;
-  /** Store full request bodies for replay (default: false — hashes only) */
+  /** Store full request bodies for replay (default: false, hashes only) */
   storeFullRequests: boolean;
   retentionDays: number;
   directory: string;
@@ -115,7 +119,7 @@ export interface ExportOptions {
   outputPath?: string;
 }
 
-/** Input type for write() — partial event (traceId, sessionId, sequence, timestamp filled in) */
+/** Input type for write(), partial event (traceId, sessionId, sequence, timestamp filled in) */
 export interface WriteEventInput {
   eventType: TraceEventType;
   parentTraceId?: string;

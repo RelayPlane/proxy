@@ -71,7 +71,10 @@ CREATE TABLE IF NOT EXISTS episodic_events (
   outcome TEXT NOT NULL,
   outcome_detail TEXT,
   trace_id TEXT,
-  tags TEXT DEFAULT '[]'
+  tags TEXT DEFAULT '[]',
+  run_id TEXT,
+  agent_label TEXT,
+  thread_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_episodic_session ON episodic_events(session_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_timestamp ON episodic_events(timestamp);
@@ -96,6 +99,10 @@ const COLUMN_MIGRATIONS = [
   `ALTER TABLE knowledge_atoms ADD COLUMN observation_count INTEGER DEFAULT 1`,
   `ALTER TABLE knowledge_atoms ADD COLUMN decay_rate REAL DEFAULT 0.05`,
   `ALTER TABLE knowledge_atoms ADD COLUMN tags TEXT DEFAULT '[]'`,
+  // Run attribution (PR1): run chip on the dashboard RequestStream
+  `ALTER TABLE episodic_events ADD COLUMN run_id TEXT`,
+  `ALTER TABLE episodic_events ADD COLUMN agent_label TEXT`,
+  `ALTER TABLE episodic_events ADD COLUMN thread_id TEXT`,
 ];
 
 /** Lazy-initialised SQLite database handle, or null if unavailable. */

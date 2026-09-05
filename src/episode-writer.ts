@@ -1,5 +1,5 @@
 /**
- * Episode Writer — Phase 2 Session 4: Layered Session Memory
+ * Episode Writer, Phase 2 Session 4: Layered Session Memory
  *
  * Writes episodic events to osmosis.db after each proxied response.
  * Also tracks promotion candidates: when evidence_count >= PROMOTION_THRESHOLD,
@@ -12,6 +12,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { getRelayplaneDir } from './osmosis-store.js';
+import { runCtx } from './run-attribution.js';
 
 const PROMOTION_THRESHOLD = 2;
 const EPISODIC_MAX_ROWS = parseInt(process.env['RELAYPLANE_EPISODIC_MAX_ROWS'] ?? '100000', 10);
@@ -109,23 +110,29 @@ export interface EpisodeEvent {
   outcomeDetail?: string;
   traceId?: string;
   durationMs?: number;
+  /** Run attribution; defaults from the request's runCtx when omitted. */
+  runId?: string;
+  agentLabel?: string;
+  threadId?: string;
 }
 
 // ── Write episode ─────────────────────────────────────────────────────────────
 
 /**
- * Write an episodic event record. Fire-and-forget — never throws.
+ * Write an episodic event record. Fire-and-forget, never throws.
  */
 export function writeEpisode(sessionId: string, event: EpisodeEvent): void {
   try {
     const db = getOsmosisDb();
     if (!db) return;
     const id = crypto.randomUUID();
+    const rc = runCtx.getStore();
     db.prepare(`
       INSERT OR IGNORE INTO episodic_events
         (id, session_id, event_type, timestamp, duration_ms, model_used,
-         tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id,
+         run_id, agent_label, thread_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       sessionId,
@@ -139,6 +146,9 @@ export function writeEpisode(sessionId: string, event: EpisodeEvent): void {
       event.outcome,
       event.outcomeDetail ?? null,
       event.traceId ?? null,
+      event.runId ?? rc?.runId ?? null,
+      event.agentLabel ?? rc?.agentLabel ?? null,
+      event.threadId ?? rc?.threadId ?? null,
     );
 
     // Prune episodic_events every 100th write
@@ -170,7 +180,7 @@ function computeSignature(model: string, eventType: string, outcome: string): st
 
 /**
  * Check and potentially promote an episodic pattern to procedural (mesh) store.
- * Fire-and-forget — never throws.
+ * Fire-and-forget, never throws.
  */
 function checkPromotion(sessionId: string, patternSignature: string): void {
   try {
@@ -260,7 +270,7 @@ function promoteToProcedural(patternSignature: string, evidenceCount: number): s
   }
 }
 
-/** Exposed for testing — reset singleton db handles. */
+/** Exposed for testing, reset singleton db handles. */
 export function _resetEpisodeWriter(): void {
   if (_osmosisDb) { try { _osmosisDb.close(); } catch { /* ignore */ } }
   if (_meshDb) { try { _meshDb.close(); } catch { /* ignore */ } }

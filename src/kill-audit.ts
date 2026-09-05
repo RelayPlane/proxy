@@ -4,6 +4,8 @@ export interface KillEvent {
   agent: string;
   reason: 'cap_exceeded' | 'runaway_loop' | 'manual';
   saved_usd: number;
+  /** Run attribution: the run whose cap blocked the request (cap_exceeded only). */
+  run_id?: string;
 }
 
 const MAX_BUFFER = 1000;

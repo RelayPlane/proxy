@@ -88,6 +88,13 @@ import { captureAtom, countAtomsForSession, getOsmosisDb, getRelayplaneDir } fro
 import { writeEpisode } from './episode-writer.js';
 import { getSessionId, upsertSession, getSessions, getActiveSessions } from './session-tracker.js';
 import { TraceWriter, sha256Hex, defaultTracesConfig } from './trace-writer.js';
+import {
+  runCtx, newRunRequestContext, attachRunIdentity, setRunTraceId, stampRunFields, recordRunRequest,
+  checkRunCap, withRunHeaders, endRun, registerRun, configureRunAttribution, startRunAttributionTimers,
+  stopRunAttributionTimers, RUN_REQUEST_HEADERS, RUN_RESPONSE_HEADERS, DEFAULT_ATTRIBUTION_CONFIG,
+  type AttributionConfig,
+} from './run-attribution.js';
+import { getRunStore } from './run-store.js';
 import { getToolRouter, extractToolContext } from './tool-router.js';
 import { getTokenPool, type PoolAccountConfig } from './token-pool.js';
 import {
@@ -1051,6 +1058,8 @@ interface RelayPlaneProxyConfigFile {
   alerts?: Partial<AlertsConfig>;
   downgrade?: Partial<DowngradeConfig>;
   dashboard?: { showRequestContent?: boolean };
+  /** Run attribution (runs.db): headers, inference, per-run caps, bands, alerts. See run-attribution.ts. */
+  attribution?: Partial<AttributionConfig>;
   /**
    * Cross-provider cascade fallback (GH #38).
    * When a provider returns 429/529/503, retry with the next provider in `providers` list.
@@ -1178,6 +1187,17 @@ interface RequestHistoryEntry {
   statusCode?: number;
   routing_rule?: string | null;
   routing_reason?: string | null;
+  // Run attribution (optional; old history files keep loading)
+  runId?: string;
+  parentRunId?: string;
+  agentLabel?: string;
+  threadId?: string;
+  runSource?: string;
+  traceId?: string;
+  sessionId?: string;
+  attempt?: number;
+  isRetry?: boolean;
+  tags?: Record<string, string>;
 }
 const requestHistory: RequestHistoryEntry[] = [];
 
@@ -1303,7 +1323,7 @@ function shutdownHistory(): void {
   flushHistoryBuffer();
 }
 
-function logRequest(
+export function logRequest(
   originalModel: string,
   targetModel: string,
   provider: Provider,
@@ -1374,17 +1394,37 @@ function logRequest(
     routing_rule: null,
     routing_reason: null,
   };
+  // Run attribution: bind this entry to the request context so cost lands by id, not position.
+  const rc = runCtx.getStore();
+  if (rc) {
+    rc.historyEntry = entry;
+    stampRunFields(entry, rc);
+  }
   requestHistory.push(entry);
   if (requestHistory.length > MAX_HISTORY) {
     requestHistory.shift();
   }
   bufferHistoryEntry(entry);
+  if (rc && !success) recordRunRequest(entry, rc);
 }
 
-/** Update the most recent history entry with token/cost info */
-function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number, agentFingerprint?: string, agentId?: string, requestContent?: RequestContentData, errorMessage?: string, errorStatusCode?: number): void {
-  if (requestHistory.length > 0) {
-    const last = requestHistory[requestHistory.length - 1]!;
+let warnedMissingRunCtx = false;
+/** The history entry this request owns (AsyncLocalStorage), else the positional tail (unit tests, legacy). */
+function currentHistoryEntry(): RequestHistoryEntry | undefined {
+  const rc = runCtx.getStore();
+  if (rc?.historyEntry) return rc.historyEntry as RequestHistoryEntry;
+  if (requestHistory.length === 0) return undefined;
+  if (!rc && !warnedMissingRunCtx && requestHistory.length > 1) {
+    warnedMissingRunCtx = true;
+    console.log('[RelayPlane] run attribution: no request context in history update, falling back to the tail entry');
+  }
+  return requestHistory[requestHistory.length - 1];
+}
+
+/** Update this request's history entry (by id via AsyncLocalStorage; tail fallback) with token/cost info */
+export function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string, cacheCreationTokens?: number, cacheReadTokens?: number, agentFingerprint?: string, agentId?: string, requestContent?: RequestContentData, errorMessage?: string, errorStatusCode?: number): void {
+  const last = currentHistoryEntry();
+  if (last) {
     last.tokensIn = tokensIn;
     last.tokensOut = tokensOut;
     last.costUsd = costUsd;
@@ -1398,13 +1438,18 @@ function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: nu
     if (requestContent) last.requestContent = requestContent;
     if (errorMessage !== undefined) last.error = errorMessage;
     if (errorStatusCode !== undefined) last.statusCode = errorStatusCode;
+    const rc = runCtx.getStore();
+    if (rc && rc.historyEntry === last) recordRunRequest(last, rc);
   }
 }
 
-/** Flag the most recent history entry as carrying estimated (not provider-reported) usage. */
-function markLastHistoryEntryEstimated(): void {
-  if (requestHistory.length > 0) {
-    requestHistory[requestHistory.length - 1]!.costEstimated = true;
+/** Flag this request's history entry as carrying estimated (not provider-reported) usage. */
+export function markLastHistoryEntryEstimated(): void {
+  const last = currentHistoryEntry();
+  if (last) {
+    last.costEstimated = true;
+    const rc = runCtx.getStore();
+    if (rc && rc.historyEntry === last) recordRunRequest(last, rc);
   }
 }
 
@@ -1480,6 +1525,7 @@ export function extractResponseText(responseData: Record<string, unknown>, isAnt
 const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
   enabled: true,
   modelOverrides: {},
+  attribution: { ...DEFAULT_ATTRIBUTION_CONFIG },
   routing: {
     mode: 'cascade',
     cascade: {
@@ -2107,7 +2153,7 @@ async function forwardToAnthropic(
   const anthropicBody = buildAnthropicBody(request, targetModel, false);
   const headers = buildAnthropicHeaders(ctx, envApiKey);
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetch(`${anthropicBaseUrl()}/v1/messages`, {
     method: 'POST',
     headers,
     body: JSON.stringify(anthropicBody),
@@ -2128,7 +2174,7 @@ async function forwardToAnthropicStream(
   const anthropicBody = buildAnthropicBody(request, targetModel, true);
   const headers = buildAnthropicHeaders(ctx, envApiKey);
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetch(`${anthropicBaseUrl()}/v1/messages`, {
     method: 'POST',
     headers,
     body: JSON.stringify(anthropicBody),
@@ -2150,7 +2196,7 @@ async function forwardNativeAnthropicRequest(
 ): Promise<Response> {
   const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken, isRerouted);
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  const response = await fetch(`${anthropicBaseUrl()}/v1/messages`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -2337,6 +2383,17 @@ async function forwardToOpenAI(
   });
 
   return response;
+}
+
+/**
+ * Base URL for the native Anthropic API. RELAYPLANE_ANTHROPIC_BASE_URL
+ * overrides the default so the proxy can be pointed at a local mock
+ * (the p0 harness) or a private gateway, same contract as providerBaseUrl.
+ */
+export function anthropicBaseUrl(): string {
+  const override = process.env['RELAYPLANE_ANTHROPIC_BASE_URL'];
+  if (override && override.trim()) return override.trim().replace(/\/+$/, '');
+  return 'https://api.anthropic.com';
 }
 
 /**
@@ -3329,13 +3386,13 @@ function buildRelayPlaneResponseHeaders(
   provider: string,
   routingMode: string
 ): Record<string, string> {
-  return {
+  return withRunHeaders({
     'x-relayplane-routed-model': routedModel,
     'x-relayplane-requested-model': requestedModel,
     'x-relayplane-complexity': complexity,
     'x-relayplane-provider': provider,
     'x-relayplane-routing-mode': routingMode,
-  };
+  });
 }
 
 /**
@@ -4661,6 +4718,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     meshHandle.stop();
     shutdownHistory();
     TraceWriter.getInstance().shutdown();
+    stopRunAttributionTimers();
+    try { getRunStore().close(); } catch { /* never block shutdown */ }
     process.exit(0);
   };
   process.on('SIGINT', handleShutdown);
@@ -4936,6 +4995,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   // Initialize alert manager
   const alertManager = getAlertManager(proxyConfig.alerts);
+
+  // ── Run attribution: configure from proxyConfig.attribution (hot-reloaded below) ──
+  const applyAttributionConfig = () => {
+    configureRunAttribution(proxyConfig.attribution, {
+      log,
+      resolveAgentName: (fingerprint: string) => getAgentRegistry()[fingerprint]?.name,
+    });
+  };
+  applyAttributionConfig();
+  startRunAttributionTimers();
   if (proxyConfig.alerts?.enabled) {
     try {
       alertManager.init();
@@ -4973,7 +5042,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   }
 
   /** Record a cap block in the kill audit so `relayplane kills` / /control/kills show it. */
-  function recordCapKill(sessionId: string | undefined, agent: string | undefined, savedUsd: number): void {
+  function recordCapKill(sessionId: string | undefined, agent: string | undefined, savedUsd: number, runId?: string): void {
     try {
       getKillAudit().record({
         timestamp: new Date().toISOString(),
@@ -4981,6 +5050,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         agent: agent ?? 'unknown',
         reason: 'cap_exceeded',
         saved_usd: Math.max(0, savedUsd),
+        ...(runId ? { run_id: runId } : {}),
       });
     } catch { /* audit must never block */ }
   }
@@ -5100,6 +5170,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
   const reloadConfig = async () => {
     proxyConfig = await loadProxyConfig(configPath, log);
+    applyAttributionConfig();
     cooldownManager.updateConfig(getCooldownConfig(proxyConfig));
     budgetManager.updateConfig({ ...budgetManager.getConfig(), ...(proxyConfig.budget ?? {}) });
     if (proxyConfig.budget?.enabled) {
@@ -5146,17 +5217,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     log(`Cleared ${clearedCount} default routing rules (complexity config takes priority)`);
   }
 
-  const server = http.createServer(async (req, res) => {
+  const server = http.createServer((req, res) => runCtx.run(newRunRequestContext(req), async () => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, Authorization, x-api-key, anthropic-beta, anthropic-version, X-RelayPlane-Bypass, X-RelayPlane-Model'
+      `Content-Type, Authorization, x-api-key, anthropic-beta, anthropic-version, X-RelayPlane-Bypass, X-RelayPlane-Model, ${RUN_REQUEST_HEADERS.join(', ')}`
     );
     res.setHeader(
       'Access-Control-Expose-Headers',
-      'x-relayplane-routed-model, x-relayplane-requested-model, x-relayplane-complexity, x-relayplane-provider, x-relayplane-routing-mode'
+      `x-relayplane-routed-model, x-relayplane-requested-model, x-relayplane-complexity, x-relayplane-provider, x-relayplane-routing-mode, ${RUN_RESPONSE_HEADERS.join(', ')}`
     );
 
     if (req.method === 'OPTIONS') {
@@ -5290,6 +5361,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         try {
           const patch = await readJsonBody(req);
           proxyConfig = mergeProxyConfig(proxyConfig, patch);
+          applyAttributionConfig();
           await saveProxyConfig(configPath, proxyConfig);
           startConfigWatcher();
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -5874,8 +5946,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const limit = parseInt(params.get('limit') || '50', 10);
         const offset = parseInt(params.get('offset') || '0', 10);
         const sessionIdFilter = params.get('session_id');
+        const runIdFilter = params.get('run_id');
         const sorted = [...requestHistory].reverse();
-        const filtered = sessionIdFilter ? sorted.filter(r => r.agentId === sessionIdFilter) : sorted;
+        let filtered = sessionIdFilter ? sorted.filter(r => r.sessionId === sessionIdFilter) : sorted;
+        if (runIdFilter) filtered = filtered.filter(r => r.runId === runIdFilter);
         const runs = filtered.slice(offset, offset + limit).map(r => {
           // Savings should reflect routing decisions only - pass same cache tokens to baseline
           // so the cache discount doesn't get counted as "savings from routing"
@@ -5910,6 +5984,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             agentId: r.agentId ?? null,
             routing_rule: r.routing_rule ?? null,
             routing_reason: r.routing_reason ?? null,
+            run_id: r.runId ?? null,
+            run_source: r.runSource ?? null,
+            session_id: r.sessionId ?? null,
+            agent_label: r.agentLabel ?? null,
+            thread_id: r.threadId ?? null,
+            trace_id: r.traceId ?? null,
+            attempt: r.attempt ?? 1,
+            is_retry: r.isRetry === true,
             requestContent: r.requestContent ? {
               systemPrompt: r.requestContent.systemPrompt,
               userMessage: r.requestContent.userMessage,
@@ -6424,6 +6506,71 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       return;
     }
 
+    // === Run attribution endpoints (PR1: minimal set; PR2 adds list/active/bands/alerts/export) ===
+    if (pathname === '/v1/runs' || pathname.startsWith('/v1/runs/')) {
+      const remoteAddr = req.socket.remoteAddress;
+      if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Run endpoints are localhost-only' }));
+        return;
+      }
+      const runsJson = (status: number, body: unknown) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      const dashboardUrlFor = (id: string) => `http://localhost:${port}/dashboard#run=${encodeURIComponent(id)}`;
+      if (req.method === 'POST' && pathname === '/v1/runs') {
+        let body: Record<string, unknown> = {};
+        try { body = await readJsonBody(req); } catch { runsJson(400, { error: 'Invalid JSON' }); return; }
+        const result = registerRun({
+          run_id: typeof body['run_id'] === 'string' ? body['run_id'] : undefined,
+          label: typeof body['label'] === 'string' ? body['label'] : undefined,
+          parent_run_id: typeof body['parent_run_id'] === 'string' ? body['parent_run_id'] : undefined,
+          tags: body['tags'] && typeof body['tags'] === 'object' ? (body['tags'] as Record<string, string>) : undefined,
+          cap_usd: typeof body['cap_usd'] === 'number' ? body['cap_usd'] : undefined,
+        });
+        if ('error' in result) { runsJson(400, { error: result.error }); return; }
+        runsJson(200, { run_id: result.run.run_id, dashboard_url: dashboardUrlFor(result.run.run_id), run: result.run });
+        return;
+      }
+      const endMatch = /^\/v1\/runs\/(.+)\/end$/.exec(pathname);
+      if (req.method === 'POST' && endMatch) {
+        const id = decodeURIComponent(endMatch[1]!);
+        let body: Record<string, unknown> = {};
+        try { body = await readJsonBody(req); } catch { body = {}; }
+        const exitCode = typeof body['exit_code'] === 'number' ? body['exit_code'] : null;
+        const run = endRun(id, { exitCode });
+        if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+        const store = getRunStore();
+        runsJson(200, { run, agents: store.agentsForRun(id), children: store.childrenOf(id) });
+        return;
+      }
+      const idMatch = /^\/v1\/runs\/([^/]+)$/.exec(pathname);
+      if (idMatch) {
+        const id = decodeURIComponent(idMatch[1]!);
+        const store = getRunStore();
+        if (req.method === 'POST') {
+          let body: Record<string, unknown> = {};
+          try { body = await readJsonBody(req); } catch { runsJson(400, { error: 'Invalid JSON' }); return; }
+          let run = store.getRun(id);
+          if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+          if (typeof body['cap_usd'] === 'number' && body['cap_usd'] > 0) run = store.setCap(id, body['cap_usd']) ?? run;
+          if (body['cap_usd'] === null) run = store.setCap(id, null) ?? run;
+          if (typeof body['label'] === 'string' && body['label'].trim()) run = store.setLabel(id, body['label'].trim().slice(0, 80)) ?? run;
+          runsJson(200, { run });
+          return;
+        }
+        if (req.method === 'GET') {
+          const run = store.getRun(id);
+          if (!run) { runsJson(404, { error: 'run_not_found', run_id: id }); return; }
+          runsJson(200, { run, agents: store.agentsForRun(id), children: store.childrenOf(id) });
+          return;
+        }
+      }
+      runsJson(404, { error: 'not_found', hint: 'PR2 ships GET /v1/runs, /v1/runs/active, /bands, /alerts, /export' });
+      return;
+    }
+
     // === Session Intelligence endpoints ===
     if (req.method === 'GET' && (pathname === '/v1/sessions' || pathname === '/v1/sessions/active')) {
       const remoteAddr = req.socket.remoteAddress;
@@ -6623,12 +6770,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         let events: unknown[];
         if (sessionId) {
           events = db.prepare(
-            `SELECT id, session_id, event_type, timestamp, duration_ms, model_used, tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id
+            `SELECT id, session_id, event_type, timestamp, duration_ms, model_used, tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id, run_id, agent_label, thread_id
              FROM episodic_events WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?`
           ).all(sessionId, limit);
         } else {
           events = db.prepare(
-            `SELECT id, session_id, event_type, timestamp, duration_ms, model_used, tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id
+            `SELECT id, session_id, event_type, timestamp, duration_ms, model_used, tokens_in, tokens_out, cost_usd, outcome, outcome_detail, trace_id, run_id, agent_label, thread_id
              FROM episodic_events ORDER BY timestamp DESC LIMIT ?`
           ).all(limit);
         }
@@ -6795,8 +6942,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       let routingSuffix = parsedModel.suffix;
       requestedModel = parsedModel.baseModel;
 
+      // ── Run attribution: bind run/agent/thread identity to this request ──
+      const nativeRunCtx = runCtx.getStore();
+      if (nativeRunCtx) {
+        attachRunIdentity(nativeRunCtx, {
+          sessionId: nativeSessionId,
+          sessionSource: nativeSessionSource,
+          systemPrompt: nativeSystemPrompt,
+          agentFingerprint: nativeAgentFingerprint,
+          explicitAgentId: nativeExplicitAgentId,
+          body: requestBody,
+          requestedModel,
+        });
+      }
+
       // ── CAP 3: Deterministic Traces - allocate traceId + emit request.start ──
       const nativeTraceId = randomUUID();
+      setRunTraceId(nativeTraceId);
       {
         const tw = TraceWriter.getInstance();
         if (tw.isEnabled() && recordTelemetry) {
@@ -6814,6 +6976,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               messageCount: messages?.length,
               requestedTools: reqTools,
               systemPromptHash: sysHash,
+              runId: nativeRunCtx?.runId,
+              agentLabel: nativeRunCtx?.agentLabel,
+              threadId: nativeRunCtx?.threadId,
             },
           });
         }
@@ -7200,6 +7365,29 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       }
       // ── End session budget check ──
+
+      // ── Per-run cap (attribution): block the request that WOULD cross the run's cap ──
+      {
+        const rc = runCtx.getStore();
+        if (rc?.runId) {
+          const runProjected = projectedRequestCost(targetModel || requestedModel, promptText);
+          const capCheck = checkRunCap(rc, runProjected);
+          if (capCheck.blocked) {
+            recordCapKill(nativeSessionId, nativeExplicitAgentId ?? nativeAgentFingerprint, runProjected, rc.runId);
+            res.writeHead(429, { 'Content-Type': 'application/json', 'x-relayplane-run-cap-exceeded': 'true', ...withRunHeaders({}) });
+            res.end(JSON.stringify({
+              error: 'run_budget_exceeded',
+              type: 'run_budget_exceeded',
+              run_id: rc.runId,
+              spent: capCheck.spent,
+              cap: capCheck.cap,
+              hint: 'Raise with POST /v1/runs/<id> {cap_usd} or relayplane run --cap',
+            }));
+            return;
+          }
+          if (capCheck.warn) res.setHeader('x-relayplane-run-cap-warning', 'true');
+        }
+      }
 
       // ── Tool authorization check (deny-by-default, after budget gate) ──
       {
@@ -7945,7 +8133,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       try {
         const headers = buildAnthropicHeaders(ctx, useAnthropicEnvKey);
-        const response = await fetch('https://api.anthropic.com/v1/messages/count_tokens', {
+        const response = await fetch(`${anthropicBaseUrl()}/v1/messages/count_tokens`, {
           method: 'POST',
           headers,
           body,
@@ -8018,8 +8206,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       chatAgentFingerprint = agentResult.fingerprint;
     }
 
+    // ── Run attribution: bind run/agent/thread identity to this request ──
+    const chatRunCtx = runCtx.getStore();
+    if (chatRunCtx) {
+      attachRunIdentity(chatRunCtx, {
+        sessionId: chatSessionId,
+        sessionSource: chatSessionSource,
+        systemPrompt: chatSystemPrompt,
+        agentFingerprint: chatAgentFingerprint,
+        explicitAgentId: chatExplicitAgentId,
+        body: { ...request },
+        requestedModel: request.model,
+      });
+    }
+
     // ── CAP 3: Deterministic Traces - allocate chatTraceId + emit request.start ──
     const chatTraceId = randomUUID();
+    setRunTraceId(chatTraceId);
     {
       const tw = TraceWriter.getInstance();
       if (tw.isEnabled() && recordTelemetry) {
@@ -8032,6 +8235,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             model: request.model,
             messageCount: request.messages?.length,
             systemPromptHash: chatSysHash,
+            runId: chatRunCtx?.runId,
+            agentLabel: chatRunCtx?.agentLabel,
+            threadId: chatRunCtx?.threadId,
           },
         });
       }
@@ -8425,6 +8631,29 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
     // ── End budget check ──
 
+    // ── Per-run cap (attribution): block the request that WOULD cross the run's cap ──
+    {
+      const rc = runCtx.getStore();
+      if (rc?.runId) {
+        const runProjected = projectedRequestCost(targetModel, promptText);
+        const capCheck = checkRunCap(rc, runProjected);
+        if (capCheck.blocked) {
+          recordCapKill(chatSessionId, chatExplicitAgentId ?? chatAgentFingerprint, runProjected, rc.runId);
+          res.writeHead(429, { 'Content-Type': 'application/json', 'x-relayplane-run-cap-exceeded': 'true', ...withRunHeaders({}) });
+          res.end(JSON.stringify({
+            error: 'run_budget_exceeded',
+            type: 'run_budget_exceeded',
+            run_id: rc.runId,
+            spent: capCheck.spent,
+            cap: capCheck.cap,
+            hint: 'Raise with POST /v1/runs/<id> {cap_usd} or relayplane run --cap',
+          }));
+          return;
+        }
+        if (capCheck.warn) res.setHeader('x-relayplane-run-cap-warning', 'true');
+      }
+    }
+
     // ── Rate limit check ──
     // Same account-aware key as the primary request path above.
     const chatWorkspaceId = cooldownKey('local', ctx.authHeader);
@@ -8673,7 +8902,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         );
       }
     }
-  });
+  }));
 
   // ── Health Watchdog ──
   let watchdogFailures = 0;
