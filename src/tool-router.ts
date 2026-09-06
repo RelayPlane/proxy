@@ -1,5 +1,5 @@
 /**
- * ToolRouter — deny-by-default tool authorization with named scope packs.
+ * ToolRouter - deny-by-default tool authorization with named scope packs.
  *
  * CAP 2: Hierarchical Tool Routing (Phase 2, Session 3)
  *
@@ -40,7 +40,7 @@ export interface ToolPack {
   /** Policy applied to tools NOT listed in this pack */
   defaultPolicy: 'allow' | 'deny';
   version: string;
-  /** True for the three built-in packs — cannot be deleted */
+  /** True for the three built-in packs - cannot be deleted */
   builtIn?: boolean;
 }
 
@@ -95,7 +95,7 @@ export interface ToolRouterConfig {
 
 export const DEFAULT_TOOL_ROUTER_CONFIG: ToolRouterConfig = {
   enabled: false,
-  packsDir: path.join(os.homedir(), '.relayplane', 'config', 'tool-packs'),
+  packsDir: path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane', 'config', 'tool-packs'),
 };
 
 // ── Built-in Packs ────────────────────────────────────────────────────────────
@@ -535,7 +535,7 @@ export class ToolRouter {
         return schema;
       }
     } catch {
-      // Schema load failure is non-fatal — tool is still allowed
+      // Schema load failure is non-fatal - tool is still allowed
     }
     return undefined;
   }

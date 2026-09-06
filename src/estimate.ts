@@ -1,7 +1,7 @@
 /**
  * Pre-flight cost estimation for RelayPlane proxy.
  *
- * POST /v1/estimate — available to all authenticated users.
+ * POST /v1/estimate: free and available to everyone (no Pro gate).
  *
  * Accepts `{ model, messages, max_tokens }` (same shape as chat completions)
  * and returns a cost estimate without forwarding to any provider.
@@ -45,7 +45,7 @@ export interface InvalidRequestError {
 }
 
 // ---------------------------------------------------------------------------
-// Token counting (no external deps — ~4 chars per token heuristic + role overhead)
+// Token counting (no external deps - ~4 chars per token heuristic + role overhead)
 // ---------------------------------------------------------------------------
 
 const CHARS_PER_TOKEN = 4;
@@ -116,7 +116,7 @@ export function inferProvider(model: string): string {
 // Pro tier check
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR = path.join(os.homedir(), '.relayplane');
+const CONFIG_DIR = path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane');
 const CREDENTIALS_PATH = path.join(CONFIG_DIR, 'credentials.json');
 
 interface Credentials {
@@ -190,17 +190,8 @@ export function estimateChatRequest(req: EstimateRequest): EstimateResponse {
 export function handleEstimateRequest(
   rawBody: string
 ): { status: number; body: EstimateResponse | UpgradeRequiredError | InvalidRequestError } {
-  // In production all authenticated users get access; gate only applies in dev/test environments.
-  if (process.env.NODE_ENV !== 'production' && !isProTier()) {
-    return {
-      status: 402,
-      body: {
-        error: 'upgrade_required',
-        message: 'Upgrade to Pro for pre-flight cost estimation',
-        url: 'https://relayplane.com/pricing',
-      },
-    };
-  }
+  // The proxy is 100% free (MIT). Pre-flight cost estimation is available to
+  // everyone with no gate. The old Pro/upgrade_required path has been removed.
 
   // --- Parse request ---
   let req: EstimateRequest;
@@ -250,7 +241,7 @@ export function handleEstimateRequest(
 export { MODEL_PRICING };
 
 // ---------------------------------------------------------------------------
-// Per-IP rate limiter for /v1/estimate — extracted for testability
+// Per-IP rate limiter for /v1/estimate - extracted for testability
 // ---------------------------------------------------------------------------
 
 export interface EstimateRateLimitEntry {
@@ -268,7 +259,7 @@ export interface EstimateRateLimitResult {
 /**
  * Check and update the per-IP rate limit for /v1/estimate.
  *
- * Uses `remoteAddress` (socket-level) as the key — never x-forwarded-for.
+ * Uses `remoteAddress` (socket-level) as the key - never x-forwarded-for.
  * Mutates rateMap in place. Returns { allowed: false } when limit is exceeded.
  */
 export function checkEstimateRateLimit(
@@ -286,7 +277,7 @@ export function checkEstimateRateLimit(
     entry.count++;
     return { allowed: true, count: entry.count };
   }
-  // New window — create or reset entry
+  // New window - create or reset entry
   rateMap.set(ip, { windowStart: now, count: 1 });
   return { allowed: true, count: 1 };
 }

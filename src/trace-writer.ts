@@ -136,7 +136,7 @@ export function defaultTracesConfig(): TracesConfig {
     enabled: true,
     storeFullRequests: false,
     retentionDays: 30,
-    directory: path.join(os.homedir(), '.relayplane', 'traces'),
+    directory: path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane', 'traces'),
     maxDiskMb: 500,
   };
 }

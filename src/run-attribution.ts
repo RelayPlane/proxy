@@ -20,6 +20,7 @@ import type * as http from 'node:http';
 
 import { sha256Hex } from './trace-writer.js';
 import { estimateCost } from './telemetry.js';
+import { maybeFireRunFirstAttributed, maybeFireRunMilestone } from './lifecycle-telemetry.js';
 import {
   getRunStore,
   nearestRankPercentile,
@@ -925,12 +926,29 @@ function rebuildLabelStats(run: RunRow, dominant: Record<string, string>, now: n
 }
 
 /**
- * Shared close path for `endRun` and `sweepIdleRuns`: under-band check, then
- * cross-run drift, then the label_stats rebuild.
+ * Adoption pings, fired from the close path.
+ *
+ * Only runs the user tagged themselves count. Inferred runs happen whether or
+ * not anyone opted in, so they say nothing about whether attribution is being
+ * used on purpose. Nothing identifying leaves the box: no run id, no label, no
+ * agent name, no cost, only the fact that a header-tagged run closed.
+ */
+function fireRunLifecycle(run: RunRow): void {
+  try {
+    if (run.run_source !== 'header' || run.request_count <= 0) return;
+    maybeFireRunFirstAttributed();
+    maybeFireRunMilestone(getRunStore().countRuns({ source: 'header', status: 'completed' }));
+  } catch { /* telemetry never breaks a run close */ }
+}
+
+/**
+ * Shared close path for `endRun` and `sweepIdleRuns`: adoption pings, then the
+ * under-band check, then cross-run drift, then the label_stats rebuild.
  */
 function onRunClosed(run: RunRow, now: number): void {
   try {
     const store = getRunStore();
+    fireRunLifecycle(run);
     const band = bandForRun(run);
     if (band && run.cost_usd < band[0]) {
       const [lo, hi] = band;

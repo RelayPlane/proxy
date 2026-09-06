@@ -21,11 +21,15 @@ const read = (rel: string) => readFileSync(path.join(PROXY_ROOT, rel), 'utf8');
 const exists = (rel: string) => existsSync(path.join(PROXY_ROOT, rel));
 
 describe('packages/proxy/README.md truth pass (relayplane-readme-truth-pass-2026-09-04)', () => {
-  it('opens with the section-4 draft pitch', () => {
+  it('opens with the # RelayPlane title and the real hero pitch', () => {
+    // Reconciled 2026-09-06: the intentional live README (the "killer" rewrite,
+    // PR #299) leads with the cost/control hero line, not the older section-4
+    // draft's "One local endpoint for every model" pitch. Assert the real,
+    // shipped opening. The honesty guarantee (opens with # RelayPlane) is kept.
     const content = read('README.md');
     expect(content.startsWith('# RelayPlane\n')).toBe(true);
     expect(content).toContain(
-      'One local endpoint for every model your AI agents use.'
+      'Know what every agent run costs. Kill the runaway before it drains your budget.'
     );
   });
 

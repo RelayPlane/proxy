@@ -1,7 +1,7 @@
 import React from 'react';
 import { useRunDetail } from './useRunDetail';
 import { useLiveRuns, fmtRunDur } from './useLiveRuns';
-import { fmtUsd4, shortRunId, CopyButton, SourceBadge, StatusPill, BandPill } from './Runs';
+import { fmtUsd4, shortRunId, CopyButton, SourceBadge, StatusPill, BandPill, modelClassOf, bandTone as bandToneShared } from './Runs';
 
 // One run, end to end. Money at the top, then where it went: band, retries,
 // agents, models, children, requests, alerts. No sparkline and no tree, the
@@ -58,7 +58,9 @@ function StatTile({ eyebrow, value, sub, accent, title }) {
 }
 
 // Horizontal band ruler: lo and hi ticks with the run's cost as the marker.
-function BandBar({ band, cost }) {
+// Exported so the Overview's inline run expand (RunsCenterpiece) can reuse the
+// same "expected vs actual" ruler instead of drawing a second one.
+export function BandBar({ band, cost }) {
   const lo = Number(band && band.lo);
   const hi = Number(band && band.hi);
   const cacheState = (band && band.cache_state) || 'unknown';
@@ -78,6 +80,8 @@ function BandBar({ band, cost }) {
   const axisHi = hi + span * 0.6;
   const pos = v => Math.max(0, Math.min(100, ((v - axisLo) / (axisHi - axisLo)) * 100));
   const status = band.status || 'none';
+  const ratio = hi > 0 ? (Number(cost) || 0) / hi : NaN;
+  const markerTone = bandToneShared(status, ratio);
   return (
     <div className={'rdband rdband--' + status}>
       <div className="rdband__hd">
@@ -86,6 +90,9 @@ function BandBar({ band, cost }) {
           band {fmtUsd4(lo)} to {fmtUsd4(hi)}, cache {cacheState}
         </span>
         <BandPill status={status} />
+        {Number.isFinite(ratio) && (
+          <span className="rdband__ratio" style={{ color: markerTone }}>{ratio.toFixed(1)}x</span>
+        )}
       </div>
       <div className="rdband__track">
         <i className="rdband__zone" style={{ left: pos(lo) + '%', width: (pos(hi) - pos(lo)) + '%' }} />
@@ -93,7 +100,7 @@ function BandBar({ band, cost }) {
         <i className="rdband__tick" style={{ left: pos(hi) + '%' }} title={`hi ${fmtUsd4(hi)}`} />
         <i
           className="rdband__marker"
-          style={{ left: pos(Number(cost) || 0) + '%' }}
+          style={{ left: pos(Number(cost) || 0) + '%', background: markerTone }}
           title={`this run ${fmtUsd4(cost)}`}
         />
       </div>
@@ -112,7 +119,7 @@ function ModelChips({ modelsSeen }) {
   return (
     <span className="rdchips">
       {entries.map(([model, n]) => (
-        <span key={model} className="rdchip" title={`${model}, ${n} requests`}>
+        <span key={model} className={'modelchip modelchip--' + modelClassOf(model)} title={`${model}, ${n} requests`}>
           {shortModel(model)} <b>x{n}</b>
         </span>
       ))}
@@ -166,7 +173,7 @@ function ModelMix({ byModel, total }) {
         </div>
         {byModel.map(m => (
           <div className="rdtable__row" key={m.model}>
-            <span className="rdtable__mono" title={m.model}>{shortModel(m.model)}</span>
+            <span className="rdtable__mono rdtable__model" title={m.model}><i className={'rddot rddot--' + modelClassOf(m.model)} />{shortModel(m.model)}</span>
             <span className="r">{(Number(m.request_count) || 0).toLocaleString()}</span>
             <span className="r"><b>{(Number(m.tokens_in) || 0).toLocaleString()}</b><span className="dim">/{(Number(m.tokens_out) || 0).toLocaleString()}</span></span>
             <span className="r rdtable__cost">{fmtUsd4(m.cost_usd)}</span>

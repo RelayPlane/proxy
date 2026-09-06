@@ -158,11 +158,11 @@ describe('estimateChatRequest', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. Pro gate enforced (402 for free tier)
+// 3. No Pro gate. Estimation is free for everyone (proxy is 100% free/MIT)
 // ---------------------------------------------------------------------------
 
-describe('handleEstimateRequest — Pro gate', () => {
-  it('returns 402 for free-tier users (no env override, no credentials)', () => {
+describe('handleEstimateRequest, no Pro gate (free for everyone)', () => {
+  it('returns a real 200 estimate with no env override and no credentials', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', undefined, () => {
       const result = handleEstimateRequest(
         JSON.stringify({
@@ -170,13 +170,14 @@ describe('handleEstimateRequest — Pro gate', () => {
           messages: [{ role: 'user', content: 'Test' }],
         })
       );
-      expect(result.status).toBe(402);
-      expect((result.body as any).error).toBe('upgrade_required');
-      expect((result.body as any).url).toContain('relayplane.com/pricing');
+      expect(result.status).toBe(200);
+      expect((result.body as any).error).toBeUndefined();
+      expect((result.body as any).note).toBe('estimate only');
+      expect((result.body as any).estimated_cost_usd).toBeGreaterThan(0);
     });
   });
 
-  it('returns 200 for Pro users (env override = true)', () => {
+  it('returns a 200 estimate when the (retired) Pro env flag is set', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', 'true', () => {
       const result = handleEstimateRequest(
         JSON.stringify({
@@ -189,7 +190,7 @@ describe('handleEstimateRequest — Pro gate', () => {
     });
   });
 
-  it('402 response includes upgrade URL', () => {
+  it('never returns 402 upgrade_required, even with the flag explicitly disabled', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', '0', () => {
       const result = handleEstimateRequest(
         JSON.stringify({
@@ -197,10 +198,8 @@ describe('handleEstimateRequest — Pro gate', () => {
           messages: [{ role: 'user', content: 'Test' }],
         })
       );
-      expect(result.status).toBe(402);
-      const body = result.body as any;
-      expect(body.url).toBe('https://relayplane.com/pricing');
-      expect(body.message).toMatch(/upgrade/i);
+      expect(result.status).toBe(200);
+      expect((result.body as any).error).toBeUndefined();
     });
   });
 });
@@ -361,7 +360,7 @@ describe('MCP relay_estimate_cost tool integration', () => {
 // ---------------------------------------------------------------------------
 
 // Fix #2: RELAYPLANE_PRO_ESTIMATE env bypass blocked in production
-describe('isProTier — production env override gate (Fix #2)', () => {
+describe('isProTier - production env override gate (Fix #2)', () => {
   it('env override is NOT respected when NODE_ENV=production', () => {
     const origNode = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
@@ -383,7 +382,7 @@ describe('isProTier — production env override gate (Fix #2)', () => {
 });
 
 // Fix #5: Unbounded max_tokens validation
-describe('handleEstimateRequest — max_tokens bounds (Fix #5)', () => {
+describe('handleEstimateRequest - max_tokens bounds (Fix #5)', () => {
   it('returns 400 invalid_request for max_tokens = 0', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', '1', () => {
       const result = handleEstimateRequest(
@@ -417,7 +416,7 @@ describe('handleEstimateRequest — max_tokens bounds (Fix #5)', () => {
 
   it('returns 400 invalid_request for max_tokens = Infinity', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', '1', () => {
-      // JSON.stringify converts Infinity to null — test the boundary separately
+      // JSON.stringify converts Infinity to null - test the boundary separately
       const body = '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":1e400}';
       const result = handleEstimateRequest(body);
       // 1e400 parses as Infinity in JS
@@ -446,7 +445,7 @@ describe('handleEstimateRequest — max_tokens bounds (Fix #5)', () => {
 });
 
 // Fix #6: Wrong error code on 400 responses
-describe('handleEstimateRequest — correct error codes on 400 (Fix #6)', () => {
+describe('handleEstimateRequest - correct error codes on 400 (Fix #6)', () => {
   it('returns error: invalid_request (not upgrade_required) for bad JSON', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', '1', () => {
       const result = handleEstimateRequest('not-valid-json{{{');
@@ -473,19 +472,19 @@ describe('handleEstimateRequest — correct error codes on 400 (Fix #6)', () => 
     });
   });
 
-  it('402 responses still use error: upgrade_required', () => {
+  it('a valid request with no Pro flag returns a real 200 estimate (no gate)', () => {
     withEnv('RELAYPLANE_PRO_ESTIMATE', undefined, () => {
       const result = handleEstimateRequest(
         JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] })
       );
-      expect(result.status).toBe(402);
-      expect((result.body as any).error).toBe('upgrade_required');
+      expect(result.status).toBe(200);
+      expect((result.body as any).note).toBe('estimate only');
     });
   });
 });
 
 // Fix #4: SSRF via RELAYPLANE_PROXY_URL
-describe('relayEstimateCost — SSRF validation (Fix #4)', () => {
+describe('relayEstimateCost - SSRF validation (Fix #4)', () => {
   it('rejects non-localhost URLs', async () => {
     const { relayEstimateCost } = await import(
       '../../mcp-server/src/tools/relay-estimate-cost.js'
@@ -552,7 +551,7 @@ describe('relayEstimateCost — SSRF validation (Fix #4)', () => {
 // Phase 0 item 2: free-tier access to /v1/estimate (rp-estimate-free-tier)
 // ---------------------------------------------------------------------------
 
-describe('handleEstimateRequest — free-tier access (Phase 0)', () => {
+describe('handleEstimateRequest - free-tier access (Phase 0)', () => {
   it('returns 200 EstimateResponse for free-tier users (no plan, no env override)', () => {
     // Simulate a free-tier user: clear RELAYPLANE_PRO_ESTIMATE and set NODE_ENV=production
     // so the env-override bypass path is not taken.  The Pro gate must NOT fire.
@@ -609,7 +608,7 @@ describe('handleEstimateRequest — free-tier access (Phase 0)', () => {
       path.resolve(__dirname, '../src/estimate.ts'),
       'utf8'
     );
-    // The old JSDoc said "Pro-tier feature" — it must be removed
+    // The old JSDoc said "Pro-tier feature" - it must be removed
     expect(src).not.toMatch(/Pro-tier feature/);
   });
 });

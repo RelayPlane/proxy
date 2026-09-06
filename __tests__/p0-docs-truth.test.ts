@@ -10,6 +10,8 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { RUN_REQUEST_HEADERS, RUN_RESPONSE_HEADERS } from '../src/run-attribution.js';
+
 const repoRoot = join(__dirname, '..', '..', '..');
 const docs = join(repoRoot, 'apps', 'marketing-site', 'src', 'app', 'docs');
 const read = (p: string) => readFileSync(p, 'utf8');
@@ -21,6 +23,7 @@ const costCaps = join(docs, 'cost-caps', 'page.tsx');
 const cliDoc = join(docs, 'proxy', 'cli', 'page.tsx');
 const installDoc = join(docs, 'installation', 'page.tsx');
 const rootReadme = join(repoRoot, 'README.md');
+const runsDoc = join(docs, 'runs', 'page.tsx');
 
 describe('getting-started pages use a command that exists on npm', () => {
   for (const page of [firstRun, quickstart]) {
@@ -99,5 +102,38 @@ describe('CLI reference matches the shipped CLI', () => {
   it('installation page version example matches the real output format', () => {
     if (!existsSync(installDoc)) return;
     expect(read(installDoc)).not.toMatch(/1\.7\.7/);
+  });
+});
+
+describe('docs/runs documents every header the proxy reads', () => {
+  it('names all 8 request headers', () => {
+    const src = read(runsDoc);
+    for (const header of RUN_REQUEST_HEADERS) {
+      expect(src).toContain(header);
+    }
+  });
+
+  it('names all 4 response headers', () => {
+    const src = read(runsDoc);
+    for (const header of RUN_RESPONSE_HEADERS) {
+      expect(src).toContain(header);
+    }
+  });
+
+  it('documents the streaming caveat on the run cost header', () => {
+    const src = read(runsDoc);
+    expect(src).toMatch(/streaming/i);
+  });
+
+  it('documents both CLI entry points', () => {
+    const src = read(runsDoc);
+    expect(src).toContain('relayplane run ');
+    expect(src).toContain('relayplane runs ');
+  });
+
+  it('is the only page that documents /v1/runs/, the getting-started pages stay clean', () => {
+    expect(read(runsDoc)).toMatch(/\/v1\/runs/);
+    expect(read(firstRun)).not.toMatch(/\/v1\/runs\//);
+    expect(read(quickstart)).not.toMatch(/\/v1\/runs\//);
   });
 });

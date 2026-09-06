@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 const repositoryRoot = join(__dirname, '..', '..', '..');
 const marketingSiteApp = join(repositoryRoot, 'apps', 'marketing-site', 'src', 'app');
+const marketingSiteSrc = join(repositoryRoot, 'apps', 'marketing-site', 'src');
 
 // The live site contradicted itself: title claimed 90% savings, og claimed
 // 40-60%, and the internal record (notes/relayplane-true-story-2026-09-02.md
@@ -54,5 +55,54 @@ describe('marketing site savings claims converge on record-true proof', () => {
     for (const bannedClaim of BANNED_SAVINGS_CLAIMS) {
       expect(docs).not.toMatch(bannedClaim);
     }
+  });
+});
+
+// PR5: the run attribution surfaces quote real dollar figures, which the
+// honesty rule allows only when the same breath says they are notional list
+// price (the counterfactual cost of the traffic at published per-token rates,
+// not an invoice). JSX has no paragraph boundary a regex can trust, since a
+// single <p> is routinely broken up by <code> and <strong>, so "same
+// paragraph" is approximated by a character window either side of the figure.
+const MONEY_FIGURE = /\$\s?\d[\d,]*(?:\.\d+)?/g;
+const PERCENT_FIGURE = /\d[\d,]*(?:\.\d+)?\s?%/g;
+const CAVEAT_WINDOW = 500;
+
+const RUN_ATTRIBUTION_SURFACES = [
+  join('app', 'docs', 'runs', 'page.tsx'),
+  join('components', 'landing-v2', 'runs-section.tsx'),
+  join('components', 'landing-v2', 'runs-screenshot.tsx'),
+];
+
+function uncaveatedFigures(source: string): string[] {
+  const found: string[] = [];
+  for (const pattern of [MONEY_FIGURE, PERCENT_FIGURE]) {
+    for (const match of source.matchAll(pattern)) {
+      const at = match.index ?? 0;
+      const window = source.slice(Math.max(0, at - CAVEAT_WINDOW), at + CAVEAT_WINDOW);
+      if (!window.includes('notional')) found.push(match[0]);
+    }
+  }
+  return found;
+}
+
+describe('run attribution surfaces never quote a figure without the notional caveat', () => {
+  for (const relativePath of RUN_ATTRIBUTION_SURFACES) {
+    it(`${relativePath} carries "notional" alongside every dollar and percent figure`, () => {
+      const source = readFileSync(join(marketingSiteSrc, relativePath), 'utf8');
+      expect(uncaveatedFigures(source)).toEqual([]);
+    });
+
+    it(`${relativePath} has no unverifiable savings percentage`, () => {
+      const source = readFileSync(join(marketingSiteSrc, relativePath), 'utf8');
+      for (const bannedClaim of BANNED_SAVINGS_CLAIMS) {
+        expect(source).not.toMatch(bannedClaim);
+      }
+    });
+  }
+
+  it('the sniffer actually catches an uncaveated figure', () => {
+    expect(uncaveatedFigures('<p>You save $42.00 every night.</p>')).toEqual(['$42.00']);
+    expect(uncaveatedFigures('<p>$42.00 notional list price.</p>')).toEqual([]);
   });
 });

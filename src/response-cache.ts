@@ -1,5 +1,5 @@
 /**
- * RelayPlane Response Cache — Phase 1: Exact Match
+ * RelayPlane Response Cache - Phase 1: Exact Match
  *
  * Caches LLM API responses locally to avoid duplicate API calls.
  * SHA-256 hash of canonical request → cached response.
@@ -58,7 +58,7 @@ const DEFAULTS: ResolvedCacheConfig = {
   defaultTtlSeconds: 3600,
   ttlByTaskType: {},
   onlyWhenDeterministic: true,
-  cacheDir: path.join(os.homedir(), '.relayplane', 'cache'),
+  cacheDir: path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane', 'cache'),
   mode: 'exact',
   aggressiveMaxAge: 1800,
 };
@@ -137,7 +137,7 @@ export function computeCacheKey(requestBody: Record<string, unknown>): string {
 
 /**
  * Fields included in the aggressive cache key.
- * Ignores conversation history — only uses system prompt + last user message + model + tools.
+ * Ignores conversation history - only uses system prompt + last user message + model + tools.
  */
 const AGGRESSIVE_KEY_FIELDS = ['model', 'system', 'tools'] as const;
 
@@ -184,7 +184,7 @@ export function isDeterministic(requestBody: Record<string, unknown>): boolean {
 
 /**
  * Check if a response contains tool calls.
- * Note: We still cache tool call responses — agent workloads are almost
+ * Note: We still cache tool call responses - agent workloads are almost
  * entirely tool calls, and identical requests should return cached results.
  * The caller decides whether to use this check.
  */

@@ -657,6 +657,7 @@ interface RunBackend {
   getRun(runId: string): RunRow | null;
   putRun(row: RunRow): void;
   queryRuns(q: RunQuery): RunRow[];
+  countRuns(q: RunQuery): number;
   getAgent(runId: string, agentLabel: string, threadId: string): RunAgentRow | null;
   putAgent(row: RunAgentRow): void;
   agentsForRun(runId: string): RunAgentRow[];
@@ -709,7 +710,8 @@ class SqliteRunBackend implements RunBackend {
     this.stmt(sql).run({ ...row, tags: JSON.stringify(row.tags) });
   }
 
-  queryRuns(q: RunQuery): RunRow[] {
+  /** Shared by `queryRuns` and `countRuns` so the two can never drift apart. */
+  private runWhere(q: RunQuery): { clause: string; params: unknown[] } {
     const where: string[] = [];
     const params: unknown[] = [];
     if (q.status !== undefined) { where.push(`status = ?`); params.push(q.status); }
@@ -727,7 +729,11 @@ class SqliteRunBackend implements RunBackend {
       where.push(`(last_seen_at < ? OR (last_seen_at = ? AND run_id < ?))`);
       params.push(q.cursorTs, q.cursorTs, q.cursorId);
     }
-    const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+    return { clause: where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '', params };
+  }
+
+  queryRuns(q: RunQuery): RunRow[] {
+    const { clause, params } = this.runWhere(q);
     params.push(q.limit ?? 1000);
     const rows = this.stmt(`SELECT * FROM runs${clause} ORDER BY last_seen_at DESC, run_id DESC LIMIT ?`).all(...params);
     const out: RunRow[] = [];
@@ -736,6 +742,14 @@ class SqliteRunBackend implements RunBackend {
       if (mapped) out.push(mapped);
     }
     return out;
+  }
+
+  countRuns(q: RunQuery): number {
+    const { clause, params } = this.runWhere(q);
+    const row = this.stmt(`SELECT COUNT(*) AS n FROM runs${clause}`).get(...params);
+    if (row === null || typeof row !== 'object') return 0;
+    const n = (row as Record<string, unknown>)['n'];
+    return typeof n === 'number' && Number.isFinite(n) ? n : 0;
   }
 
   getAgent(runId: string, agentLabel: string, threadId: string): RunAgentRow | null {
@@ -890,14 +904,13 @@ class MemoryRunBackend implements RunBackend {
     this.runs.set(row.run_id, cloneRun(row));
   }
 
-  queryRuns(q: RunQuery): RunRow[] {
+  /** Shared by `queryRuns` and `countRuns`: every filter except cursor and limit. */
+  private filterRuns(q: RunQuery): RunRow[] {
     let rows = [...this.runs.values()];
     const minLastSeen = q.minLastSeen;
     const maxLastSeen = q.maxLastSeen;
     const minEndedAt = q.minEndedAt;
     const tagKey = q.tagKey;
-    const cursorTs = q.cursorTs;
-    const cursorId = q.cursorId;
     if (q.status !== undefined) rows = rows.filter((r) => r.status === q.status);
     if (minLastSeen !== undefined) rows = rows.filter((r) => r.last_seen_at >= minLastSeen);
     if (maxLastSeen !== undefined) rows = rows.filter((r) => r.last_seen_at < maxLastSeen);
@@ -906,11 +919,26 @@ class MemoryRunBackend implements RunBackend {
     if (q.source !== undefined) rows = rows.filter((r) => r.run_source === q.source);
     if (q.parentRunId !== undefined) rows = rows.filter((r) => r.parent_run_id === q.parentRunId);
     if (tagKey !== undefined) rows = rows.filter((r) => r.tags[tagKey] === (q.tagValue ?? ''));
+    return rows;
+  }
+
+  queryRuns(q: RunQuery): RunRow[] {
+    let rows = this.filterRuns(q);
+    const cursorTs = q.cursorTs;
+    const cursorId = q.cursorId;
     rows.sort((a, b) => (b.last_seen_at - a.last_seen_at) || (a.run_id < b.run_id ? 1 : a.run_id > b.run_id ? -1 : 0));
     if (cursorTs !== undefined && cursorId !== undefined) {
       rows = rows.filter((r) => r.last_seen_at < cursorTs || (r.last_seen_at === cursorTs && r.run_id < cursorId));
     }
     return rows.slice(0, q.limit ?? 1000).map(cloneRun);
+  }
+
+  countRuns(q: RunQuery): number {
+    const cursorTs = q.cursorTs;
+    const cursorId = q.cursorId;
+    const rows = this.filterRuns(q);
+    if (cursorTs === undefined || cursorId === undefined) return rows.length;
+    return rows.filter((r) => r.last_seen_at < cursorTs || (r.last_seen_at === cursorTs && r.run_id < cursorId)).length;
   }
 
   getAgent(runId: string, agentLabel: string, threadId: string): RunAgentRow | null {
@@ -1350,6 +1378,26 @@ export class RunStore {
     const last = runs[runs.length - 1];
     const next = runs.length === limit && last ? `${last.last_seen_at}:${last.run_id}` : null;
     return { runs, next_cursor: next };
+  }
+
+  /**
+   * Row count for the same filter `listRuns` takes, without paging the rows
+   * back out. `limit` and `cursor` are ignored: a count is a count.
+   */
+  countRuns(filter: Omit<RunListFilter, 'limit' | 'cursor'>): number {
+    const q: RunQuery = {};
+    if (filter.status !== undefined) q.status = filter.status;
+    if (filter.sinceMs !== undefined) q.minLastSeen = filter.sinceMs;
+    if (filter.label !== undefined) q.label = filter.label;
+    if (filter.source !== undefined) q.source = filter.source;
+    if (filter.tag !== undefined) {
+      const idx = filter.tag.indexOf(':');
+      if (idx > 0) {
+        q.tagKey = filter.tag.slice(0, idx);
+        q.tagValue = filter.tag.slice(idx + 1);
+      }
+    }
+    return this.backend.countRuns(q);
   }
 
   activeRuns(sinceMs: number): RunRow[] {

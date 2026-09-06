@@ -26,7 +26,7 @@ export interface AgentRegistry {
   [fingerprint: string]: AgentRegistryEntry;
 }
 
-const REGISTRY_DIR = path.join(os.homedir(), '.relayplane');
+const REGISTRY_DIR = path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane');
 const REGISTRY_FILE = path.join(REGISTRY_DIR, 'agents.json');
 
 let agentRegistry: AgentRegistry = {};
@@ -129,7 +129,7 @@ export function flushAgentRegistry(): void {
     fs.writeFileSync(REGISTRY_FILE, JSON.stringify(agentRegistry, null, 2), 'utf-8');
     registryDirty = false;
   } catch {
-    // Silent failure — don't break the proxy
+    // Silent failure - don't break the proxy
   }
 }
 

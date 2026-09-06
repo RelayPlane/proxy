@@ -10,27 +10,24 @@
    ============================================================ */
 
 /* --- Fonts (Google Fonts) --------------------------------------
-   SUBSTITUTION NOTE: RelayPlane's marketing site appears to use a
-   Geist-family sans + JetBrains-style mono. No font files were
-   provided in the repos, so we use the closest Google Fonts:
-     - Inter Tight  → display + body sans (Geist substitute)
-     - JetBrains Mono → code, CLI, run IDs, stat numbers
-   Replace these with the real Geist/IBM Plex Mono files when
-   the user provides them.
+   Matches the approved Claude Design export: JetBrains Mono for
+   every number, label and code string; Newsreader (serif, with a
+   real italic) for headlines and section titles. Dark, terminal-
+   adjacent, precise , the redesign's aesthetic anchor.
 ---------------------------------------------------------------- */
-@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700;800&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;1,6..72,300;1,6..72,400&display=swap');
 
 :root {
   /* ===== Color tokens , RAW palette ============================ */
-  /* Ink (dark surfaces) */
+  /* Ink (dark surfaces) , tuned to the design export's exact values */
   --rp-ink-1000: #07080A;   /* deepest background */
-  --rp-ink-900:  #0B0D10;   /* page bg */
-  --rp-ink-800:  #11141A;   /* panel bg */
-  --rp-ink-700:  #181C24;   /* card bg */
-  --rp-ink-600:  #232833;   /* card bg elevated, hover */
-  --rp-ink-500:  #2E3441;   /* borders strong */
-  --rp-ink-400:  #3B4252;   /* borders */
-  --rp-ink-300:  #555C6A;   /* dim text on dark */
+  --rp-ink-900:  #0A0B0C;   /* page bg */
+  --rp-ink-800:  #0F1214;   /* panel bg */
+  --rp-ink-700:  #14171A;   /* card bg */
+  --rp-ink-600:  #1B1F21;   /* card bg elevated, hover */
+  --rp-ink-500:  #23282B;   /* borders strong */
+  --rp-ink-400:  #2B3134;   /* borders */
+  --rp-ink-300:  #545B57;   /* dim text on dark */
 
   /* Paper (light surfaces) */
   --rp-paper-0:    #FFFFFF;
@@ -44,21 +41,32 @@
   --rp-paper-700:  #2A2A30;
 
   /* Signal , accents (functional, not decorative) */
-  --rp-signal-relay:    #34D399;  /* lime , RelayPlane brand accent, "savings", "active" */
-  --rp-signal-relay-dim:#1BA37B;
+  --rp-signal-relay:    #57E0A0;  /* green , RelayPlane brand accent, "savings", "active", "in band" */
+  --rp-signal-relay-dim:#2F4A3E;
   --rp-signal-relay-deep:#0F5E44;
 
-  --rp-signal-route:    #4D9BFF;  /* azure , routing decisions, info */
+  --rp-signal-route:    #7EC8F0;  /* azure , routing decisions, info */
   --rp-signal-route-dim:#2B6EC8;
 
-  --rp-signal-spend:    #FFB347;  /* amber , cost warnings, budget threshold */
+  --rp-signal-spend:    #E8B13C;  /* amber , cost warnings, budget threshold, cold cache */
   --rp-signal-spend-dim:#C8821F;
 
-  --rp-signal-stop:     #FF5A4D;  /* coral , kill-switch, errors, denied */
+  --rp-signal-stop:     #F0604F;  /* red , kill-switch, errors, denied, runaway/over band */
   --rp-signal-stop-dim: #C8362A;
 
-  --rp-signal-verify:   #A78BFA;  /* violet , spec-match, verification */
+  --rp-signal-verify:   #C8A0E8;  /* violet , spec-match, verification */
   --rp-signal-verify-dim:#7C5FE0;
+
+  /* Model-mix chip palette , each model family reads as its own hue so a run's
+     composition is legible at a glance (matches the approved design export:
+     sonnet=azure, opus=violet, haiku/fable=green/grey). border-dim + text. */
+  --rp-model-sonnet:     #9AAAD0;  --rp-model-sonnet-dim:  #3A4256;
+  --rp-model-opus:       #C0A0CC;  --rp-model-opus-dim:    #4A3A52;
+  --rp-model-haiku:      #8FC6AA;  --rp-model-haiku-dim:   #2F4A3E;
+  --rp-model-fable:      #9AA29D;  --rp-model-fable-dim:   #23282B;
+  --rp-model-gpt:        #8FC6AA;  --rp-model-gpt-dim:     #2F4A3E;
+  --rp-model-gemini:     #7EC8F0;  --rp-model-gemini-dim:  #2B6EC8;
+  --rp-model-other:      #9AA29D;  --rp-model-other-dim:   #23282B;
 
   /* ===== Semantic tokens , DARK (default product surfaces) ===== */
   --rp-bg:           var(--rp-ink-900);
@@ -119,9 +127,13 @@
   --rp-glow-accent: 0 0 0 1px var(--rp-signal-relay), 0 0 24px -6px rgba(52,211,153,.5);
   --rp-glow-stop:   0 0 0 1px var(--rp-signal-stop),  0 0 18px -6px rgba(255,90,77,.5);
 
-  /* ===== Type scale ============================================ */
-  --rp-font-sans:    'Inter Tight', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --rp-font-display: 'Instrument Serif', 'Times New Roman', Georgia, serif;
+  /* ===== Type scale ============================================
+     The design export uses exactly two families: JetBrains Mono for
+     every number, label, code string and stat (this is also what
+     --rp-font-sans resolves to, so nothing in the codebase needs a
+     sans-serif fallback rewritten), and Newsreader for headlines. */
+  --rp-font-sans:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --rp-font-display: 'Newsreader', 'Times New Roman', Georgia, serif;
   --rp-font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 
   /* sizes (px, line-height multipliers via classes below) */

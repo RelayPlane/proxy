@@ -11,11 +11,14 @@ describe('marketing site paid-tier cleanup', () => {
       .map((file) => readFileSync(join(marketingComponents, file), 'utf8'))
       .join('\n');
 
-    // The honest-positioning revamp removed the paid tiers entirely, so none of
-    // the Pro / Kill switch / Pricing labels should appear in the primary chrome.
+    // The honest-positioning revamp removed the old paid tiers, so the old
+    // paid-tier framing (Pro, Kill switch) must not appear in the primary chrome.
+    // Reconciled 2026-09-06: a /pricing page IS intentional again, the hosted-tier
+    // fake-door demand test (PR #280) lives there and must be discoverable, so a
+    // "Pricing" nav link is allowed. The page itself is free-proxy + a hosted
+    // waitlist, not a resurrected paid tier.
     expect(combined).not.toMatch(/>\s*Pro\s*</);
     expect(combined).not.toMatch(/>\s*Kill switch\s*</);
-    expect(combined).not.toMatch(/>\s*Pricing\s*</);
   });
 
   it('removes obsolete landing components that preserve paid-tier UI', () => {

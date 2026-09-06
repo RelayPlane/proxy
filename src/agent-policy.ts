@@ -20,7 +20,7 @@ export interface TaskPolicy {
 }
 
 export interface AgentPolicy {
-  fingerprint?: string;            // Optional — matched by name if absent
+  fingerprint?: string;            // Optional - matched by name if absent
   preferred: string;
   escalateTo?: string;
   escalateOn?: Array<'complexity_high' | 'rate_limit' | 'error'>;
@@ -54,7 +54,7 @@ export interface PolicyResolution {
 
 // ─── File Loading ─────────────────────────────────────────────────────────────
 
-const POLICY_DIR = path.join(os.homedir(), '.relayplane');
+const POLICY_DIR = path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane');
 export const POLICY_FILE = path.join(POLICY_DIR, 'policy.yaml');
 const CACHE_TTL_MS = 5000;
 
@@ -65,7 +65,7 @@ interface PolicyCache {
 
 let _cache: PolicyCache | null = null;
 
-/** Reset cache — for testing only */
+/** Reset cache - for testing only */
 export function _resetPolicyCache(): void {
   _cache = null;
 }

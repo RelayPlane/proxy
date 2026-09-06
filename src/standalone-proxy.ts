@@ -131,7 +131,7 @@ const CREDENTIAL_POOL_RESERVE_MODEL = 'claude-fable-5-1';
 /** Read per-account usage headroom from an optional ~/.relayplane/headroom.json. */
 function readCredentialHeadroom(credId: string): CredentialHeadroom | undefined {
   try {
-    const p = path.join(os.homedir(), '.relayplane', 'headroom.json');
+    const p = path.join(getRelayplaneDir(), 'headroom.json');
     const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Record<string, CredentialHeadroom>;
     const h = raw?.[credId];
     return h && typeof h === 'object' ? h : undefined;
@@ -1220,7 +1220,7 @@ const HISTORY_RETENTION_DAYS = 7;
 let requestIdCounter = 0;
 
 // --- Persistent history (JSONL) ---
-const HISTORY_DIR = path.join(os.homedir(), '.relayplane');
+const HISTORY_DIR = getRelayplaneDir();
 const HISTORY_FILE = path.join(HISTORY_DIR, 'history.jsonl');
 let historyWriteBuffer: RequestHistoryEntry[] = [];
 let historyFlushTimer: NodeJS.Timeout | null = null;
@@ -1584,7 +1584,7 @@ function isProceduralInjectionEnabled(): boolean {
 function getProxyConfigPath(): string {
   const customPath = process.env['RELAYPLANE_CONFIG_PATH'];
   if (customPath && customPath.trim()) return customPath;
-  return path.join(os.homedir(), '.relayplane', 'config.json');
+  return path.join(getRelayplaneDir(), 'config.json');
 }
 
 const COMPLEXITY_TIER_KEYS = ['simple', 'moderate', 'complex', 'elite'] as const;
@@ -6580,13 +6580,29 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
         return out;
       };
-      const enrichRun = (row: RunRow) => ({
-        ...row,
-        agent_count: runsStore.agentsForRun(row.run_id).length,
-        savings_usd: Math.max(0, row.baseline_usd - row.cost_usd),
-        retry_pct: row.cost_usd > 0 ? row.retry_cost_usd / row.cost_usd : 0,
-        band_status: row.band_status,
-      });
+      const enrichRun = (row: RunRow) => {
+        // agentsForRun is already needed for agent_count; fold the per-agent
+        // models_seen maps into a per-run model mix here so the list rows can
+        // render colored mix chips without an extra query or the detail fetch.
+        const runAgents = runsStore.agentsForRun(row.run_id);
+        const mix = new Map<string, number>();
+        for (const a of runAgents) {
+          for (const [model, n] of Object.entries(a.models_seen ?? {})) {
+            mix.set(model, (mix.get(model) ?? 0) + (Number(n) || 0));
+          }
+        }
+        const model_mix = [...mix.entries()]
+          .map(([model, count]) => ({ model, count }))
+          .sort((a, b) => b.count - a.count);
+        return {
+          ...row,
+          agent_count: runAgents.length,
+          model_mix,
+          savings_usd: Math.max(0, row.baseline_usd - row.cost_usd),
+          retry_pct: row.cost_usd > 0 ? row.retry_cost_usd / row.cost_usd : 0,
+          band_status: row.band_status,
+        };
+      };
       /** Shared by GET /v1/runs/:id and POST /v1/runs/:id/end. */
       const buildRunDetail = (id: string) => {
         const run = runsStore.getRun(id);

@@ -59,12 +59,16 @@ export async function fetchToday(days = 1) {
 
 export function useLiveToday(intervalMs = 5000, days = 1) {
   const [today, setToday] = React.useState(RP_TODAY);
+  // `loaded` distinguishes "the API answered with genuinely zero traffic"
+  // (first-run state) from "we have not heard back yet" (both look like
+  // RP_TODAY's zeroed defaults otherwise).
+  const [loaded, setLoaded] = React.useState(false);
 
   React.useEffect(() => {
     let alive = true;
     const tick = () => {
       fetchToday(days)
-        .then(d => { if (alive) setToday(d); })
+        .then(d => { if (alive) { setToday(d); setLoaded(true); } })
         .catch(() => { /* keep last */ });
     };
     tick();
@@ -72,5 +76,5 @@ export function useLiveToday(intervalMs = 5000, days = 1) {
     return () => { alive = false; clearInterval(id); };
   }, [intervalMs, days]);
 
-  return today;
+  return React.useMemo(() => ({ ...today, loaded }), [today, loaded]);
 }

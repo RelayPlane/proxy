@@ -11,6 +11,20 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 
+/**
+ * Resolve the RelayPlane home directory, honoring RELAYPLANE_HOME_OVERRIDE.
+ *
+ * This MUST be used for every on-disk path (budget.db, etc.) so that a proxy
+ * started with RELAYPLANE_HOME_OVERRIDE (tests, dogfood harnesses) is fully
+ * isolated from the live ~/.relayplane and never leaks into production data.
+ * Matches the pattern in osmosis-store.ts / run-store.ts.
+ */
+function getRelayplaneDir(): string {
+  const override = process.env['RELAYPLANE_HOME_OVERRIDE'];
+  const base = override ?? os.homedir();
+  return path.join(base, '.relayplane');
+}
+
 // ─── Model Pricing Constants ──────────────────────────────────────────
 
 /** Per-million token pricing for known Claude models (USD). */
@@ -232,7 +246,7 @@ export class BudgetManager {
     if (!this.config.enabled) return;
     this._initialized = true;
 
-    const budgetDir = path.join(os.homedir(), '.relayplane');
+    const budgetDir = getRelayplaneDir();
     fs.mkdirSync(budgetDir, { recursive: true });
 
     try {
@@ -816,7 +830,7 @@ export class BudgetTracker {
     this._initialized = true;
     if (this.dailyCapUSD === null) return; // unlimited, no persistence needed
 
-    const budgetDir = path.join(os.homedir(), '.relayplane');
+    const budgetDir = getRelayplaneDir();
     fs.mkdirSync(budgetDir, { recursive: true });
 
     try {

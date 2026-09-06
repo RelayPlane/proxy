@@ -90,7 +90,7 @@ export class AlertManager {
     if (!this.config.enabled) return;
     this._initialized = true;
 
-    const dir = path.join(os.homedir(), '.relayplane');
+    const dir = path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane');
     fs.mkdirSync(dir, { recursive: true });
 
     try {

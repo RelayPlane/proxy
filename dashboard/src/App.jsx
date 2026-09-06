@@ -4,11 +4,9 @@ import { RP_TOKEN_POOL } from './fixtures';
 import {
   useTweaks, TweaksPanel, TweakSection, TweakRadio, TweakSlider, TweakToggle,
 } from './tweaks-panel';
-import { ProviderStrip, RequestStream, TokenPool, Sessions, ByModelTable, ByAgentTable } from './panels';
+import { ProviderStrip, RequestStream, TokenPool } from './panels';
 import { useLiveToday } from './useLiveToday';
-import { useLiveBreakdown } from './useLiveBreakdown';
 import { useLiveRequests } from './useLiveRequests';
-import { useLiveSessions } from './useLiveSessions';
 import { useLiveStatus } from './useLiveStatus';
 import { useLiveSpendCurve } from './useLiveSpendCurve';
 import { useLiveProviders } from './useLiveProviders.js';
@@ -16,12 +14,15 @@ import { Guardrails } from './Guardrails';
 import { useTier } from './useTier';
 import { Runs } from './Runs';
 import { RunDetail } from './RunDetail';
+import { RunsCenterpiece } from './RunsCenterpiece';
 import { useLiveRuns } from './useLiveRuns';
 import { useRunAlerts } from './useRunAlerts';
 
-// Tabs exposed by the dashboard header. `overview`, `runs` and `config` are
-// wired; the rest render a placeholder until their data layer lands.
-const TABS = ['overview', 'runs', 'requests', 'routing', 'tokens', 'sessions', 'policies', 'audit', 'config'];
+// Tabs exposed by the dashboard header. `overview`, `runs`, `requests` and
+// `config` are wired; `routing` and `policies` render a placeholder until
+// their data layer lands. `sessions` folded into `runs`, `tokens` and
+// `audit` were never real tabs, dropped rather than left as dead links.
+const TABS = ['overview', 'runs', 'requests', 'routing', 'policies', 'config'];
 
 // Deep link contract: `#run=<id>` opens the runs tab on that run. The CLI
 // prints this URL at run start and the request stream's run chip writes it.
@@ -196,41 +197,119 @@ function RunsInFlight({ runs, onOpen }) {
   );
 }
 
+// Honest by construction: the number is small and sourced, and "show the
+// math" expands the actual per-request comparison in place rather than
+// asserting a headline percentage the reader has to take on faith. This
+// replaces the old "$12,721.61 · 94% cheaper than all-opus" hero tile,
+// which compared every call to a baseline nobody would run and contradicted
+// the $0.00 the same page showed elsewhere.
+function SavingsStat({ today }) {
+  const [showMath, setShowMath] = React.useState(false);
+  const baselineTotal = today.cost + today.savings;
+  return (
+    <HeroStat
+      eyebrow="ROUTING SAVINGS · TODAY"
+      value={today.savings.toFixed(2)}
+      unit="$"
+      accent
+      sub={`vs the same ${today.requests.toLocaleString()} calls on the fleet default model`}
+      footer={<span>{today.savingsPct.toFixed(1)}% lower · <button className="hstat__mathbtn" onClick={() => setShowMath(v => !v)}>{showMath ? 'hide the math' : 'show the math'}</button></span>}
+    >
+      {showMath && (
+        <div className="hstat__math">
+          <div>fleet default, all {today.requests.toLocaleString()} calls: <b>${baselineTotal.toFixed(2)}</b></div>
+          <div>actual routed spend: <b>${today.cost.toFixed(2)}</b></div>
+          <div>difference, priced per request at provider rates: <b>${today.savings.toFixed(2)}</b></div>
+        </div>
+      )}
+    </HeroStat>
+  );
+}
+
+// SPEND tile , the design's lead number. Green while there is headroom, amber
+// past 80% of the cap, red once the cap is crossed, with an inline progress bar
+// and the "$X of $Y remaining · Z% spent" line underneath.
+function SpendTile({ today }) {
+  const budget = Number(today.budget) || 0;
+  const spent = Number(today.cost) || 0;
+  const pct = budget > 0 ? Math.min(100, (spent / budget) * 100) : 0;
+  const over = budget > 0 && spent >= budget;
+  const tone = budget <= 0 ? 'relay' : over ? 'stop' : pct >= 80 ? 'spend' : 'relay';
+  const remaining = Math.max(0, budget - spent);
+  return (
+    <div className={'hstat hstat--tone-' + tone}>
+      <div className="hstat__hd"><span className="rp-eyebrow">SPEND · TODAY</span></div>
+      <div className="hstat__num">
+        <span className="hstat__cur">$</span>
+        <span className="hstat__val">{spent.toFixed(2)}</span>
+      </div>
+      <div className="hstat__bar"><i style={{ width: pct.toFixed(1) + '%' }} /></div>
+      <div className="hstat__footer">
+        {budget > 0
+          ? <span><b>${remaining.toFixed(2)}</b> of ${budget.toFixed(0)} remaining · {pct.toFixed(1)}% spent</span>
+          : <span>no cap set · <b>${spent.toFixed(2)}</b> today</span>}
+      </div>
+    </div>
+  );
+}
+
+// BURN RATE / PROJECTED RUNOUT , always amber: this is the "how long until the
+// cap" read, a warning even when nothing is wrong yet.
+function BurnTile({ today }) {
+  const burn = Number(today.burn) || 0;
+  const budget = Number(today.budget) || 0;
+  const remaining = Math.max(0, budget - (Number(today.cost) || 0));
+  const hoursLeft = burn > 0 ? remaining / burn : null;
+  const runout = hoursLeft == null
+    ? 'holding flat · no runout projected'
+    : budget <= 0
+      ? 'set a cap to project a runout'
+      : (() => {
+          const at = new Date(Date.now() + hoursLeft * 3600 * 1000);
+          const label = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+          return `at this rate the cap is reached ${label}`;
+        })();
+  return (
+    <div className="hstat hstat--tone-spend">
+      <div className="hstat__hd"><span className="rp-eyebrow">BURN RATE · PROJECTED RUNOUT</span></div>
+      <div className="hstat__num">
+        <span className="hstat__cur">$</span>
+        <span className="hstat__val">{burn.toFixed(2)}</span>
+        <span className="hstat__unit">/hr</span>
+      </div>
+      <div className="hstat__sub hstat__sub--strong">{runout}</div>
+      <div className="hstat__footer">estimate · last 60 min of traffic, held flat</div>
+    </div>
+  );
+}
+
+// REQUESTS tile , neutral number with the cache/avg/p95 sub-stats and a small
+// two-tone usage bar (cache-served share in green, the rest muted).
+function RequestsTile({ today }) {
+  const reqs = Number(today.requests) || 0;
+  const cachePct = Math.max(0, Math.min(100, (Number(today.cacheHitRate) || 0) * 100));
+  return (
+    <div className="hstat">
+      <div className="hstat__hd"><span className="rp-eyebrow">REQUESTS · TODAY</span></div>
+      <div className="hstat__num"><span className="hstat__val">{reqs.toLocaleString()}</span></div>
+      <div className="hstat__sub">
+        {cachePct.toFixed(1)}% cache hit · {today.latencyAvg.toFixed(1)}s avg · p95 {today.latencyP95.toFixed(1)}s
+      </div>
+      <div className="hstat__usebar" title={`${cachePct.toFixed(1)}% served from cache`}>
+        <i className="hstat__usebar-cache" style={{ flex: Math.max(0.0001, cachePct) }} />
+        <i className="hstat__usebar-rest" style={{ flex: Math.max(0.0001, 100 - cachePct) }} />
+      </div>
+    </div>
+  );
+}
+
 function HeroStats({ today, activeRuns, onOpenRuns }) {
   return (
     <section className="hero-stats" data-screen-label="hero-stats">
-      <HeroStat
-        eyebrow="REQUESTS · TODAY"
-        value={today.requests.toLocaleString()}
-        delta={today.requestsDelta}
-        deltaDir="up"
-        sub="vs yesterday"
-        footer={<span><b>{today.cacheHitRate.toFixed(1)}%</b> cache hit rate</span>}
-      />
-      <HeroStat
-        eyebrow="COST · TODAY"
-        value={today.cost.toFixed(2)}
-        unit="$"
-        delta={today.costDelta}
-        deltaDir="down"
-        sub="vs yesterday"
-        footer={<span><b>${(today.budget - today.cost).toFixed(2)}</b> of {`$${today.budget.toFixed(0)}`} plan remaining</span>}
-      />
-      <HeroStat
-        eyebrow="ROUTING SAVINGS · TODAY"
-        value={today.savings.toFixed(2)}
-        unit="$"
-        accent
-        sub={`${today.savingsPct.toFixed(0)}% cheaper than all-opus baseline`}
-        footer={<span>verified per request at provider price</span>}
-      />
-      <HeroStat
-        eyebrow="LATENCY · AVG"
-        value={today.latencyAvg.toFixed(2)}
-        unit="s"
-        sub={`p95 ${today.latencyP95.toFixed(2)}s`}
-        footer={<span>across {today.requests.toLocaleString()} requests</span>}
-      />
+      <SpendTile today={today} />
+      <BurnTile today={today} />
+      <RequestsTile today={today} />
+      <SavingsStat today={today} />
       <RunsInFlight runs={activeRuns || []} onOpen={onOpenRuns} />
     </section>
   );
@@ -384,6 +463,75 @@ function NetworkCallout({ learning }) {
 }
 
 // ============================================================================
+// First-run / empty state , the make-or-break screen. No requests yet, so
+// teach instead of showing a grid of zeros.
+// ============================================================================
+
+function FirstRun() {
+  return (
+    <section className="firstrun" data-screen-label="first-run">
+      <div className="firstrun__grid">
+        <div>
+          <span className="rp-eyebrow">FIRST RUN · NO TRAFFIC YET</span>
+          <h2 className="firstrun__head">Point one agent at the proxy. Costs start rolling up per run immediately.</h2>
+          <p className="firstrun__lead">Nothing is tracked until a request arrives, and nothing leaves this machine when it does. Two lines and the panels below fill in.</p>
+
+          <div className="firstrun__step">
+            <div className="firstrun__stephd">
+              <span>step 1 · route your agent</span>
+              <CopyButtonInline text="export ANTHROPIC_BASE_URL=http://localhost:4100" />
+            </div>
+            <div className="firstrun__stepbody">
+              <div><span className="firstrun__prompt">$</span> export ANTHROPIC_BASE_URL=<span className="firstrun__cmd">http://localhost:4100</span></div>
+              <div><span className="firstrun__prompt">$</span> export RELAYPLANE_RUN_ID=<span className="firstrun__cmd">$(uuidgen)</span> <span className="firstrun__prompt"># groups sub-agents into one run</span></div>
+            </div>
+          </div>
+
+          <div className="firstrun__step">
+            <div className="firstrun__stephd"><span>step 2 · set a cap before you sleep</span></div>
+            <div className="firstrun__stepbody">
+              <div><span className="firstrun__prompt">$</span> relayplane budget --limit 500 --on-breach deny</div>
+            </div>
+          </div>
+
+          <div className="firstrun__meta">
+            <span>0 providers configured, <a className="rp-link" href="#" onClick={(e) => e.preventDefault()}>add one</a></span>
+            <span>waiting for first request<span className="firstrun__waiting">…</span></span>
+          </div>
+        </div>
+
+        <div>
+          <div className="firstrun__previewhd">what will fill in here</div>
+          <div className="firstrun__tiles">
+            {['spend today', 'burn rate', 'requests', 'routing savings'].map(label => (
+              <div className="firstrun__tile" key={label}>
+                <div className="firstrun__tile-label">{label}</div>
+                <div className="firstrun__tile-shimmer" />
+              </div>
+            ))}
+          </div>
+          <div className="firstrun__runspreview">
+            <div className="firstrun__tile-label">runs · cost per agent run</div>
+            <div className="firstrun__runspreview-note">One row per run, the orchestrator plus every sub-agent it fanned out to, not one row per call.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CopyButtonInline({ text }) {
+  const [done, setDone] = React.useState(false);
+  const copy = () => {
+    const write = navigator.clipboard && navigator.clipboard.writeText
+      ? navigator.clipboard.writeText(text)
+      : Promise.reject(new Error('no clipboard'));
+    write.then(() => { setDone(true); setTimeout(() => setDone(false), 1400); }).catch(() => {});
+  };
+  return <button className="hstat__mathbtn" onClick={copy}>{done ? 'copied' : 'copy'}</button>;
+}
+
+// ============================================================================
 // App
 // ============================================================================
 
@@ -453,26 +601,35 @@ export function App() {
   }, []);
   const today = useLiveToday(5000, days);
   const liveReqs = useLiveRequests({ intervalMs: Math.max(1000, t.tickRate), limit: Math.max(50, t.streamCap), days });
-  const liveSessions = useLiveSessions({ intervalMs: 5000, limit: 20, days });
   const status = useLiveStatus();
   const tier = useTier();
   const { curve: spendCurve, nowHr } = useLiveSpendCurve(30000, days);
   const { providers: liveProviders } = useLiveProviders({ intervalMs: 10000, days });
-  const breakdown = useLiveBreakdown({ intervalMs: 10000, days });
   const { runs: activeRuns } = useLiveRuns({ intervalMs: 5000, active: true });
   const { alerts: runAlerts } = useRunAlerts({ intervalMs: 15000, since: '1h', limit: 50 });
 
-  // Newest critical run alert, only while it is still actionable.
+  // Newest actionable run alert: a hard cap hit (critical) or a run tracking
+  // over its expected band (the "runaway run" case the design calls out by
+  // name, e.g. 3.1x expected cost) , both are things you can still do
+  // something about inside the alert window.
   const criticalRunAlert = React.useMemo(() => {
     const cutoff = Date.now() - RUN_ALERT_MAX_AGE_MS;
     let newest = null;
     for (const a of runAlerts) {
-      if (a.severity !== 'critical') continue;
+      if (a.severity !== 'critical' && a.kind !== 'run.over_band') continue;
       if (!(Number(a.ts) > cutoff)) continue;
       if (!newest || Number(a.ts) > Number(newest.ts)) newest = a;
     }
     return newest;
   }, [runAlerts]);
+
+  // Budget exceeded: spend has crossed the cap for the selected window.
+  const isBudgetExceeded = today.budget > 0 && today.cost >= today.budget;
+
+  // First-run: the API has answered, there is genuinely no traffic yet in
+  // today's window, and no run is mid-flight. Only meaningful on the
+  // "today" window, a quiet 7d/30d view is not the onboarding moment.
+  const isFirstRun = days === 1 && today.loaded && today.requests === 0 && (activeRuns || []).length === 0;
 
   const reqs = React.useMemo(() => {
     if (paused || killArmed) return frozen ?? [];
@@ -518,55 +675,74 @@ export function App() {
         </div>
       )}
 
+      {!killArmed && isBudgetExceeded && (
+        <div className="budgetband" data-screen-label="budget-exceeded-strip">
+          <span className="budgetband__icon">■</span>
+          <b>budget exceeded.</b>
+          <span className="budgetband__msg">${today.cost.toFixed(2)} of ${today.budget.toFixed(2)}. new requests may be denied depending on the on-breach policy.</span>
+          <button className="ghostbtn budgetband__btn" onClick={() => setActiveTab('config')}>raise cap</button>
+        </div>
+      )}
+
       {criticalRunAlert && (
         <div className="runband" data-screen-label="run-alert-strip">
           <span className="runband__icon">▲</span>
           <b>{String(criticalRunAlert.kind || 'run alert').replace(/_/g, ' ')}.</b>
           <span className="runband__msg">{criticalRunAlert.message}</span>
           <code className="runband__id" title={criticalRunAlert.run_id}>{criticalRunAlert.run_id}</code>
-          <button className="ghostbtn runband__btn" onClick={() => openRun(criticalRunAlert.run_id)}>open run</button>
+          <button className="ghostbtn runband__btn" onClick={() => openRun(criticalRunAlert.run_id)}>
+            {criticalRunAlert.kind === 'run.over_band' ? 'kill this run' : 'open run'}
+          </button>
         </div>
       )}
 
       <main className="body">
         {activeTab === 'overview' ? (
-          <>
-            <HeroStats today={today} activeRuns={activeRuns} onOpenRuns={() => openRun(null)} />
+          isFirstRun ? (
+            <FirstRun />
+          ) : (
+            <>
+              <HeroStats today={today} activeRuns={activeRuns} onOpenRuns={() => openRun(null)} />
 
-            <section className="row row--full">
-              <BudgetMeter
-                today={today}
-                spendCurve={spendCurve}
-                nowHr={nowHr}
-                tickRate={t.tickRate}
-                showProjection={t.showProjection}
+              <section className="row row--full">
+                <BudgetMeter
+                  today={today}
+                  spendCurve={spendCurve}
+                  nowHr={nowHr}
+                  tickRate={t.tickRate}
+                  showProjection={t.showProjection}
+                />
+              </section>
+
+              {/* The centerpiece: one row per run, not per call, expandable
+                  in place to cost-by-agent, retries and the expected band.
+                  Cost-by-model and cost-by-agent live inside a run now,
+                  consolidated rather than stranded as separate tables. The
+                  full filterable ledger is one click away on the Runs tab. */}
+              <RunsCenterpiece
+                days={days}
+                todayCost={today.cost}
+                onOpenRuns={() => openRun(null)}
+                onOpenRun={openRun}
               />
-            </section>
 
-            <ProviderStrip providers={liveProviders} />
+              <ProviderStrip providers={liveProviders} />
 
-            <section className="row row--2-asym">
-              <RequestStream
-                rows={reqs}
-                paused={paused}
-                onTogglePause={handleTogglePause}
-                onClear={handleClear}
-                density={t.density}
-              />
               <TokenPool rows={RP_TOKEN_POOL} />
-            </section>
-
-            <section className="row row--2">
-              <ByModelTable rows={breakdown.byModel} />
-              <ByAgentTable rows={breakdown.byAgent} />
-            </section>
-
-            <Sessions sessions={liveSessions} />
-          </>
+            </>
+          )
         ) : activeTab === 'runs' ? (
           runId
             ? <RunDetail id={runId} onBack={() => openRun(null)} onOpenRun={openRun} />
             : <Runs days={days} onOpenRun={openRun} />
+        ) : activeTab === 'requests' ? (
+          <RequestStream
+            rows={reqs}
+            paused={paused}
+            onTogglePause={handleTogglePause}
+            onClear={handleClear}
+            density={t.density}
+          />
         ) : activeTab === 'config' ? (
           <Guardrails />
         ) : (

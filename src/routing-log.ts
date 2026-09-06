@@ -24,14 +24,14 @@ export interface RoutingLogEntry {
   resolvedBy: ResolvedBy;
   candidateModel: string | null; // what complexity routing would have picked
   reason: string;                // human-readable from PolicyResolution.reason
-  // Optional — populated from upstream response usage headers/body when available
+  // Optional - populated from upstream response usage headers/body when available
   inputTokens?: number;          // prompt token count from provider response
   outputTokens?: number;         // completion token count from provider response
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const LOG_DIR = path.join(os.homedir(), '.relayplane');
+const LOG_DIR = path.join(process.env['RELAYPLANE_HOME_OVERRIDE'] ?? os.homedir(), '.relayplane');
 export const LOG_FILE = path.join(LOG_DIR, 'routing-log.jsonl');
 const BAK_FILE = path.join(LOG_DIR, 'routing-log.jsonl.bak');
 const MAX_ENTRIES = 1000;
@@ -68,7 +68,7 @@ export function initRoutingLog(): void {
       }
     }
   } catch {
-    // Non-critical — start with empty buffer
+    // Non-critical - start with empty buffer
   }
 }
 
@@ -93,12 +93,12 @@ export function appendRoutingLog(entry: RoutingLogEntry): void {
         fs.renameSync(LOG_FILE, BAK_FILE);
       }
     } catch {
-      // File may not exist yet — that's fine
+      // File may not exist yet - that's fine
     }
 
     fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n', 'utf-8');
   } catch {
-    // Non-critical — don't break the proxy
+    // Non-critical - don't break the proxy
   }
 }
 
@@ -126,7 +126,7 @@ export function getRoutingLog(opts?: {
 }
 
 /**
- * No-op flush — writes are synchronous. Called for symmetry on shutdown.
+ * No-op flush - writes are synchronous. Called for symmetry on shutdown.
  */
 export function flushRoutingLog(): void {
   // No-op: all writes are synchronous appends
