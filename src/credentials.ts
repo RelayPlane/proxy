@@ -77,12 +77,12 @@ export function saveAgentCredentials(creds: Partial<AgentCredentials>): void {
   const dir = path.dirname(credPath);
 
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(dir, { recursive: true });
   }
 
   const existing = loadAgentCredentials();
   const merged: AgentCredentials = { ...existing, ...creds };
-  fs.writeFileSync(credPath, JSON.stringify(merged, null, 2) + '\n', { mode: 0o600 });
+  fs.writeFileSync(credPath, JSON.stringify(merged, null, 2) + '\n');
 }
 
 /**

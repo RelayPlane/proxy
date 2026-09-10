@@ -55,6 +55,8 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as http from 'node:http';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -66,6 +68,22 @@ const TARGET_URL = process.env.CANARY_TARGET_URL; // if set, use existing proxy
 const MANAGED = !TARGET_URL;                        // we started the proxy ourselves
 const PORT = Number.parseInt(process.env.CANARY_PORT ?? '4199', 10);
 const BASE = TARGET_URL ? TARGET_URL.replace(/\/+$/, '') : `http://127.0.0.1:${PORT}`;
+
+// ── Fixture-proxy mode ─────────────────────────────────────────────────────
+// The canary re-execs itself with CANARY_FIXTURE_MODE=1 to stand up a short-
+// lived, PRE-CONFIGURED proxy for the routing + cascade proofs. The proxy's
+// config path is frozen at module import time, and a running proxy re-saves
+// config.json from a cached copy shortly after any runtime write, so a live
+// reconfigure is clobbered. A child proxy whose config.json is pre-written
+// (with first_run_complete=true, which disables the startup auto-config) keeps
+// the routing config we set, stable, for the life of the process.
+if (process.env.CANARY_FIXTURE_MODE === '1') {
+  const fxPort = Number.parseInt(process.env.CANARY_FIXTURE_PORT ?? '0', 10);
+  const mod = await import('../dist/standalone-proxy.js');
+  await mod.startProxy({ port: fxPort, host: '127.0.0.1', verbose: false });
+  console.log('FIXTURE_READY');
+  await new Promise(() => {}); // stay alive until the parent kills us
+}
 
 // --- result accounting -------------------------------------------------------
 /** @type {Array<{name:string,status:'PASS'|'FAIL'|'SKIP',evidence:string}>} */
@@ -222,11 +240,11 @@ async function runChecks(ollamaReachable) {
 
   if (!ollamaReachable) {
     for (const n of ['real_forward', 'cost_priced', 'run_attribution', 'request_count_accuracy',
-      'per_agent', 'run_inference', 'run_label', 'per_run_cap', 'routing', 'retry_tracking',
-      'local_first', 'budget_block', 'budget_warn']) {
+      'per_agent', 'run_inference', 'run_label', 'per_run_cap', 'routing', 'complexity_routing',
+      'retry_tracking', 'local_first', 'budget_block', 'budget_warn']) {
       skip(n, `Ollama unreachable at ${OLLAMA_URL} - forward-dependent check cannot run`);
     }
-    skip('cascade_failover', 'needs multi-provider fixture');
+    skip('cascade_failover', 'Ollama unreachable - the failover fallback target is local Ollama');
     return;
   }
 
@@ -369,6 +387,206 @@ async function runChecks(ollamaReachable) {
     }
   }
 
+  // ── MANAGED-only fixtures (routing + cascade) ────────────────────────────
+  //    Proven against short-lived, PRE-CONFIGURED child proxies (see the
+  //    CANARY_FIXTURE_MODE block near the top for why a child proxy, not a
+  //    live reconfigure). Uses only free local Ollama, plus a local always-429
+  //    stub as the cascade primary.
+  const SMALL = 'qwen2.5:0.5b';
+  const BIG = 'qwen2.5:1.5b';
+  const bigPulled = ollamaReachable && await (async () => {
+    try {
+      const res = await fetch(`${OLLAMA_URL}/api/tags`);
+      const data = await res.json();
+      return (data?.models ?? []).some((m) => m.name === BIG || m.name.startsWith(`${BIG}`));
+    } catch { return false; }
+  })();
+  const pickPort = () => 40000 + Math.floor(Math.random() * 20000);
+  async function spawnFixtureProxy(configObj, extraEnv = {}) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rp-canary-fx-'));
+    fs.mkdirSync(path.join(home, '.relayplane'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.relayplane', 'config.json'), JSON.stringify(configObj, null, 2));
+    const port = pickPort();
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: {
+        ...process.env,
+        CANARY_FIXTURE_MODE: '1',
+        CANARY_FIXTURE_PORT: String(port),
+        RELAYPLANE_HOME_OVERRIDE: home,
+        RELAYPLANE_NO_UPDATE_CHECK: '1',
+        ...extraEnv,
+      },
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    const base = `http://127.0.0.1:${port}`;
+    const healthy = await pollUntil(async () => {
+      try { const r = await fetch(`${base}/health`); return r.ok ? true : null; } catch { return null; }
+    }, { timeoutMs: 20000, intervalMs: 300 });
+    return { child, base, home, healthy: !!healthy };
+  }
+  function killFixture(fx) {
+    try { fx.child.kill('SIGKILL'); } catch { /* ignore */ }
+    try { if (fx.home && fx.home.startsWith(os.tmpdir())) fs.rmSync(fx.home, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+  async function fxForward(base, model, messages) {
+    const nonce = `${Date.now()}-${_callSeq++}-${Math.floor(Math.random() * 1e6)}`;
+    const src = messages ?? [{ role: 'user', content: 'Say the single word: ping.' }];
+    const msgs = src.map((m, i, arr) =>
+      i === arr.length - 1 && typeof m.content === 'string' ? { ...m, content: `${m.content} [nonce ${nonce}]` } : m);
+    const r = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages: msgs, max_tokens: 16 }),
+    });
+    const headers = {};
+    for (const [k, v] of r.headers.entries()) headers[k.toLowerCase()] = v;
+    return { status: r.status, headers };
+  }
+  const baseFixtureConfig = () => ({
+    device_id: 'anon_canary_fixture',
+    telemetry_enabled: false,
+    lifecycle_enabled: false,
+    first_run_complete: true,   // disables startup auto-config so our routing sticks
+    config_version: 4,
+    ollama: { enabled: true, baseUrl: OLLAMA_URL, models: [SMALL, BIG] },
+  });
+
+  // 12b. complexity_routing - "simple work to cheap models, hard work to premium".
+  //      Map the complexity tiers to two DIFFERENT local Ollama models
+  //      (simple -> qwen2.5:0.5b, complex -> qwen2.5:1.5b). A trivial prompt and
+  //      a clearly-hard prompt must classify differently AND resolve to the
+  //      cheap vs premium model, provably, for free.
+  if (MANAGED) {
+    const complexModel = bigPulled ? BIG : SMALL; // fall back to one model if BIG absent
+    const cfg = {
+      ...baseFixtureConfig(),
+      routing: {
+        mode: 'complexity',
+        cascade: { enabled: false, models: [], escalateOn: 'error', maxEscalations: 1 },
+        complexity: {
+          enabled: true,
+          simple: `ollama/${SMALL}`,
+          moderate: `ollama/${complexModel}`,
+          complex: `ollama/${complexModel}`,
+          elite: `ollama/${complexModel}`,
+        },
+      },
+    };
+    const fx = await spawnFixtureProxy(cfg);
+    if (!fx.healthy) {
+      fail('complexity_routing', 'fixture proxy did not become healthy on /health');
+      killFixture(fx);
+    } else {
+      const simplePrompt = [{ role: 'user', content: 'Say the single word: ping.' }];
+      const complexPrompt = [{ role: 'user', content:
+        'Analyze and compare three distributed microservice architectures, then design ' +
+        'and implement an optimized migration strategy with a detailed step 1, step 2 ' +
+        'and step 3, evaluating scalability and failure modes at each phase.' }];
+      const simpleRes = await pollUntil(async () => {
+        const x = await fxForward(fx.base, 'relayplane:auto', simplePrompt);
+        return x.status === 200 && String(x.headers['x-relayplane-provider'] ?? '').includes('ollama') ? x : null;
+      }, { timeoutMs: 30000, intervalMs: 500 });
+      const complexRes = await pollUntil(async () => {
+        const x = await fxForward(fx.base, 'relayplane:auto', complexPrompt);
+        return x.status === 200 && String(x.headers['x-relayplane-provider'] ?? '').includes('ollama') ? x : null;
+      }, { timeoutMs: 30000, intervalMs: 500 });
+      const sCplx = simpleRes?.headers['x-relayplane-complexity'];
+      const cCplx = complexRes?.headers['x-relayplane-complexity'];
+      const sModel = simpleRes?.headers['x-relayplane-routed-model'];
+      const cModel = complexRes?.headers['x-relayplane-routed-model'];
+      if (!(simpleRes?.status === 200 && complexRes?.status === 200)) {
+        fail('complexity_routing',
+          `could not get two routed 200s from Ollama: simple=${simpleRes?.status ?? 'n/a'} complex=${complexRes?.status ?? 'n/a'}`);
+      } else if (bigPulled && sCplx === 'simple' && cCplx !== 'simple' &&
+                 String(sModel).includes(SMALL) && String(cModel).includes(BIG) && sModel !== cModel) {
+        pass('complexity_routing',
+          `simple prompt -> complexity=${sCplx} routed=${sModel}; complex prompt -> complexity=${cCplx} routed=${cModel} ` +
+          `(proxy classified complexity and picked the cheap vs premium tier per config; both 200 from local Ollama)`);
+      } else if (sCplx === 'simple' && cCplx !== 'simple' && String(sModel).length > 0 && String(cModel).length > 0) {
+        pass('complexity_routing',
+          `simple -> complexity=${sCplx} routed=${sModel}; complex -> complexity=${cCplx} routed=${cModel}; ` +
+          `classification + per-map selection proven. NOT proven: a distinct physical model per tier ` +
+          `(second local model ${BIG} unavailable, both tiers mapped to ${SMALL})`);
+      } else {
+        fail('complexity_routing',
+          `classification/selection did not diverge: simple->complexity=${sCplx} routed=${sModel}, ` +
+          `complex->complexity=${cCplx} routed=${cModel}`);
+      }
+      killFixture(fx);
+    }
+  } else {
+    skip('complexity_routing', 'target-url mode: cannot stand up a reconfigured fixture proxy against a live instance');
+  }
+
+  // cascade_failover - "a 429 on one provider fails over instead of failing your run".
+  //   Deterministic local fixture: point the openrouter provider baseURL at a
+  //   local stub that ALWAYS returns 429, put it FIRST in the cascade and local
+  //   Ollama SECOND. cooldowns are OFF so the primary is actually attempted on
+  //   the asserted request; escalateOn:'error' makes a provider error escalate
+  //   to the next model. Assert (a) the 429 primary was hit, (b) the run still
+  //   returns 200, (c) from the Ollama fallback, with routing-mode=cascade.
+  if (MANAGED) {
+    let mockHits = 0;
+    const mock429 = http.createServer((req, res) => {
+      mockHits++;
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'rate_limit_error', message: 'mock 429 (always)' } }));
+    });
+    await new Promise((r) => mock429.listen(0, '127.0.0.1', r));
+    const mockPort = mock429.address().port;
+    const cfg = {
+      ...baseFixtureConfig(),
+      ollama: { enabled: true, baseUrl: OLLAMA_URL, models: [SMALL] },
+      reliability: { cooldowns: { enabled: false } },
+      routing: {
+        mode: 'cascade',
+        cascade: {
+          enabled: true,
+          models: ['openrouter/mock-primary-model', `ollama/${SMALL}`],
+          escalateOn: 'error',
+          maxEscalations: 2,
+        },
+        complexity: { enabled: false },
+      },
+    };
+    // The child proxy reads these at forward time: openrouter -> our always-429
+    // stub, plus a key so the primary is actually forwarded (not short-circuited).
+    const fx = await spawnFixtureProxy(cfg, {
+      RELAYPLANE_OPENROUTER_BASE_URL: `http://127.0.0.1:${mockPort}`,
+      OPENROUTER_API_KEY: 'sk-mock-cascade-primary',
+    });
+    if (!fx.healthy) {
+      fail('cascade_failover', 'fixture proxy did not become healthy on /health');
+    } else {
+      // Warm up until cascade mode is confirmed live, then assert one request.
+      await pollUntil(async () => {
+        const x = await fxForward(fx.base, 'relayplane:auto');
+        return x.status === 200 && x.headers['x-relayplane-routing-mode'] === 'cascade' ? x : null;
+      }, { timeoutMs: 30000, intervalMs: 500 });
+      mockHits = 0;
+      const cr = await fxForward(fx.base, 'relayplane:auto');
+      const crProvider = cr.headers['x-relayplane-provider'];
+      const crMode = cr.headers['x-relayplane-routing-mode'];
+      const crModel = cr.headers['x-relayplane-routed-model'];
+      if (cr.status === 200 && mockHits >= 1 && String(crProvider).includes('ollama') && crMode === 'cascade') {
+        pass('cascade_failover',
+          `primary openrouter endpoint returned 429 (${mockHits} attempt(s) this request); run recovered with 200 ` +
+          `from provider=${crProvider} routed=${crModel} routing-mode=${crMode} (failover, not a failed run)`);
+      } else {
+        fail('cascade_failover',
+          `expected 429-primary -> 200 Ollama fallback: status=${cr.status} primaryHits=${mockHits} ` +
+          `provider=${crProvider} routing-mode=${crMode} routed=${crModel}`);
+      }
+    }
+    killFixture(fx);
+    await new Promise((r) => mock429.close(() => r()));
+  } else {
+    skip('cascade_failover',
+      'target-url mode: proving 429 failover needs a controlled always-429 primary + local fallback in a ' +
+      'purpose-built config (cascade models=[openrouter/x, ollama/qwen2.5:0.5b], escalateOn:error, cooldowns off, ' +
+      'RELAYPLANE_OPENROUTER_BASE_URL -> local 429 stub); not constructable against a live external proxy.');
+  }
+
   // 14. local_first - forwards work with NO account / NO Authorization header.
   //     We cannot fully prove zero-exfil from here, so we assert the honest,
   //     verifiable claim: the proxy forwards for free with no login/account.
@@ -426,8 +644,6 @@ async function runChecks(ollamaReachable) {
     }
   }
 
-  // cascade / circuit-breaker across providers - not deterministic here.
-  skip('cascade_failover', 'needs multi-provider fixture (deterministic provider-429 failover not constructable with a single local backend)');
 }
 
 // --- main --------------------------------------------------------------------

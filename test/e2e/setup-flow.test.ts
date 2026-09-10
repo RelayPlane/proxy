@@ -120,7 +120,7 @@ describe('relayplane init (setup flow)', () => {
     expect(res.stderr).not.toContain('required');
   });
 
-  it('is idempotent — second init does not crash or corrupt config', () => {
+  it('is idempotent, second init does not crash or corrupt config', () => {
     runCli(['init']);
     const res = runCli(['init']);
     expect(res.status).toBe(0);
@@ -186,7 +186,7 @@ describe('relayplane start (crash-free)', () => {
           ...process.env,
           HOME: testHome,
           // Provide a fake key so the proxy starts (it will fail on actual API calls,
-          // but that happens only when requests come in — startup must be clean)
+          // but that happens only when requests come in, startup must be clean)
           OPENROUTER_API_KEY: 'sk-or-test-fake-key-e2e',
           ANTHROPIC_API_KEY: '',
           OPENAI_API_KEY: '',
@@ -197,6 +197,12 @@ describe('relayplane start (crash-free)', () => {
       let finished = false;
 
       proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      proc.on('error', (err) => {
+        if (finished) return;
+        finished = true;
+        reject(err);
+      });
 
       proc.on('exit', (code, signal) => {
         if (finished) return;
@@ -216,7 +222,7 @@ describe('relayplane start (crash-free)', () => {
           stderr.includes('better_sqlite3.node') ||
           stderr.includes('EADDRINUSE');
         if (isEnvIssue) {
-          // Treat as skip — native modules need `npm rebuild better-sqlite3` in CI
+          // Treat as skip: native modules need `npm rebuild better-sqlite3` in CI
           resolve();
           return;
         }
@@ -235,7 +241,7 @@ describe('relayplane start (crash-free)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Service file User= field — Sunil bug regression (unit, no sudo needed)
+// 5. Service file User= field, Sunil bug regression (unit, no sudo needed)
 //
 // Bug: v1.8.26 hardcoded User=root in the generated systemd service file.
 //      Fixed in v1.8.29 by reading SUDO_USER env var.
@@ -348,7 +354,7 @@ describe('Service install: User= field (Sunil bug regression)', () => {
     try {
       require('child_process').execSync('which systemctl', { stdio: 'ignore' });
     } catch {
-      // systemd not present in this environment — skip
+      // systemd not present in this environment, skip
       return;
     }
 
@@ -359,7 +365,7 @@ describe('Service install: User= field (Sunil bug regression)', () => {
     expect(res.status).toBe(0);
 
     if (res.stdout.includes('DRY RUN')) {
-      // Full dry-run output was produced — assert correctness
+      // Full dry-run output was produced, assert correctness
       expect(res.stdout).toContain('User=sunil');
       expect(res.stdout).not.toContain('User=root');
       expect(res.stdout).toContain('EnvironmentFile=-/home/sunil/');

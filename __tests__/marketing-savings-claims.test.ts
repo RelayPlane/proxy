@@ -1,16 +1,19 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { extname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const repositoryRoot = join(__dirname, '..', '..', '..');
-const marketingSiteApp = join(repositoryRoot, 'apps', 'marketing-site', 'src', 'app');
-const marketingSiteSrc = join(repositoryRoot, 'apps', 'marketing-site', 'src');
+const marketingSiteRoot = join(repositoryRoot, 'apps', 'marketing-site');
+const marketingSiteApp = join(marketingSiteRoot, 'src', 'app');
+const marketingSiteSrc = join(marketingSiteRoot, 'src');
 
 // The live site contradicted itself: title claimed 90% savings, og claimed
 // 40-60%, and the internal record (notes/relayplane-true-story-2026-09-02.md
 // section 5) flags 73%/77% as fabricated. None of these unverifiable
-// percentage-savings figures may appear anywhere on the marketing site.
-const BANNED_SAVINGS_CLAIMS = [/90%/, /77%/, /73%/, /40-60%/, /40-70%/];
+// percentage-savings figures may appear anywhere on the marketing site, not
+// just on the homepage: guides, compare pages, integrations, and docs pages
+// repeat the same fabricated numbers.
+const BANNED_SAVINGS_CLAIMS = [/90%/, /77%/, /73%/, /40-60%/, /40-70%/, /60-90%/];
 
 // Verifiable proof points from notes/relayplane-true-story-2026-09-02.md
 // section 3, safe to use in place of unverifiable percentages.
@@ -23,6 +26,28 @@ const VERIFIABLE_PROOF_POINTS = [
 ];
 
 const LEDGER_LANGUAGE = /ledger|meter(s|ing)?/i;
+
+const SCAN_EXTENSIONS = new Set(['.tsx', '.ts', '.html', '.mdx']);
+
+function walk(dir: string): string[] {
+  const entries = readdirSync(dir);
+  const files: string[] = [];
+
+  for (const entry of entries) {
+    if (entry === 'node_modules' || entry === '.next' || entry === '.turbo') continue;
+
+    const fullPath = join(dir, entry);
+    const stat = statSync(fullPath);
+
+    if (stat.isDirectory()) {
+      files.push(...walk(fullPath));
+    } else if (SCAN_EXTENSIONS.has(extname(entry))) {
+      files.push(fullPath);
+    }
+  }
+
+  return files;
+}
 
 function readMarketingFiles(relativePaths: string[]): string {
   return relativePaths
@@ -46,15 +71,22 @@ describe('marketing site savings claims converge on record-true proof', () => {
     expect(VERIFIABLE_PROOF_POINTS.some((pattern) => pattern.test(layout))).toBe(true);
   });
 
-  it('docs pages have no unverifiable savings percentages', () => {
-    const docs = readMarketingFiles([
-      join('docs', 'cost-optimization', 'page.tsx'),
-      join('docs', 'cost-optimization', 'savings', 'page.tsx'),
-    ]);
+  it('no page, guide, compare, integration, blog, or static asset anywhere on the marketing site contains an unverifiable savings percentage', () => {
+    const files = [...walk(join(marketingSiteRoot, 'src')), ...walk(join(marketingSiteRoot, 'public'))];
 
-    for (const bannedClaim of BANNED_SAVINGS_CLAIMS) {
-      expect(docs).not.toMatch(bannedClaim);
+    const offenders: { file: string; claim: string }[] = [];
+
+    for (const file of files) {
+      const contents = readFileSync(file, 'utf8');
+
+      for (const bannedClaim of BANNED_SAVINGS_CLAIMS) {
+        if (bannedClaim.test(contents)) {
+          offenders.push({ file, claim: bannedClaim.source });
+        }
+      }
     }
+
+    expect(offenders).toEqual([]);
   });
 });
 

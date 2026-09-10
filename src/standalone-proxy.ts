@@ -8872,6 +8872,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     }
 
     // ── Budget check + auto-downgrade (chat/completions) ──
+    // Warn/downgrade headers computed here must ride along on the 200 response,
+    // symmetric with the native /v1/messages path (which surfaces them via
+    // budgetExtraHeaders). Capture them so the streaming/non-streaming/cascade
+    // response writers below can attach them.
+    const chatBudgetExtraHeaders: Record<string, string> = {};
     {
       const chatProjectedCost = projectedRequestCost(targetModel, promptText);
       const chatBudgetCheck = preRequestBudgetCheck(targetModel, undefined, chatProjectedCost);
@@ -8890,6 +8895,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         targetModel = chatBudgetCheck.model;
         request.model = targetModel;
       }
+      Object.assign(chatBudgetExtraHeaders, chatBudgetCheck.headers);
     }
     // ── End budget check ──
 
@@ -8969,6 +8975,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         chatExplicitAgentId,
         chatSessionId,
         chatSessionSource,
+        chatBudgetExtraHeaders,
       );
     } else {
       if (useCascade && cascadeConfig) {
@@ -9099,7 +9106,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const chatCascadeRpHeaders = buildRelayPlaneResponseHeaders(
             cascadeResult.model, originalRequestedModel ?? 'unknown', complexity, cascadeResult.provider, 'cascade'
           );
-          res.writeHead(200, { 'Content-Type': 'application/json', 'X-Relay-Trace-Id': chatTraceId, 'X-Relay-Memory-Hits': String(countAtomsForSession(chatSessionId)), ...chatCascadeRpHeaders });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'X-Relay-Trace-Id': chatTraceId, 'X-Relay-Memory-Hits': String(countAtomsForSession(chatSessionId)), ...chatCascadeRpHeaders, ...chatBudgetExtraHeaders });
           res.end(JSON.stringify(responseData));
         } catch (err) {
           const durationMs = Date.now() - startTime;
@@ -9161,6 +9168,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           chatSessionId,
           chatSessionSource,
           chatTraceId,
+          chatBudgetExtraHeaders,
         );
       }
     }
@@ -9385,6 +9393,8 @@ async function handleStreamingRequest(
   agentId?: string,
   sessionId?: string,
   sessionSource?: 'claude-code' | 'synthetic',
+  /** Budget warn/downgrade headers to surface on the 200 response (symmetric with /v1/messages). */
+  budgetHeaders?: Record<string, string>,
 ): Promise<void> {
   let providerResponse: Response;
 
@@ -9427,6 +9437,7 @@ async function handleStreamingRequest(
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
           ...relayHeaders,
+          ...(budgetHeaders ?? {}),
         });
         for await (const chunk of ollamaStream.stream) {
           res.write(chunk);
@@ -9486,6 +9497,7 @@ async function handleStreamingRequest(
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     ...streamRpHeaders,
+    ...(budgetHeaders ?? {}),
   });
 
   // Track token usage from streaming events (including Anthropic prompt cache tokens)
@@ -9671,6 +9683,11 @@ async function handleStreamingRequest(
   // ── Post-request: budget spend + anomaly detection ──
   try {
     getBudgetManager().recordSpend(streamCost, targetModel);
+    // Mirror spend into the dailyCapUSD tracker so its warn band is reachable
+    // for /v1/chat/completions traffic too (symmetric with the native
+    // /v1/messages postRequestRecord path). Without this the warn header at
+    // preRequestBudgetCheck can never fire for chat requests.
+    getBudgetTracker().record(streamCost, targetModel);
     const anomalyResult = getAnomalyDetector().recordAndAnalyze({ model: targetModel, tokensIn: streamTokensIn, tokensOut: streamTokensOut, costUsd: streamCost });
     if (anomalyResult.detected) {
       for (const anomaly of anomalyResult.anomalies) {
@@ -9731,6 +9748,8 @@ async function handleNonStreamingRequest(
   sessionSource?: 'claude-code' | 'synthetic',
   /** CAP 3: trace ID for deterministic trace write */
   traceId?: string,
+  /** Budget warn/downgrade headers to surface on the 200 response (symmetric with /v1/messages). */
+  budgetHeaders?: Record<string, string>,
 ): Promise<void> {
   let responseData: Record<string, unknown>;
 
@@ -9885,6 +9904,9 @@ async function handleNonStreamingRequest(
   // ── Post-request: budget spend + anomaly detection ──
   try {
     getBudgetManager().recordSpend(cost, targetModel);
+    // Mirror spend into the dailyCapUSD tracker (symmetric with the native
+    // /v1/messages postRequestRecord path) so the warn band is reachable here.
+    getBudgetTracker().record(cost, targetModel);
     const anomalyResult = getAnomalyDetector().recordAndAnalyze({ model: targetModel, tokensIn, tokensOut, costUsd: cost });
     if (anomalyResult.detected) {
       for (const anomaly of anomalyResult.anomalies) {
@@ -9949,7 +9971,7 @@ async function handleNonStreamingRequest(
   const nonStreamRpHeaders = buildRelayPlaneResponseHeaders(
     targetModel, request.model ?? 'unknown', complexity, targetProvider, routingMode
   );
-  res.writeHead(200, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': chatCacheHeaderVal, ...nonStreamRpHeaders });
+  res.writeHead(200, { 'Content-Type': 'application/json', 'X-RelayPlane-Cache': chatCacheHeaderVal, ...nonStreamRpHeaders, ...(budgetHeaders ?? {}) });
   res.end(JSON.stringify(responseData));
 }
 

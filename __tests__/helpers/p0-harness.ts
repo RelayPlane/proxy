@@ -334,7 +334,7 @@ export function makeHome(config?: Record<string, unknown>): { home: string; conf
 /** Scrubbed env: no provider keys leak in from the developer's shell. */
 export function cleanEnv(home: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, CI: '1' };
-  for (const k of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY', 'DEEPSEEK_API_KEY', 'GROQ_API_KEY', 'RELAYPLANE_CONFIG_PATH', 'RELAYPLANE_HOME_OVERRIDE', 'RELAYPLANE_DAILY_CAP_USD', 'RELAYPLANE_PORT', 'RELAYPLANE_PROXY_PORT']) {
+  for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENROUTER_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY', 'DEEPSEEK_API_KEY', 'GROQ_API_KEY', 'RELAYPLANE_CONFIG_PATH', 'RELAYPLANE_HOME_OVERRIDE', 'RELAYPLANE_DAILY_CAP_USD', 'RELAYPLANE_PORT', 'RELAYPLANE_PROXY_PORT']) {
     delete env[k];
   }
   return { ...env, ...extra };

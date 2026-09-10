@@ -697,8 +697,12 @@ class SqliteRunBackend implements RunBackend {
   }
 
   transaction<T>(fn: () => T): T {
-    const wrapped = this.db.transaction(fn);
-    return wrapped();
+    // `.immediate()` acquires the write lock at BEGIN (before the read inside
+    // `fn` runs), so a concurrent connection's read-modify-write on the same
+    // row can't interleave with this one's. Combined with `busy_timeout` in
+    // `initSqlite`, a connection that loses the race waits for the lock
+    // instead of throwing SQLITE_BUSY.
+    return this.db.transaction(fn).immediate();
   }
 
   getRun(runId: string): RunRow | null {
@@ -1056,6 +1060,11 @@ function initSqlite(): SqliteDatabase | null {
     fs.mkdirSync(dir, { recursive: true });
     const db = new Database(path.join(dir, 'runs.db'));
     db.pragma('journal_mode = WAL');
+    // Without this, a connection that can't immediately grab the write lock
+    // throws SQLITE_BUSY right away instead of waiting for the holder to
+    // commit, which is what let a second connection's upsertRequest fail
+    // (or silently drop) under real cross-process contention.
+    db.pragma('busy_timeout = 5000');
     db.exec(RUNS_SCHEMA_SQL);
     // Additive column migrations for pre-existing DBs; errors mean the column is there.
     for (const sql of COLUMN_MIGRATIONS) {
