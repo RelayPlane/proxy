@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.github
+__tests__
+coverage
+*.tsbuildinfo
+.env*
+.claude
+foundation
+CLAUDE.md
+.foundation-*
+vitest.config.ts
