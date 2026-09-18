@@ -3115,6 +3115,7 @@ function _buildPolicyFromSuggestions(
       fingerprint: a.fingerprint,
       preferred: s.suggestedModel,
     };
+    if (s.downgradeTo) entry.downgradeTo = s.downgradeTo;
     if (s.escalateTo) entry.escalateTo = s.escalateTo;
     if (s.escalateOn) entry.escalateOn = s.escalateOn;
     if (s.neverDowngrade) entry.neverDowngrade = true;
@@ -3142,6 +3143,7 @@ function _buildPolicyYaml(analyses: AgentAnalysis[], suggestions: PolicySuggesti
       fingerprint: a.fingerprint,
       preferred: s.suggestedModel,
     };
+    if (s.downgradeTo) entry['downgradeTo'] = s.downgradeTo;
     if (s.escalateTo) entry['escalateTo'] = s.escalateTo;
     if (s.escalateOn) entry['escalateOn'] = s.escalateOn;
     if (s.neverDowngrade) entry['neverDowngrade'] = true;

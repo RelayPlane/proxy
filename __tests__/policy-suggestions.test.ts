@@ -11,6 +11,7 @@ vi.mock('../src/config.js', () => ({
 }));
 
 import { detectAvailableProviders, suggestPolicies } from '../src/policy-suggestions.js';
+import { resolvePolicy, type AgentPolicy, type RoutingPolicy } from '../src/agent-policy.js';
 import type { AgentAnalysis } from '../src/policy-analyzer.js';
 
 function makeAnalysis(overrides: Partial<AgentAnalysis> = {}): AgentAnalysis {
@@ -90,8 +91,8 @@ describe('detectAvailableProviders', () => {
 
 // ─── suggestPolicies / suggestForAgent rules ───────────────────────────────────
 
-describe('suggestPolicies — Rule 1: Long-context (AC-10)', () => {
-  it('avgTotalTokens > 50_000 → opus + neverDowngrade', () => {
+describe('suggestPolicies: Rule 1: Long-context (AC-10)', () => {
+  it('avgTotalTokens > 50_000 retains a full-context model without an accuracy lock', () => {
     const analysis = makeAnalysis({
       avgTotalTokens: 80_000,
       avgInputTokens: 64_000,
@@ -100,11 +101,12 @@ describe('suggestPolicies — Rule 1: Long-context (AC-10)', () => {
     });
     const [result] = suggestPolicies([analysis], ['anthropic']);
     expect(result!.suggestedModel).toContain('opus');
-    expect(result!.neverDowngrade).toBe(true);
+    expect(result!.neverDowngrade).toBe(false);
+    expect(result!.downgradeTo).toBeUndefined();
   });
 });
 
-describe('suggestPolicies — Rule 2: Security/review', () => {
+describe('suggestPolicies: Rule 2: Security/review', () => {
   it('review+security >= 0.8 → opus, neverDowngrade', () => {
     const analysis = makeAnalysis({
       taskDistribution: { review: 0.5, security: 0.35, code: 0.15 },
@@ -117,7 +119,7 @@ describe('suggestPolicies — Rule 2: Security/review', () => {
   });
 });
 
-describe('suggestPolicies — Rule 3: Code-heavy (AC-11)', () => {
+describe('suggestPolicies: Rule 3: Code-heavy (AC-11)', () => {
   it('code >= 0.8 → sonnet + escalateTo opus', () => {
     const analysis = makeAnalysis({
       taskDistribution: { code: 0.9 },
@@ -132,7 +134,7 @@ describe('suggestPolicies — Rule 3: Code-heavy (AC-11)', () => {
   });
 });
 
-describe('suggestPolicies — Rule 4: Summarization', () => {
+describe('suggestPolicies: Rule 4: Summarization', () => {
   it('summarization >= 0.8 → gemini-flash when google available', () => {
     const analysis = makeAnalysis({
       taskDistribution: { summarization: 0.9 },
@@ -145,7 +147,7 @@ describe('suggestPolicies — Rule 4: Summarization', () => {
   });
 });
 
-describe('suggestPolicies — Rule 5: Simple/utility', () => {
+describe('suggestPolicies: Rule 5: Simple/utility', () => {
   it('simple+utility >= 0.8 AND avgTotalTokens < 5_000 + groq → groq/llama', () => {
     const analysis = makeAnalysis({
       taskDistribution: { simple: 0.9 },
@@ -173,7 +175,7 @@ describe('suggestPolicies — Rule 5: Simple/utility', () => {
   });
 });
 
-describe('suggestPolicies — Default rule', () => {
+describe('suggestPolicies: Default rule', () => {
   it('no dominant pattern + anthropic → sonnet', () => {
     const analysis = makeAnalysis({
       taskDistribution: { code: 0.4, analysis: 0.3, summary: 0.3 },
@@ -185,12 +187,12 @@ describe('suggestPolicies — Default rule', () => {
   });
 });
 
-describe('suggestPolicies — noSuggestion cases', () => {
+describe('suggestPolicies: noSuggestion cases', () => {
   it('returns noSuggestion=true when already on recommended model (AC-12)', () => {
     const analysis = makeAnalysis({
-      taskDistribution: { code: 0.9 },
-      dominantTask: 'code',
-      currentModel: 'anthropic/claude-sonnet-4-5',
+      taskDistribution: { simple: 1 },
+      dominantTask: 'simple',
+      currentModel: 'anthropic/claude-haiku-4-5',
     });
     const [result] = suggestPolicies([analysis], ['anthropic']);
     expect(result!.noSuggestion).toBe(true);
@@ -209,7 +211,7 @@ describe('suggestPolicies — noSuggestion cases', () => {
   });
 });
 
-describe('suggestPolicies — savings', () => {
+describe('suggestPolicies: savings', () => {
   it('estimatedMonthlySavings is always non-negative (AC-14)', () => {
     const analyses = [
       makeAnalysis({ taskDistribution: { code: 0.9 }, currentModel: 'anthropic/claude-opus-4-5' }),
@@ -238,5 +240,70 @@ describe('suggestPolicies — savings', () => {
     const [result] = suggestPolicies([analysis], ['anthropic']);
     // sonnet is cheaper than opus, so savings should be positive
     expect(result!.estimatedMonthlySavings).toBeGreaterThan(0);
+  });
+});
+
+
+describe('suggestPolicies complexity downgrades', () => {
+  it('routes a simple code request from the preferred sonnet tier down to haiku', () => {
+    const [suggestion] = suggestPolicies([makeAnalysis({
+      currentModel: 'anthropic/claude-sonnet-4-5',
+    })], ['anthropic']);
+    expect(suggestion!.downgradeTo).toBe('anthropic/claude-haiku-4-5');
+    expect(suggestion!.noSuggestion).toBeUndefined();
+    const policy: RoutingPolicy = { version: 1, agents: { coder: {
+      preferred: suggestion!.suggestedModel,
+      downgradeTo: suggestion!.downgradeTo,
+      escalateTo: suggestion!.escalateTo,
+      escalateOn: suggestion!.escalateOn,
+      neverDowngrade: suggestion!.neverDowngrade,
+    } } };
+    const resolve = (complexity: 'simple' | 'moderate' | 'complex') =>
+      resolvePolicy(policy, undefined, 'coder', 'code', complexity, 'anthropic/claude-opus-4-5');
+    expect(resolve('simple').model).toBe('anthropic/claude-haiku-4-5');
+    expect(resolve('moderate').model).toBe('anthropic/claude-sonnet-4-5');
+    expect(resolve('complex').model).toBe('anthropic/claude-opus-4-5');
+    expect(resolve('simple').model).toBe('anthropic/claude-haiku-4-5');
+  });
+
+  it.each([1200, 80_000])('never offers a downgrade for security-heavy traffic at %i tokens', (avgTotalTokens) => {
+    const [suggestion] = suggestPolicies([makeAnalysis({
+      taskDistribution: { security: 0.7, review: 0.2, simple: 0.1 },
+      avgTotalTokens,
+    })], ['anthropic']);
+    expect(suggestion!.neverDowngrade).toBe(true);
+    expect(suggestion!.downgradeTo).toBeUndefined();
+    const rule: AgentPolicy = {
+      preferred: suggestion!.suggestedModel,
+      neverDowngrade: suggestion!.neverDowngrade,
+      // Even a manually configured downgrade must not defeat the accuracy lock.
+      downgradeTo: 'anthropic/claude-haiku-4-5',
+    };
+    const policies: RoutingPolicy[] = [
+      { version: 1, agents: { reviewer: rule } },
+      { version: 1, tasks: { security: rule } },
+      { version: 1, agents: { reviewer: { preferred: rule.preferred, tasks: { security: rule } } } },
+    ];
+    for (const policy of policies) {
+      const result = resolvePolicy(policy, undefined, 'reviewer', 'security', 'simple', rule.downgradeTo!);
+      expect(result.model).toBe(suggestion!.suggestedModel);
+      expect(result.neverDowngrade).toBe(true);
+    }
+  });
+
+  it('does not offer an unavailable or more expensive downgrade', () => {
+    const [unavailable] = suggestPolicies([makeAnalysis()], []);
+    expect(unavailable!.downgradeTo).toBeUndefined();
+    const [cheap] = suggestPolicies([makeAnalysis({ taskDistribution: { simple: 1 } })], ['groq', 'anthropic']);
+    expect(cheap!.suggestedModel).toBe('groq/llama-3.1-8b-instant');
+    expect(cheap!.downgradeTo).toBeUndefined();
+  });
+
+  it.each(['task', 'agent_task'])('applies a simple downgrade through a %s rule', (scope) => {
+    const rule = { preferred: 'anthropic/claude-sonnet-4-5', downgradeTo: 'anthropic/claude-haiku-4-5' };
+    const policy: RoutingPolicy = scope === 'task'
+      ? { version: 1, tasks: { code: rule } }
+      : { version: 1, agents: { coder: { preferred: rule.preferred, tasks: { code: rule } } } };
+    expect(resolvePolicy(policy, undefined, 'coder', 'code', 'simple', rule.preferred).model).toBe(rule.downgradeTo);
   });
 });

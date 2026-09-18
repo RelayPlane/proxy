@@ -6460,6 +6460,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const s = suggestions[i]!;
           if (s.noSuggestion) continue;
           const entry: Record<string, unknown> = { fingerprint: a.fingerprint, preferred: s.suggestedModel };
+          if (s.downgradeTo) entry['downgradeTo'] = s.downgradeTo;
           if (s.escalateTo) entry['escalateTo'] = s.escalateTo;
           if (s.escalateOn) entry['escalateOn'] = s.escalateOn;
           if (s.neverDowngrade) entry['neverDowngrade'] = true;

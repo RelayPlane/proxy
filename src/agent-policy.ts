@@ -15,6 +15,7 @@ import { load as yamlLoad } from 'js-yaml';
 export interface TaskPolicy {
   preferred: string;               // "provider/model" or alias
   neverDowngrade?: boolean;
+  downgradeTo?: string;            // used for simple requests unless neverDowngrade
   escalateTo?: string;
   escalateOn?: Array<'complexity_high' | 'rate_limit' | 'error'>;
 }
@@ -22,6 +23,7 @@ export interface TaskPolicy {
 export interface AgentPolicy {
   fingerprint?: string;            // Optional - matched by name if absent
   preferred: string;
+  downgradeTo?: string;            // used for simple requests unless neverDowngrade
   escalateTo?: string;
   escalateOn?: Array<'complexity_high' | 'rate_limit' | 'error'>;
   fallback?: string;
@@ -148,7 +150,7 @@ export function resolvePolicy(
   // 1. Agent task override
   if (matchedAgent && matchedAgent.tasks && matchedAgent.tasks[taskType]) {
     const rule = matchedAgent.tasks[taskType]!;
-    const model = resolveEscalation(rule, complexity) ?? rule.preferred;
+    const model = resolveComplexityModel(rule, complexity) ?? rule.preferred;
     return {
       model,
       resolvedBy: 'agent_task_override',
@@ -161,7 +163,7 @@ export function resolvePolicy(
   // 2. Global task rule
   if (policy.tasks && policy.tasks[taskType]) {
     const rule = policy.tasks[taskType]!;
-    const model = resolveEscalation(rule, complexity) ?? rule.preferred;
+    const model = resolveComplexityModel(rule, complexity) ?? rule.preferred;
     return {
       model,
       resolvedBy: 'task_rule',
@@ -173,7 +175,7 @@ export function resolvePolicy(
 
   // 3. Agent-level rule
   if (matchedAgent) {
-    const model = resolveAgentEscalation(matchedAgent, complexity) ?? matchedAgent.preferred;
+    const model = resolveComplexityModel(matchedAgent, complexity) ?? matchedAgent.preferred;
     return {
       model,
       resolvedBy: 'agent_rule',
@@ -193,10 +195,17 @@ export function resolvePolicy(
   };
 }
 
-function resolveEscalation(
+function resolveComplexityModel(
   rule: TaskPolicy,
   complexity: 'simple' | 'moderate' | 'complex',
 ): string | null {
+  if (complexity === 'simple' && rule.neverDowngrade !== true && rule.downgradeTo) {
+    return rule.downgradeTo;
+  }
+  // Cache-awareness requires per-request cache residency and token prices, which
+  // this pure resolver does not receive. Switching models breaks prompt-cache
+  // reuse and can cost roughly 7x on cache-heavy inputs. Do not infer cache
+  // savings from complexity alone or suppress accuracy-critical escalation.
   if (
     rule.escalateTo &&
     rule.escalateOn &&
@@ -204,21 +213,6 @@ function resolveEscalation(
     complexity === 'complex'
   ) {
     return rule.escalateTo;
-  }
-  return null;
-}
-
-function resolveAgentEscalation(
-  agent: AgentPolicy,
-  complexity: 'simple' | 'moderate' | 'complex',
-): string | null {
-  if (
-    agent.escalateTo &&
-    agent.escalateOn &&
-    agent.escalateOn.includes('complexity_high') &&
-    complexity === 'complex'
-  ) {
-    return agent.escalateTo;
   }
   return null;
 }

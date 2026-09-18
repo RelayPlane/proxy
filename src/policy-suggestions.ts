@@ -6,7 +6,7 @@
  */
 
 import { getProviderConfigs } from './config.js';
-import { estimateDailyCost } from './policy-analyzer.js';
+import { estimateDailyCost, MODEL_COST_PER_1M } from './policy-analyzer.js';
 import type { AgentAnalysis } from './policy-analyzer.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -16,6 +16,7 @@ export interface PolicySuggestion {
   agentName: string;
   currentModel: string;
   suggestedModel: string;                                            // primary model to route to
+  downgradeTo?: string;                                              // cheaper target for simple requests
   escalateTo?: string;                                               // optional escalation target
   escalateOn?: Array<'complexity_high' | 'rate_limit' | 'error'>;
   neverDowngrade: boolean;
@@ -52,7 +53,7 @@ export function detectAvailableProviders(): string[] {
       }
     }
   } catch {
-    // Config may not exist — that's fine
+    // Config may not exist: that's fine
   }
 
   return [...providers].sort();
@@ -86,27 +87,27 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
   let neverDowngrade = false;
   let reason = '';
 
-  // RULE 1 — Long-context: avgTotalTokens > 50_000
+  // RULE 1: Long-context: avgTotalTokens > 50_000
   if (avgTotalTokens > 50_000) {
     suggestedModel = bestAvailable([
       'anthropic/claude-opus-4-5', 'anthropic/claude-opus-4',
       'openai/gpt-4o',
     ], availableProviders);
-    neverDowngrade = true;
-    reason = `Long-context patterns (avg ${Math.round(avgTotalTokens / 1000)}K tokens) — keep on full-context model`;
+    neverDowngrade = (taskDistribution['review'] ?? 0) + (taskDistribution['security'] ?? 0) >= 0.8;
+    reason = `Long-context patterns (avg ${Math.round(avgTotalTokens / 1000)}K tokens): keep on full-context model`;
   }
 
-  // RULE 2 — Security/review: review + security >= 0.8
+  // RULE 2: Security/review: review + security >= 0.8
   else if ((taskDistribution['review'] ?? 0) + (taskDistribution['security'] ?? 0) >= 0.8) {
     const pct = Math.round(((taskDistribution['review'] ?? 0) + (taskDistribution['security'] ?? 0)) * 100);
     suggestedModel = bestAvailable([
       'anthropic/claude-opus-4-5', 'anthropic/claude-opus-4',
     ], availableProviders) ?? currentModel;
     neverDowngrade = true;
-    reason = `High review/security share (${pct}%) — never downgrade for accuracy`;
+    reason = `High review/security share (${pct}%): never downgrade for accuracy`;
   }
 
-  // RULE 3 — Code-heavy: code >= 0.8
+  // RULE 3: Code-heavy: code >= 0.8
   else if ((taskDistribution['code'] ?? 0) >= 0.8) {
     const pct = Math.round((taskDistribution['code'] ?? 0) * 100);
     suggestedModel = bestAvailable([
@@ -117,10 +118,10 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
     ], availableProviders) ?? undefined;
     escalateOn = ['complexity_high'];
     neverDowngrade = false;
-    reason = `Code-heavy (${pct}%) — sonnet for speed, escalate to opus on complexity`;
+    reason = `Code-heavy (${pct}%): sonnet for speed, escalate to opus on complexity`;
   }
 
-  // RULE 4 — Summarization: summarization >= 0.8
+  // RULE 4: Summarization: summarization >= 0.8
   else if ((taskDistribution['summarization'] ?? 0) >= 0.8) {
     const pct = Math.round((taskDistribution['summarization'] ?? 0) * 100);
     suggestedModel = bestAvailable([
@@ -128,10 +129,10 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
       'anthropic/claude-haiku-4-5', 'openai/gpt-4o-mini',
     ], availableProviders);
     neverDowngrade = false;
-    reason = `Summarization-heavy (${pct}%) — fast/cheap model`;
+    reason = `Summarization-heavy (${pct}%): fast/cheap model`;
   }
 
-  // RULE 5 — Simple/utility: (simple + utility) >= 0.8 AND avgTotalTokens < 5_000
+  // RULE 5: Simple/utility: (simple + utility) >= 0.8 AND avgTotalTokens < 5_000
   else if (
     ((taskDistribution['simple'] ?? 0) + (taskDistribution['utility'] ?? 0)) >= 0.8 &&
     avgTotalTokens < 5_000
@@ -142,16 +143,32 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
       'google/gemini-2.0-flash', 'anthropic/claude-haiku-4-5', 'openai/gpt-4o-mini',
     ], availableProviders);
     neverDowngrade = false;
-    reason = `Simple tasks with low token volume (avg ${Math.round(avgTotalTokens)} tokens) — cheapest capable model`;
+    reason = `Simple tasks with low token volume (avg ${Math.round(avgTotalTokens)} tokens): cheapest capable model`;
   }
 
-  // DEFAULT — no dominant pattern
+  // DEFAULT: no dominant pattern
   else {
     suggestedModel = bestAvailable([
       'anthropic/claude-sonnet-4-5', 'openai/gpt-4o', 'google/gemini-2.0-flash',
     ], availableProviders);
     neverDowngrade = false;
-    reason = 'Mixed patterns — balanced capability model';
+    reason = 'Mixed patterns: balanced capability model';
+  }
+
+  // A simple request must be able to leave a high preferred tier. Only offer
+  // models with known, strictly cheaper input AND output prices. Unknown prices
+  // are not zero-cost models. Long-context profiles retain a full-context base
+  // until a per-request context-fit check is available.
+  let downgradeTo: string | undefined;
+  if (!neverDowngrade && suggestedModel && avgTotalTokens <= 50_000) {
+    const baseCost = MODEL_COST_PER_1M[suggestedModel];
+    downgradeTo = bestAvailable([
+      'anthropic/claude-haiku-4-5', 'openai/gpt-4o-mini',
+      'google/gemini-2.0-flash', 'groq/llama-3.1-8b-instant',
+    ].filter(model => {
+      const cost = MODEL_COST_PER_1M[model];
+      return baseCost && cost && cost.input < baseCost.input && cost.output < baseCost.output;
+    }), availableProviders) ?? undefined;
   }
 
   // Post-rule: handle null or same model
@@ -162,7 +179,7 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
     noSuggestion = true;
     noSuggestionReason = "No available provider for this agent's task profile";
     suggestedModel = currentModel;
-  } else if (suggestedModel === currentModel) {
+  } else if (suggestedModel === currentModel && !downgradeTo) {
     noSuggestion = true;
     noSuggestionReason = 'Already on the recommended model';
   }
@@ -183,6 +200,7 @@ function suggestForAgent(analysis: AgentAnalysis, availableProviders: string[]):
     estimatedMonthlySavings,
   };
 
+  if (downgradeTo) result.downgradeTo = downgradeTo;
   if (escalateTo) result.escalateTo = escalateTo;
   if (escalateOn) result.escalateOn = escalateOn;
   if (noSuggestion !== undefined) result.noSuggestion = noSuggestion;

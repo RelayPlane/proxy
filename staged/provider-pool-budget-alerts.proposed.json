@@ -1,0 +1,54 @@
+{
+  "providers": {
+    "anthropic": {
+      "accounts": []
+    }
+  },
+  "credentialPool": [
+    {
+      "id": "acctC-max3",
+      "tenantId": "local",
+      "source": "oauth-file",
+      "path": "/home/coder/.claude-max3/.claude/.credentials.json",
+      "refresh": false,
+      "weight": 5,
+      "maxConcurrent": 5
+    },
+    {
+      "id": "acctD-default",
+      "tenantId": "local",
+      "source": "oauth-file",
+      "path": "/home/coder/.claude-default/.claude/.credentials.json",
+      "refresh": false,
+      "weight": 2,
+      "maxConcurrent": 5
+    }
+  ],
+  "budget": {
+    "enabled": true,
+    "dailyUsd": 500,
+    "hourlyUsd": 100,
+    "onBreach": "block",
+    "sessionCapUsd": 200,
+    "perSessionCapUsd": 200,
+    "alertThresholds": [
+      80,
+      95
+    ],
+    "_note": "Proposed Layer-2 notional API-equivalent caps for proxied traffic only. No per-account or provider quota guarantee."
+  },
+  "alerts": {
+    "enabled": true,
+    "notifyCliPath": "/home/coder/clawd/scripts/v2/bin/notify-cli.py",
+    "cooldownMs": 300000,
+    "maxHistory": 500
+  },
+  "anomaly": {
+    "enabled": true,
+    "velocityThreshold": 80,
+    "tokenExplosionUsd": 20,
+    "repetitionThreshold": 20,
+    "windowMs": 300000,
+    "_note": "Post-response alerts only. Velocity threshold must not exceed the 100-entry buffer."
+  }
+}

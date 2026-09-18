@@ -12,6 +12,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
+import { execFile } from 'node:child_process';
 import type { AnomalyDetail } from './anomaly.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -20,6 +21,8 @@ export interface AlertsConfig {
   enabled: boolean;
   /** Webhook URL for alert delivery */
   webhookUrl?: string;
+  /** Optional absolute path to clawd's notify-cli.py. Uses its Telegram/digest policy. */
+  notifyCliPath?: string;
   /** Alert cooldown in ms to prevent spam (default: 300000 = 5 min) */
   cooldownMs: number;
   /** Max alerts stored in history */
@@ -251,6 +254,7 @@ export class AlertManager {
 
     // Deliver webhook (non-blocking)
     this.deliverWebhook(alert);
+    this.deliverNotifyBus(alert);
 
     return alert;
   }
@@ -276,6 +280,38 @@ export class AlertManager {
     }
   }
 
+  private markDelivered(alert: Alert): void {
+    alert.delivered = true;
+    try {
+      this.db?.prepare('UPDATE alerts SET delivered = 1 WHERE id = ?').run(alert.id);
+    } catch { /* SQLite failure non-fatal */ }
+  }
+
+  private deliverNotifyBus(alert: Alert): void {
+    const cli = this.config.notifyCliPath;
+    if (!cli) return;
+    if (!path.isAbsolute(cli)) {
+      console.warn('[RelayPlane Alerts] notifyCliPath must be absolute');
+      return;
+    }
+    // The bus owns credentials, Telegram delivery, deduplication and digest policy.
+    const kind = String(alert.data['breachType'] ?? alert.data['anomalyType'] ?? alert.data['threshold'] ?? alert.data['kind'] ?? alert.type);
+    execFile('python3', [
+      cli, 'publish', '--class', alert.severity === 'critical' ? 'INFRA-CRITICAL' : 'BRIEF',
+      '--source', 'relayplane', '--kind', alert.type,
+      '--title', `RelayPlane ${alert.type}`, '--body', alert.message,
+      '--dedup-key', `relayplane:${alert.type}:${kind}:${String(alert.data['run_id'] ?? '')}`,
+    ], { timeout: 30_000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+      if (error) {
+        // Do not log subprocess output: it can contain notifier credentials.
+        console.warn('[RelayPlane Alerts] Notification bus publish failed');
+        return;
+      }
+      // Successful publication can still mean suppressed, queued, or failed delivery.
+      if (/\bdelivered=True\b/.test(stdout)) this.markDelivered(alert);
+    });
+  }
+
   private deliverWebhook(alert: Alert): void {
     if (!this.config.webhookUrl) return;
     const url = this.config.webhookUrl;
@@ -295,13 +331,8 @@ export class AlertManager {
           data: alert.data,
         },
       }),
-    }).then(() => {
-      alert.delivered = true;
-      try {
-        if (this.db) {
-          this.db!.prepare('UPDATE alerts SET delivered = 1 WHERE id = ?').run(alert.id);
-        }
-      } catch { /* SQLite failure non-fatal */ }
+    }).then((response) => {
+      if (response.ok) this.markDelivered(alert);
     }).catch(() => {
       // Webhook delivery failure, non-fatal
     });
