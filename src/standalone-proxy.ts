@@ -70,7 +70,8 @@ import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DO
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
 import { EliteGuardrails, DEFAULT_ELITE_GUARDRAILS, type RouteDecision } from './elite-guardrails.js';
 import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
-import { loadPolicy, resolvePolicy, POLICY_FILE } from './agent-policy.js';
+import { loadPolicy, resolvePolicy, POLICY_FILE, type RoutingPolicy } from './agent-policy.js';
+import { lookupVerifiedPrice } from './model-pricing.js';
 import { getVersionStatus } from './utils/version-status.js';
 import { initNudge, checkAndShowNudge } from './signup-nudge.js';
 import { initStarNudge, checkAndShowStarNudge } from './star-nudge.js';
@@ -1971,6 +1972,49 @@ export function resolveComplexityTier(
   const tier = tiers[complexity as keyof typeof tiers];
   if (tier) return { provider: tier.provider, model: tier.model };
   return { provider, model: tiers.complex.model };
+}
+
+/**
+ * Live-path model selection that consults the merged downgrade resolver.
+ *
+ * The HTTP handlers derive a candidate model from routing.complexity[tier].
+ * This makes that candidate consult resolvePolicy so a simple request can route
+ * DOWN to a strictly-cheaper, known-priced model unless the matched policy is
+ * neverDowngrade (accuracy-critical review/security stays pinned). SAFE: any
+ * failure, unknown price, or non-cheaper target returns the original candidate;
+ * it never throws.
+ *
+ * Complexity mapping (resolver only accepts simple/moderate/complex):
+ *  - simple            -> consult resolver (downgrade may apply)
+ *  - moderate/complex  -> returned unchanged (no live behavior change here)
+ *  - elite             -> mapped explicitly to keep the elite/fable route, never downgraded
+ */
+export function resolveLiveModel(params: {
+  complexity: Complexity;
+  candidateModel: string;
+  policy: RoutingPolicy;
+  taskType: string;
+  agentFingerprint?: string;
+  agentName?: string;
+}): string {
+  const { complexity, candidateModel, policy, taskType, agentFingerprint, agentName } = params;
+  try {
+    if (complexity !== 'simple') {
+      return candidateModel;
+    }
+    const resolution = resolvePolicy(policy, agentFingerprint, agentName, taskType, 'simple', candidateModel);
+    if (resolution.neverDowngrade === true) return candidateModel;
+    if (!resolution.model || resolution.model === candidateModel) return candidateModel;
+    const candidatePrice = lookupVerifiedPrice(candidateModel);
+    const downgradePrice = lookupVerifiedPrice(resolution.model);
+    if (!candidatePrice || !downgradePrice) return candidateModel;
+    const candidateCost = candidatePrice.input + candidatePrice.output;
+    const downgradeCost = downgradePrice.input + downgradePrice.output;
+    if (downgradeCost < candidateCost) return resolution.model;
+    return candidateModel;
+  } catch {
+    return candidateModel;
+  }
 }
 
 export function shouldEscalate(responseText: string, trigger: CascadeConfig['escalateOn']): boolean {
@@ -7417,6 +7461,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (complexityVal != null) {
             const parsed = parseComplexityModel(complexityVal);
             selectedModel = `${parsed.provider}/${parsed.model}`;
+            selectedModel = resolveLiveModel({
+              complexity,
+              candidateModel: selectedModel,
+              policy: loadPolicy(),
+              taskType,
+              agentFingerprint: nativeAgentFingerprint,
+              agentName: nativeExplicitAgentId,
+            });
           }
         } else {
           selectedModel = getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
@@ -7460,6 +7512,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             if (complexityVal != null) {
               const parsed = parseComplexityModel(complexityVal);
               selectedModel = `${parsed.provider}/${parsed.model}`;
+              selectedModel = resolveLiveModel({
+                complexity,
+                candidateModel: selectedModel,
+                policy: loadPolicy(),
+                taskType,
+                agentFingerprint: nativeAgentFingerprint,
+                agentName: nativeExplicitAgentId,
+              });
               log(`Complexity routing: ${complexity} → ${parsed.provider}/${parsed.model}`);
             }
           }
@@ -8729,6 +8789,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           if (complexityVal != null) {
             const parsed = parseComplexityModel(complexityVal);
             selectedModel = `${parsed.provider}/${parsed.model}`;
+            selectedModel = resolveLiveModel({
+              complexity,
+              candidateModel: selectedModel,
+              policy: loadPolicy(),
+              taskType,
+              agentFingerprint: chatAgentFingerprint,
+              agentName: chatExplicitAgentId,
+            });
             log(`Complexity routing: ${complexity} → ${parsed.provider}/${parsed.model}`);
           }
         }
