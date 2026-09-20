@@ -71,6 +71,7 @@ import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptF
 import { EliteGuardrails, DEFAULT_ELITE_GUARDRAILS, type RouteDecision } from './elite-guardrails.js';
 import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
 import { loadPolicy, resolvePolicy, POLICY_FILE, type RoutingPolicy } from './agent-policy.js';
+import { loadJevConfig } from './classifier/jev_setup.js';
 import { lookupVerifiedPrice } from './model-pricing.js';
 import { getVersionStatus } from './utils/version-status.js';
 import { initNudge, checkAndShowNudge } from './signup-nudge.js';
@@ -1929,6 +1930,65 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   if (score >= 4) return 'complex';
   if (score >= 2) return 'moderate';
   return 'simple';
+}
+
+/**
+ * OPTIONAL, KEY-GATED complexity classifier (Jev / TypeSafe System One).
+ *
+ * When RELAYPLANE_JEV_API_KEY is present, consult Jev to classify request
+ * complexity into simple | moderate | complex, feeding the SAME resolvePolicy
+ * routing path the free heuristic feeds. Returns the Jev tier on success, or
+ * `undefined` when:
+ *   - no Jev key is configured (the default: the Jev network module is never
+ *     even imported, zero new latency, zero external calls), or
+ *   - Jev fails/times out/returns an unusable answer.
+ *
+ * `undefined` means "fall back to the free classifyComplexity heuristic". Jev is
+ * never required, never blocks the request, and never re-gates the free proxy.
+ */
+export async function classifyComplexityViaAddon(
+  messages: Array<{ role?: string; content?: unknown }>,
+  log: (msg: string) => void,
+): Promise<Complexity | undefined> {
+  const cfg = loadJevConfig();
+  if (!cfg.enabled || cfg.apiKey === null) {
+    return undefined;
+  }
+
+  // Classify the last user message only, mirroring classifyComplexity, so the
+  // signal is the current request, not ambient agent context.
+  const userMessages = messages.filter((m) => m.role === 'user');
+  const lastUserMessage = userMessages.length > 0 ? [userMessages[userMessages.length - 1]!] : messages;
+  const prompt = extractMessageText(lastUserMessage);
+  if (!prompt) {
+    return undefined;
+  }
+
+  try {
+    // Dynamic import so the Jev network client is never loaded on the default
+    // (no-key) path.
+    const { classifyComplexityViaJev } = await import('./classifier/jev_client.js');
+    const result = await classifyComplexityViaJev(
+      { prompt },
+      {
+        apiKey: cfg.apiKey,
+        endpoint: cfg.endpoint,
+        model: cfg.model,
+        timeoutMs: cfg.timeoutMs,
+        logger: { debug: (m: string) => log(m), warn: (m: string) => log(m) },
+      },
+    );
+    if (result === null) {
+      log('[jev] classification unavailable, using free heuristic');
+      return undefined;
+    }
+    log(`[jev] complexity=${result}`);
+    return result;
+  } catch (err) {
+    // Defense in depth: the client never throws, but never let Jev fail a request.
+    log(`[jev] addon error, using free heuristic: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
 }
 
 /**
@@ -7378,11 +7438,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
       const isStreaming = requestBody['stream'] === true;
 
+      // ── Optional Jev complexity add-on (key-gated) ──
+      // When a Jev key is configured, classify BEFORE the cache lookup so the
+      // Jev-derived tier is part of the cache identity (a non-deterministic
+      // classifier must not let a complex request hit a simple-tier cached
+      // answer). When no key is configured this is a no-op (undefined) and the
+      // cache key + classification stay byte-for-byte identical to before.
+      const nativeMessagesForJev = Array.isArray(requestBody['messages'])
+        ? (requestBody['messages'] as Array<{ role?: string; content?: unknown }>)
+        : [];
+      const jevComplexity = await classifyComplexityViaAddon(nativeMessagesForJev, log);
+
       // ── Response Cache: check for cached response ──
       const cacheBypass = responseCache.shouldBypass(requestBody);
       let cacheHash: string | undefined;
       if (!cacheBypass) {
-        cacheHash = responseCache.computeKey(requestBody);
+        cacheHash = responseCache.computeKey(requestBody, jevComplexity);
         const cached = responseCache.get(cacheHash);
         if (cached) {
           try {
@@ -7437,7 +7508,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         promptText = extractMessageText(messages);
         taskType = inferTaskType(promptText);
         confidence = getInferenceConfidence(promptText, taskType);
-        complexity = classifyComplexity(messages);
+        // Jev tier (key-gated) takes precedence when present; otherwise the
+        // free heuristic decides, exactly as before.
+        complexity = jevComplexity ?? classifyComplexity(messages);
         log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
       }
 
@@ -8566,11 +8639,20 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
     }
 
+    // ── Optional Jev complexity add-on (key-gated) ──
+    // Classify BEFORE the cache lookup so a Jev-derived tier is part of the
+    // cache identity. No-op (undefined) when no Jev key is configured, keeping
+    // the cache key and classification byte-for-byte identical to before.
+    const chatMessagesForJev = Array.isArray(request.messages)
+      ? (request.messages as Array<{ role?: string; content?: unknown }>)
+      : [];
+    const jevComplexityChat = await classifyComplexityViaAddon(chatMessagesForJev, log);
+
     // ── Response Cache: check for cached response (chat/completions) ──
     const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
     let chatCacheHash: string | undefined;
     if (!chatCacheBypass) {
-      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>);
+      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>, jevComplexityChat);
       const chatCached = responseCache.get(chatCacheHash);
       if (chatCached) {
         try {
@@ -8731,7 +8813,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       promptText = extractPromptText(request.messages);
       taskType = inferTaskType(promptText);
       confidence = getInferenceConfidence(promptText, taskType);
-      complexity = classifyComplexity(request.messages);
+      // Jev tier (key-gated) takes precedence when present; otherwise the free
+      // heuristic decides, exactly as before.
+      complexity = jevComplexityChat ?? classifyComplexity(request.messages);
       log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
     }
 
@@ -9238,6 +9322,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           chatSessionSource,
           chatTraceId,
           chatBudgetExtraHeaders,
+          jevComplexityChat,
         );
       }
     }
@@ -9819,6 +9904,12 @@ async function handleNonStreamingRequest(
   traceId?: string,
   /** Budget warn/downgrade headers to surface on the 200 response (symmetric with /v1/messages). */
   budgetHeaders?: Record<string, string>,
+  /**
+   * Jev-derived complexity tier, when the key-gated add-on picked the tier.
+   * Folded into the cache STORE key so it matches the tagged GET key. Undefined
+   * on the free-heuristic default path (key unchanged from before).
+   */
+  cacheComplexityTag?: Complexity,
 ): Promise<void> {
   let responseData: Record<string, unknown>;
 
@@ -10025,7 +10116,8 @@ async function handleNonStreamingRequest(
   const chatCacheBypassLocal = chatRespCache.shouldBypass(chatReqAsRecord);
   let chatCacheHeaderVal: string = chatCacheBypassLocal ? 'BYPASS' : 'MISS';
   if (!chatCacheBypassLocal) {
-    const chatHashLocal = chatRespCache.computeKey(chatReqAsRecord);
+    // Fold the Jev tier into the STORE key so it matches the tagged GET key.
+    const chatHashLocal = chatRespCache.computeKey(chatReqAsRecord, cacheComplexityTag);
     chatRespCache.set(chatHashLocal, JSON.stringify(responseData), {
       model: targetModel,
       tokensIn: tokensIn,

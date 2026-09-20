@@ -116,16 +116,37 @@ const CACHE_KEY_FIELDS = [
 ] as const;
 
 /**
+ * Optional key added to the canonical cache object to make a classifier-derived
+ * complexity tier part of the cache identity. Sorted alphabetically among the
+ * other fields; only present when a tag is supplied, so keys computed without a
+ * tag are byte-for-byte identical to the historical behavior.
+ */
+const COMPLEXITY_TAG_FIELD = '__rp_complexity';
+
+/**
  * Generate a SHA-256 cache key from a request body.
  * Only includes fields that affect the response content.
  * Excluded: stream, provider headers, API keys.
+ *
+ * `complexityTag` folds a classifier-derived complexity tier into the key. It
+ * MUST be passed whenever a non-deterministic classifier (e.g. the optional Jev
+ * add-on) picked the routing tier, otherwise two identical request bodies that
+ * classified to different tiers would collide and a complex request could be
+ * served a simple-tier cached answer. When omitted (the free-heuristic default
+ * path), the key is unchanged from prior versions.
  */
-export function computeCacheKey(requestBody: Record<string, unknown>): string {
+export function computeCacheKey(
+  requestBody: Record<string, unknown>,
+  complexityTag?: string,
+): string {
   const canonical: Record<string, unknown> = {};
   for (const field of CACHE_KEY_FIELDS) {
     if (requestBody[field] !== undefined) {
       canonical[field] = requestBody[field];
     }
+  }
+  if (complexityTag !== undefined) {
+    canonical[COMPLEXITY_TAG_FIELD] = complexityTag;
   }
   // Use stable JSON serialization (sorted top-level keys, full depth)
   const sortedKeys = Object.keys(canonical).sort();
@@ -146,13 +167,19 @@ const AGGRESSIVE_KEY_FIELDS = ['model', 'system', 'tools'] as const;
  * Uses: system prompt + last user message + model + tools.
  * Ignores: full conversation history, temperature, max_tokens, etc.
  */
-export function computeAggressiveCacheKey(requestBody: Record<string, unknown>): string {
+export function computeAggressiveCacheKey(
+  requestBody: Record<string, unknown>,
+  complexityTag?: string,
+): string {
   const canonical: Record<string, unknown> = {};
 
   for (const field of AGGRESSIVE_KEY_FIELDS) {
     if (requestBody[field] !== undefined) {
       canonical[field] = requestBody[field];
     }
+  }
+  if (complexityTag !== undefined) {
+    canonical[COMPLEXITY_TAG_FIELD] = complexityTag;
   }
 
   // Extract last user message only
@@ -368,12 +395,18 @@ export class ResponseCache {
   /** Get the cache mode */
   get mode(): 'exact' | 'aggressive' { return this.config.mode; }
 
-  /** Compute cache key based on current mode */
-  computeKey(requestBody: Record<string, unknown>): string {
+  /**
+   * Compute cache key based on current mode.
+   *
+   * `complexityTag`, when supplied, is folded into the key so a classifier-
+   * derived complexity tier is part of the cache identity (see computeCacheKey).
+   * Omit it on the free-heuristic default path to keep keys unchanged.
+   */
+  computeKey(requestBody: Record<string, unknown>, complexityTag?: string): string {
     if (this.config.mode === 'aggressive') {
-      return computeAggressiveCacheKey(requestBody);
+      return computeAggressiveCacheKey(requestBody, complexityTag);
     }
-    return computeCacheKey(requestBody);
+    return computeCacheKey(requestBody, complexityTag);
   }
 
   /** Get aggressive mode max age in seconds */
