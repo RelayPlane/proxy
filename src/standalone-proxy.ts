@@ -59,6 +59,7 @@ import {
 import {
   crossProviderCascade,
   CrossProviderCascadeManager,
+  DEFAULT_CASCADE_TRIGGER_STATUSES,
   type CrossProviderCascadeConfig,
   type CascadeHop,
 } from './cross-provider-cascade.js';
@@ -258,6 +259,7 @@ function meshCapture(
   model: string, provider: string, taskType: string,
   tokensIn: number, tokensOut: number, costUsd: number,
   latencyMs: number, success: boolean, errorType?: string,
+  fallbackTaken?: boolean,
 ): void {
   // Osmosis Phase 1: capture KnowledgeAtom (always, independent of mesh)
   const ts = Date.now();
@@ -270,13 +272,16 @@ function meshCapture(
       inputTokens: tokensIn,
       outputTokens: tokensOut,
       timestamp: ts,
+      // Only stamp the column when a fallback was actually involved; leaving it
+      // undefined preserves the historical NULL for ordinary successes.
+      ...(fallbackTaken ? { fallbackTaken: true } : {}),
     });
   } else {
     captureAtom({
       type: 'failure',
       errorType: errorType ?? 'unknown',
       model,
-      fallbackTaken: false,
+      fallbackTaken: fallbackTaken === true,
       timestamp: ts,
     });
   }
@@ -2049,6 +2054,70 @@ export function resolveComplexityTier(
  *  - moderate/complex  -> returned unchanged (no live behavior change here)
  *  - elite             -> mapped explicitly to keep the elite/fable route, never downgraded
  */
+/**
+ * True when an Anthropic API key that can serve Haiku is present.
+ *
+ * Trap (b): Anthropic Max/OAuth tokens do NOT serve Haiku, so a downgrade to
+ * Haiku silently floors at Sonnet unless a real `sk-ant-api*` key is present.
+ * We check both the env var and the auth block in user config.
+ */
+export function hasHaikuCapableAnthropicKey(userConfig?: Record<string, unknown>): boolean {
+  const env = process.env['ANTHROPIC_API_KEY'];
+  if (typeof env === 'string' && env.startsWith('sk-ant-api')) return true;
+  const cfg = (userConfig ?? {}) as Record<string, Record<string, string> | undefined>;
+  const auth = (cfg['auth'] ?? {}) as Record<string, string>;
+  const k = auth['anthropicApiKey'];
+  return typeof k === 'string' && k.startsWith('sk-ant-api');
+}
+
+/** Strictly-cheaper price comparison (input+output per Mtok). Unknown price => false. */
+export function isStrictlyCheaperModel(candidate: string, baseline: string): boolean {
+  const a = lookupVerifiedPrice(candidate);
+  const b = lookupVerifiedPrice(baseline);
+  if (!a || !b) return false;
+  return a.input + a.output < b.input + b.output;
+}
+
+/**
+ * Built-in, policy-free downgrade target for a simple/moderate request.
+ *
+ * Returns the complexity-tier model for `provider` (from PROVIDER_COMPLEXITY_TIERS),
+ * honoring the Haiku-token trap: a Haiku target is only returned when a
+ * Haiku-capable key is present, otherwise it floors at the moderate (Sonnet)
+ * tier. Returns null for complex/elite (never downgraded) or unknown providers.
+ * The result is a bare model for anthropic and "provider/model" otherwise, to
+ * match how candidateModel is formatted at the call sites.
+ */
+export function resolveDowngradeTarget(
+  complexity: Complexity,
+  provider: Provider,
+  haikuCapable: boolean,
+): string | null {
+  if (complexity !== 'simple' && complexity !== 'moderate') return null;
+  const tiers = PROVIDER_COMPLEXITY_TIERS[provider] ?? PROVIDER_COMPLEXITY_TIERS['anthropic']!;
+  let tier = complexity === 'simple' ? tiers.simple : tiers.moderate;
+  if (tier.provider === 'anthropic' && /haiku/i.test(tier.model) && !haikuCapable) {
+    // Floor at Sonnet: Haiku is not served on OAuth/Max tokens.
+    tier = tiers.moderate;
+  }
+  return tier.provider === 'anthropic' ? tier.model : `${tier.provider}/${tier.model}`;
+}
+
+/**
+ * Live-path model selection that routes DOWN to a strictly-cheaper model for
+ * simple/moderate requests. This is what makes always-on cost routing work with
+ * NO user config: historically the only downgrade path required a per-agent
+ * `policy.downgradeTo` that nobody sets, so the router escalated up and routed
+ * zero requests down. Now:
+ *
+ *   1. An explicit policy downgrade still wins for simple (unchanged from #305).
+ *   2. Otherwise, a simple/moderate request downgrades to the built-in
+ *      complexity-tier model for its provider when that is strictly cheaper and
+ *      Haiku-eligible. complex/elite are NEVER downgraded (accuracy over cost).
+ *
+ * SAFE: any failure, unknown price, neverDowngrade policy, or non-cheaper target
+ * returns the original candidate; it never throws and never upgrades.
+ */
 export function resolveLiveModel(params: {
   complexity: Complexity;
   candidateModel: string;
@@ -2056,25 +2125,50 @@ export function resolveLiveModel(params: {
   taskType: string;
   agentFingerprint?: string;
   agentName?: string;
+  provider?: Provider;
+  haikuCapable?: boolean;
 }): string {
   const { complexity, candidateModel, policy, taskType, agentFingerprint, agentName } = params;
   try {
-    if (complexity !== 'simple') {
-      return candidateModel;
+    // Never downgrade genuinely hard work.
+    if (complexity === 'complex' || complexity === 'elite') return candidateModel;
+
+    // 1. Explicit policy downgrade (simple tier), unchanged behavior.
+    if (complexity === 'simple') {
+      const resolution = resolvePolicy(policy, agentFingerprint, agentName, taskType, 'simple', candidateModel);
+      if (resolution.neverDowngrade === true) return candidateModel;
+      if (
+        resolution.model &&
+        resolution.model !== candidateModel &&
+        isStrictlyCheaperModel(resolution.model, candidateModel)
+      ) {
+        return resolution.model;
+      }
     }
-    const resolution = resolvePolicy(policy, agentFingerprint, agentName, taskType, 'simple', candidateModel);
-    if (resolution.neverDowngrade === true) return candidateModel;
-    if (!resolution.model || resolution.model === candidateModel) return candidateModel;
-    const candidatePrice = lookupVerifiedPrice(candidateModel);
-    const downgradePrice = lookupVerifiedPrice(resolution.model);
-    if (!candidatePrice || !downgradePrice) return candidateModel;
-    const candidateCost = candidatePrice.input + candidatePrice.output;
-    const downgradeCost = downgradePrice.input + downgradePrice.output;
-    if (downgradeCost < candidateCost) return resolution.model;
+
+    // 2. Policy-free downgrade to the built-in complexity tier (simple/moderate).
+    const provider = params.provider ?? 'anthropic';
+    const target = resolveDowngradeTarget(complexity, provider, params.haikuCapable === true);
+    if (target && target !== candidateModel && isStrictlyCheaperModel(target, candidateModel)) {
+      return target;
+    }
+
     return candidateModel;
   } catch {
     return candidateModel;
   }
+}
+
+/**
+ * Whether always-on complexity routing is active for this config: the routing
+ * mode selects the classifier (auto/complexity/cascade) and the complexity
+ * table is enabled. Used to allow a downgrade even in the passthrough branch, so
+ * a caller does NOT need to set a default model.
+ */
+export function complexityRoutingActive(cfg: RelayPlaneProxyConfigFile): boolean {
+  const mode = cfg.routing?.mode;
+  const modeOn = mode === 'auto' || mode === 'complexity' || mode === 'cascade';
+  return modeOn && cfg.routing?.complexity?.enabled === true;
 }
 
 export function shouldEscalate(responseText: string, trigger: CascadeConfig['escalateOn']): boolean {
@@ -4871,6 +4965,22 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         modelMapping: proxyConfig.crossProviderCascade.modelMapping,
       });
       log(`[CROSS-CASCADE] Enabled. Provider order: ${proxyConfig.crossProviderCascade.providers!.join(' → ')}`);
+    } else if (proxyConfig.crossProviderCascade?.enabled !== false) {
+      // Always-on cross-provider fallback with ZERO config: when 2+ providers
+      // have keys, cap/rate-limit errors on the chosen provider fall through to
+      // the next eligible provider automatically. FREE: uses only keys the user
+      // already supplied (never adds a paid dependency to the default path). A
+      // user can still opt out with crossProviderCascade.enabled=false, or pin a
+      // custom provider order via crossProviderCascade.providers.
+      const cascadeProviders = detectAvailableProviders(loadUserConfig() as unknown as Record<string, unknown>);
+      if (cascadeProviders.length > 1) {
+        crossProviderCascade.configure({
+          enabled: true,
+          providers: cascadeProviders,
+          triggerStatuses: DEFAULT_CASCADE_TRIGGER_STATUSES,
+        });
+        log(`[CROSS-CASCADE] Auto-enabled (no config). Provider order: ${cascadeProviders.join(' → ')}`);
+      }
     }
     const isFirstRun = !rawFileHasRouting || !userConfig.first_run_complete;
 
@@ -7449,11 +7559,19 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         : [];
       const jevComplexity = await classifyComplexityViaAddon(nativeMessagesForJev, log);
 
+      // Trap (a): the CHOSEN complexity tier must be part of the cache identity,
+      // not just the Jev tier. classifyComplexity is deterministic on the body,
+      // so folding it in is belt-and-suspenders against a complex request being
+      // served a simple-tier cached answer if classification ever diverges from
+      // the raw body hash (e.g. Jev vs heuristic, or a future tier-aware key).
+      const nativeCacheComplexityTag: Complexity | undefined =
+        jevComplexity ?? (nativeMessagesForJev.length > 0 ? classifyComplexity(nativeMessagesForJev) : undefined);
+
       // ── Response Cache: check for cached response ──
       const cacheBypass = responseCache.shouldBypass(requestBody);
       let cacheHash: string | undefined;
       if (!cacheBypass) {
-        cacheHash = responseCache.computeKey(requestBody, jevComplexity);
+        cacheHash = responseCache.computeKey(requestBody, nativeCacheComplexityTag);
         const cached = responseCache.get(cacheHash);
         if (cached) {
           try {
@@ -7570,6 +7688,34 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
         targetProvider = resolved.provider;
         targetModel = resolved.model;
+        // Always-on routing DOWN: even when the caller named a concrete model,
+        // a simple/moderate request should not pay for a more expensive model
+        // than it needs (this is what makes the default model redundant). Only
+        // downgrades, only when routing is active and the caller did not bypass,
+        // strictly cheaper, and Haiku-trap aware. complex/elite are untouched.
+        if (
+          relayplaneEnabled && !relayplaneBypass &&
+          complexityRoutingActive(proxyConfig) &&
+          (complexity === 'simple' || complexity === 'moderate')
+        ) {
+          const downgraded = resolveLiveModel({
+            complexity,
+            candidateModel: targetModel,
+            policy: loadPolicy(),
+            taskType,
+            agentFingerprint: nativeAgentFingerprint,
+            agentName: nativeExplicitAgentId,
+            provider: targetProvider,
+            haikuCapable: hasHaikuCapableAnthropicKey(loadUserConfig() as unknown as Record<string, unknown>),
+          });
+          if (downgraded !== targetModel) {
+            const dres = resolveConfigModel(downgraded);
+            if (dres && dres.provider === 'anthropic') {
+              log(`Always-on downgrade (passthrough): ${complexity} ${targetModel} → ${dres.model}`);
+              targetModel = dres.model;
+            }
+          }
+        }
       } else if (!useCascade) {
         let selectedModel: string | null = null;
         if (routingMode === 'cost') {
@@ -8154,6 +8300,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   undefined,
                   taskType, complexity
                 );
+                // Observability: record fallback_taken=true so the cross-provider
+                // hop is queryable in osmosis (knowledge_atoms.fallback_taken).
+                {
+                  const cu = (cascData as { usage?: Record<string, number> }).usage;
+                  const cTokIn = cu?.['input_tokens'] ?? cu?.['prompt_tokens'] ?? 0;
+                  const cTokOut = cu?.['output_tokens'] ?? cu?.['completion_tokens'] ?? 0;
+                  meshCapture(cascModel, cascProvider, taskType, cTokIn, cTokOut, estimateCost(cascModel, cTokIn, cTokOut), cascDurationMs, true, undefined, true);
+                }
                 const cascRpHeaders = buildRelayPlaneResponseHeaders(
                   cascModel, originalModel ?? 'unknown', complexity, cascProvider, `${routingMode}+cross-cascade`
                 );
@@ -8648,11 +8802,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       : [];
     const jevComplexityChat = await classifyComplexityViaAddon(chatMessagesForJev, log);
 
+    // Trap (a): fold the CHOSEN complexity tier (Jev or heuristic) into the cache
+    // identity so a complex request can never be served a simple-tier cached answer.
+    const chatCacheComplexityTag: Complexity | undefined =
+      jevComplexityChat ?? (chatMessagesForJev.length > 0 ? classifyComplexity(chatMessagesForJev) : undefined);
+
     // ── Response Cache: check for cached response (chat/completions) ──
     const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
     let chatCacheHash: string | undefined;
     if (!chatCacheBypass) {
-      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>, jevComplexityChat);
+      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>, chatCacheComplexityTag);
       const chatCached = responseCache.get(chatCacheHash);
       if (chatCached) {
         try {
@@ -8842,6 +9001,34 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         targetProvider = resolved.provider;
         targetModel = resolved.model;
         log(`Pass-through mode: ${requestedModel} → ${targetProvider}/${targetModel}`);
+        // Always-on routing DOWN for an explicitly-named model (see native
+        // handler): simple/moderate requests route to a strictly-cheaper model
+        // so the caller never needs to hand-set a default. Downgrade-only,
+        // routing-active + non-bypass gated, Haiku-trap aware.
+        if (
+          !bypassRouting &&
+          complexityRoutingActive(proxyConfig) &&
+          (complexity === 'simple' || complexity === 'moderate')
+        ) {
+          const downgraded = resolveLiveModel({
+            complexity,
+            candidateModel: `${targetProvider}/${targetModel}`,
+            policy: loadPolicy(),
+            taskType,
+            agentFingerprint: chatAgentFingerprint,
+            agentName: chatExplicitAgentId,
+            provider: targetProvider,
+            haikuCapable: hasHaikuCapableAnthropicKey(loadUserConfig() as unknown as Record<string, unknown>),
+          });
+          if (downgraded !== `${targetProvider}/${targetModel}`) {
+            const dres = resolveConfigModel(downgraded);
+            if (dres) {
+              log(`Always-on downgrade (passthrough): ${complexity} ${targetProvider}/${targetModel} → ${dres.provider}/${dres.model}`);
+              targetProvider = dres.provider;
+              targetModel = dres.model;
+            }
+          }
+        }
       } else {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         if (bypassRouting) {
@@ -9912,6 +10099,9 @@ async function handleNonStreamingRequest(
   cacheComplexityTag?: Complexity,
 ): Promise<void> {
   let responseData: Record<string, unknown>;
+  // Tracks whether a cross-provider fallback served this request (recorded to
+  // osmosis fallback_taken on the success path below for observability).
+  let chatFallbackTaken = false;
 
   try {
     const result = await executeNonStreamingProviderRequest(
@@ -9962,6 +10152,7 @@ async function handleNonStreamingRequest(
           targetProvider = cascResult.provider as Provider;
           targetModel = cascResult.model;
           responseData = cascData;
+          chatFallbackTaken = true;
           // Fall through to success handling below (don't return early)
         } else {
           // All fallbacks exhausted - return the primary error
@@ -10107,7 +10298,7 @@ async function handleNonStreamingRequest(
     const innerCacheCreation = innerUsage?.cache_creation_input_tokens ?? 0;
     const innerCacheRead = innerUsage?.cache_read_input_tokens ?? 0;
     sendCloudTelemetry(taskType, targetModel, innerTokIn, innerTokOut, durationMs, true, undefined, undefined, innerCacheCreation || undefined, innerCacheRead || undefined);
-    meshCapture(targetModel, targetProvider, taskType, innerTokIn, innerTokOut, cost, durationMs, true);
+    meshCapture(targetModel, targetProvider, taskType, innerTokIn, innerTokOut, cost, durationMs, true, undefined, chatFallbackTaken); // fallback_taken observability
   }
 
   // ── Cache: store non-streaming chat/completions response ──

@@ -20,14 +20,18 @@ describe('resolveLiveModel (live downgrade wiring)', () => {
     expect(out).toBe(CHEAPER);
   });
 
-  it('moderate request is unchanged', () => {
+  // Contract change (always-on routing): a moderate request now routes DOWN to
+  // the cheaper complexity tier (Sonnet) even without an explicit policy. This
+  // is the fix for the "escalated up, routed zero down" gap; the classifier is
+  // authoritative so a caller does not need to hand-set a default model.
+  it('moderate request routes down to the cheaper tier (Sonnet), no policy needed', () => {
     const out = resolveLiveModel({
       complexity: 'moderate',
       candidateModel: CANDIDATE,
       policy: policyWith({ preferred: CANDIDATE, downgradeTo: CHEAPER }),
       taskType: 'general',
     });
-    expect(out).toBe(CANDIDATE);
+    expect(out).toBe('claude-sonnet-5');
   });
 
   it('complex request is unchanged', () => {
@@ -61,24 +65,30 @@ describe('resolveLiveModel (live downgrade wiring)', () => {
     expect(out).toBe(CANDIDATE);
   });
 
-  it('resolution failure falls back to the candidate model', () => {
+  // Contract change: an EMPTY policy no longer means "no downgrade". A simple
+  // request routes down to the built-in cheaper tier (Sonnet floor here, since
+  // no Haiku-capable key is passed). complex/elite still fall back safely.
+  it('empty policy still routes a simple request down to the cheaper tier', () => {
     const out = resolveLiveModel({
       complexity: 'simple',
       candidateModel: CANDIDATE,
       policy: { version: 1 } as RoutingPolicy,
       taskType: 'general',
     });
-    expect(out).toBe(CANDIDATE);
+    expect(out).toBe('claude-sonnet-5');
   });
 
-  it('downgrade to an unknown-priced model falls back to the candidate', () => {
+  it('an unknown-priced policy downgradeTo is ignored; falls to the built-in tier', () => {
     const out = resolveLiveModel({
       complexity: 'simple',
       candidateModel: CANDIDATE,
       policy: policyWith({ preferred: CANDIDATE, downgradeTo: 'anthropic/not-a-real-model' }),
       taskType: 'general',
     });
-    expect(out).toBe(CANDIDATE);
+    // The unknown policy target is never used (its price can't be verified);
+    // the policy-free tier downgrade still applies, landing on the Sonnet floor.
+    expect(out).not.toBe('anthropic/not-a-real-model');
+    expect(out).toBe('claude-sonnet-5');
   });
 
   it('downgrade that is not strictly cheaper falls back to the candidate', () => {

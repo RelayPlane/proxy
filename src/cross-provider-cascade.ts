@@ -37,6 +37,12 @@ export const DEFAULT_CASCADE_TRIGGER_STATUSES = [429, 529, 503];
 export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string, string>>> = {
   anthropic: {
     openrouter: {
+      // Current tier models (2026): keep quality tier comparable on the hop.
+      'claude-opus-5':             'anthropic/claude-opus-4-8',
+      'claude-sonnet-5':           'anthropic/claude-sonnet-5',
+      'claude-fable-5-1':          'anthropic/claude-opus-4-8',
+      'claude-opus-4-8':           'anthropic/claude-opus-4-8',
+      // Legacy names retained for older configs.
       'claude-opus-4-6':           'anthropic/claude-opus-4-6',
       'claude-sonnet-4-6':         'anthropic/claude-sonnet-4-6',
       'claude-haiku-4-5':          'anthropic/claude-haiku-4-5',
@@ -44,10 +50,21 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
       'claude-3-5-haiku-latest':   'anthropic/claude-3-5-haiku',
       'claude-3-opus-latest':      'anthropic/claude-3-opus',
     },
+    openai: {
+      // Quality-comparable OpenAI analogs (used when OpenAI is the next eligible provider).
+      'claude-opus-5':     'gpt-5.4',
+      'claude-fable-5-1':  'gpt-5.5',
+      'claude-sonnet-5':   'gpt-5.4',
+      'claude-haiku-4-5':  'gpt-4.1-mini',
+      'claude-opus-4-6':   'gpt-5.4',
+      'claude-sonnet-4-6': 'gpt-5.4',
+    },
     google: {
+      'claude-opus-5':      'gemini-2.5-pro',
+      'claude-sonnet-5':    'gemini-2.5-flash',
+      'claude-haiku-4-5':   'gemini-2.5-flash-lite',
       'claude-opus-4-6':    'gemini-2.0-flash',      // best available Gemini analog
       'claude-sonnet-4-6':  'gemini-2.0-flash',
-      'claude-haiku-4-5':   'gemini-2.0-flash-lite',
     },
   },
   openai: {
@@ -156,7 +173,7 @@ export class CrossProviderCascadeManager {
     const providers = this.config.providers;
     const idx = providers.indexOf(currentProvider);
     if (idx === -1) {
-      // Current provider not in list — return all as fallbacks
+      // Current provider not in list - return all as fallbacks
       return [...providers];
     }
     return providers.slice(idx + 1);
@@ -200,7 +217,7 @@ export class CrossProviderCascadeManager {
    *                           Should return `{ status, data }`.
    * @param log              - Logging callback for cascade events.
    *
-   * @returns `CascadeAttemptResult` — callers can check `.success` and use `.provider`/`.model`.
+   * @returns `CascadeAttemptResult` - callers can check `.success` and use `.provider`/`.model`.
    */
   async execute<T>(
     primaryProvider: string,
@@ -227,7 +244,7 @@ export class CrossProviderCascadeManager {
 
     const fallbacks = this.getFallbackProviders(primaryProvider);
     if (fallbacks.length === 0) {
-      log(`[CROSS-CASCADE] No fallback providers configured after ${primaryProvider} — giving up`);
+      log(`[CROSS-CASCADE] No fallback providers configured after ${primaryProvider} - giving up`);
       return {
         result: {
           success: false,
@@ -240,7 +257,7 @@ export class CrossProviderCascadeManager {
     }
 
     log(
-      `[CROSS-CASCADE] ${primaryProvider} returned ${primaryStatus} — ` +
+      `[CROSS-CASCADE] ${primaryProvider} returned ${primaryStatus} - ` +
       `cascading to: ${fallbacks.join(' → ')}`
     );
 
@@ -275,18 +292,18 @@ export class CrossProviderCascadeManager {
           };
         }
 
-        // Non-success — should we keep cascading?
+        // Non-success - should we keep cascading?
         if (this.shouldCascade(status)) {
           log(
-            `[CROSS-CASCADE] ${nextProvider} returned ${status} — ` +
+            `[CROSS-CASCADE] ${nextProvider} returned ${status} - ` +
             `trying next provider`
           );
           continue;
         }
 
-        // Non-retryable error (4xx other than 429/529) — stop cascading
+        // Non-retryable error (4xx other than 429/529) - stop cascading
         log(
-          `[CROSS-CASCADE] ${nextProvider} returned non-retryable ${status} — ` +
+          `[CROSS-CASCADE] ${nextProvider} returned non-retryable ${status} - ` +
           `aborting cascade`
         );
         return {
@@ -301,7 +318,7 @@ export class CrossProviderCascadeManager {
         };
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        log(`[CROSS-CASCADE] ${nextProvider} threw: ${errMsg} — trying next provider`);
+        log(`[CROSS-CASCADE] ${nextProvider} threw: ${errMsg} - trying next provider`);
         statusHistory.push({ provider: nextProvider, model: nextModel, status: 0 });
       }
     }

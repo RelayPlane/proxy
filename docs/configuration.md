@@ -51,6 +51,42 @@ The proxy classifies incoming requests by complexity (simple, moderate, complex)
 
 The classifier scores requests based on message count, total token length, tool usage, and content patterns (e.g., words like "analyze", "compare", "evaluate" increase the score). This happens locally, no prompt content is sent anywhere.
 
+### The classifier is authoritative: a per-request "default model" is overridden
+
+When routing is on (`routing.mode` is `auto`, `complexity`, or `cascade`, which is the out-of-the-box default), the complexity classifier decides the model, and it can route **down**. That means the model your agent names on a request is treated as a hint, not a hard requirement: a request the classifier scores `simple` or `moderate` is sent to a strictly-cheaper tier even if the caller asked for a more expensive model (Opus -> Sonnet -> Haiku, where eligible). This is deliberate, it is what lets you stop hand-setting a default model per agent. `complex` and `elite` work is never downgraded.
+
+So a configured "default model" is effectively inert under complexity routing: you do not need to pick one, and picking an expensive one will not keep simple requests on it. If that surprises you, this section is why.
+
+**To force a specific model for a request** (opt out of routing for that call), do one of:
+
+- Send the header `X-RelayPlane-Bypass: true`. The named model is honored exactly, with no classification or downgrade.
+- Set a policy rule with `neverDowngrade: true` for the agent or task (see [agent-aware routing](../../../docs/agent-aware-routing.md)); accuracy-critical work (security review, etc.) stays pinned to the strong model.
+- Turn routing off globally with `"routing": { "mode": "passthrough" }` (or `relayplane disable`), which forwards every request to the model as named.
+
+**Haiku caveat (Anthropic Max / OAuth tokens):** Anthropic Max/OAuth tokens cannot serve Haiku. When no Haiku-capable `sk-ant-api...` key is present, a downgrade that would land on Haiku is floored at Sonnet instead, so a simple request routes to Sonnet rather than silently failing. Set `ANTHROPIC_API_KEY` to an `sk-ant-api` key (or `auth.anthropicApiKey` in config) to unlock the full simple -> Haiku tier.
+
+## Cross-Provider Fallback
+
+If the provider a request is routed to returns a cap or rate-limit error (`429`, `503`, or `529`, including provider-specific quota-exhausted and Anthropic weekly-cap errors), RelayPlane automatically retries the request on the next provider whose key is present, mapping the model to a comparable-quality model on that provider. This is on top of same-provider credential-pool failover; the cross-provider hop happens after same-provider options are exhausted.
+
+**Auto-enabled, no config:** when 2 or more providers have keys available, cross-provider fallback turns on by itself and uses **whatever provider keys are present**, in detection order, as the fallback chain. It is FREE, it only ever uses keys you already supplied, and it never adds a paid dependency to the default path.
+
+```json
+{
+  "crossProviderCascade": {
+    "enabled": true,
+    "providers": ["anthropic", "openai"],
+    "triggerStatuses": [429, 503, 529]
+  }
+}
+```
+
+- **Opt out:** set `"crossProviderCascade": { "enabled": false }`. With only one provider key present it is a no-op regardless (a fallback needs at least two providers).
+- **Pin the order:** set `providers` explicitly to control which provider is tried first and next. Omit it and RelayPlane derives the order from the provider keys it detects.
+- **Custom model mapping:** `modelMapping` (`{ fromProvider: { toProvider: { model: mappedModel } } }`) overrides the built-in cross-provider model map.
+- **Safe by design:** if no fallback provider is eligible, the original provider error is returned unchanged, the request never hangs. A successful fallback is recorded (`fallback_taken`) in the local osmosis store so you can see it happened.
+- **Known limitation:** cross-provider fallback currently covers the **non-streaming** path only. Streaming cross-provider fallback is a planned follow-up (it needs pre-flight response-header handling); streaming requests still get same-provider cooldown/failover.
+
 ## Model Overrides
 
 Map any model name to a different one. Useful for silently redirecting expensive models to cheaper alternatives without changing your agent configuration:

@@ -19,6 +19,12 @@ export interface SuccessAtom {
   inputTokens: number;
   outputTokens: number;
   timestamp: number;
+  /**
+   * True when this success was served only after a cross-provider fallback hop
+   * (the originally-chosen provider capped/rate-limited and RelayPlane routed to
+   * another provider). Recorded in the fallback_taken column for observability.
+   */
+  fallbackTaken?: boolean;
   classifierSource?: 'regex' | 'sidecar';
   classifierConfidence?: number;
   classifierRecommendedModel?: string;
@@ -212,7 +218,7 @@ export function captureAtom(atom: KnowledgeAtom, sessionId?: string): void {
           input_tokens: atom.inputTokens,
           output_tokens: atom.outputTokens,
           error_type: null,
-          fallback_taken: null,
+          fallback_taken: atom.fallbackTaken === undefined ? null : (atom.fallbackTaken ? 1 : 0),
           timestamp: atom.timestamp,
           session_id: sessionId ?? null,
         });

@@ -45,7 +45,11 @@ Full walkthrough: [relayplane.com/docs/quickstart](https://relayplane.com/docs/q
   [Runs and attribution](https://relayplane.com/docs/runs) ·
   [Telemetry](https://relayplane.com/docs/telemetry)
 - **Model routing.** Send simple work to cheap models and hard work to frontier
-  models by complexity tier. It is a config edit that hot-reloads, never a code
+  models by complexity tier, on by default. The classifier is authoritative and
+  routes **down**: a simple request goes to a cheaper model even if your agent
+  named an expensive one, so you never have to hand-set a default model. Force a
+  specific model per request with the `X-RelayPlane-Bypass: true` header (or
+  `neverDowngrade` policy). It is a config edit that hot-reloads, never a code
   change.
   [Routing](https://relayplane.com/docs/concepts/routing)
 - **Budget caps.** Hard limits (daily, hourly, per-request, per-session, and
@@ -59,9 +63,13 @@ Full walkthrough: [relayplane.com/docs/quickstart](https://relayplane.com/docs/q
   spikes, and repetition (a stuck agent looping the same call) and alert you
   before the caps have to.
   [Cost caps and kill switch](https://relayplane.com/docs/cost-caps)
-- **Failover.** On a 429 or an overload, RelayPlane cools the provider down;
-  enable cross-provider cascade and it remaps the model and retries on the next
-  provider instead of failing your run.
+- **Failover.** On a `429`/`503`/`529` (rate limit, overload, or cap),
+  RelayPlane cools the provider down and, when 2+ provider keys are present,
+  automatically remaps the model and retries on the next provider instead of
+  failing your run. Cross-provider fallback auto-enables with no config and uses
+  whatever provider keys you have; opt out with
+  `crossProviderCascade.enabled=false`. Non-streaming path today; streaming is a
+  planned follow-up.
   [Providers](https://relayplane.com/docs/providers)
 - **Providers.** Native drop-in forwarding for Anthropic, OpenAI, Google
   (Gemini), xAI, OpenRouter, and local Ollama, all behind one base URL.
