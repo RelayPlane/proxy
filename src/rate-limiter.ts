@@ -88,6 +88,7 @@ export class RateLimitError extends Error {
 // Default limits. Sonnet bumped to 60 RPM, Opus bumped to 30 RPM (GH #39).
 export const DEFAULT_LIMITS: Record<string, RateLimitConfig> = {
   // Anthropic models
+  'claude-opus-5-5': { rpm: 30, maxTokens: 4096 },
   'claude-opus-5': { rpm: 30, maxTokens: 4096 },
   'claude-opus-4-6': { rpm: 30, maxTokens: 4096 },
   'claude-opus': { rpm: 30, maxTokens: 4096 },

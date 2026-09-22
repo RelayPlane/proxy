@@ -372,9 +372,10 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
   'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5' },
   haiku: { provider: 'anthropic', model: 'claude-haiku-4-5' },
   sonnet: { provider: 'anthropic', model: 'claude-sonnet-5' },
-  opus: { provider: 'anthropic', model: 'claude-opus-5' },
+  opus: { provider: 'anthropic', model: 'claude-opus-5-5' },
   // Anthropic June-July 2026 additions
   'claude-opus-5':           { provider: 'anthropic', model: 'claude-opus-5' },
+  'claude-opus-5-5':         { provider: 'anthropic', model: 'claude-opus-5-5' },
   'claude-sonnet-5':         { provider: 'anthropic', model: 'claude-sonnet-5' },
   'claude-opus-4-8':         { provider: 'anthropic', model: 'claude-opus-4-8' },
   // Fable 5.1 (GA 2026-09) REPLACES claude-fable-5 on the Claude API, so the
@@ -443,7 +444,7 @@ export const RELAYPLANE_ALIASES: Record<string, string> = {
  */
 export let SMART_ALIASES: Record<string, { provider: Provider; model: string }> = {
   // Defaults: Anthropic passthrough (Max plan / Claude Code users with no API key)
-  'rp:best': { provider: 'anthropic', model: 'claude-opus-5' },
+  'rp:best': { provider: 'anthropic', model: 'claude-opus-5-5' },
   'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-5' },
   'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-5' },
   'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-5' },
@@ -493,7 +494,7 @@ export function buildSmartAliases(): { aliases: Record<string, { provider: Provi
   return {
     via: 'anthropic (Max plan passthrough - Sonnet/Opus only)',
     aliases: {
-      'rp:best': { provider: 'anthropic', model: 'claude-opus-5' },
+      'rp:best': { provider: 'anthropic', model: 'claude-opus-5-5' },
       'rp:fast': { provider: 'anthropic', model: 'claude-sonnet-5' },
       'rp:cheap': { provider: 'anthropic', model: 'claude-sonnet-5' },
       'rp:balanced': { provider: 'anthropic', model: 'claude-sonnet-5' },
@@ -715,9 +716,9 @@ export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
   anthropic: {
     simple:   { provider: 'anthropic', model: 'claude-haiku-4-5' },
     moderate: { provider: 'anthropic', model: 'claude-sonnet-5' },
-    // complex is Opus 5 (May 2026), the flagship agentic-coding model;
+    // complex is Opus 5.5, the flagship agentic-coding model;
     // resolveComplexityTier also resolves the elite auto-upgrade path to it.
-    complex:  { provider: 'anthropic', model: 'claude-opus-5' },
+    complex:  { provider: 'anthropic', model: 'claude-opus-5-5' },
     // Fable 5.1 replaced claude-fable-5 (same $10/$50, 1M context, 128k out).
     elite:    { provider: 'anthropic', model: 'claude-fable-5-1' },
   },
@@ -749,7 +750,7 @@ export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
     simple:   { provider: 'openrouter', model: 'google/gemini-2.5-flash-lite' },
     moderate: { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
     complex:  { provider: 'openrouter', model: 'anthropic/claude-sonnet-5' },
-    elite:    { provider: 'openrouter', model: 'anthropic/claude-opus-4-8' },
+    elite:    { provider: 'openrouter', model: 'anthropic/claude-opus-5-5' },
   },
 };
 
@@ -836,7 +837,7 @@ export function resolveFirstRunComplexityTiers(
   const hasRegularApiKey = !!envAnthropicKey && envAnthropicKey.startsWith('sk-ant-api');
   if (availableProviders.includes('anthropic') && hasRegularApiKey) {
     // Full Anthropic API key: Haiku is available, use the 4-tier ladder.
-    return { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
+    return { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
   }
   if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
     const t = buildDefaultComplexityTiers(availableProviders);
@@ -848,7 +849,7 @@ export function resolveFirstRunComplexityTiers(
     };
   }
   // OAuth / Max plan / no key: Haiku is not served on OAuth, so start at Sonnet.
-  return { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
+  return { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
 }
 
 /**
@@ -1544,7 +1545,7 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
       enabled: true,
       models: [
         'claude-sonnet-4-6',
-        'claude-opus-4-6',
+        'claude-opus-5-5',
       ],
       escalateOn: 'uncertainty',
       maxEscalations: 1,
@@ -1553,7 +1554,7 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
       enabled: true,
       simple: 'claude-sonnet-4-6',
       moderate: 'claude-sonnet-4-6',
-      complex: 'claude-opus-4-6',
+      complex: 'claude-opus-5-5',
     },
   },
   reliability: {
@@ -2025,7 +2026,7 @@ export function resolveComplexityTier(
 
   if (complexity === 'complex' && eliteEnabled) {
     const modernComplexModels: Record<string, string> = {
-      anthropic: 'claude-opus-5',
+      anthropic: 'claude-opus-5-5',
     };
     if (modernComplexModels[provider] !== undefined) {
       return { provider, model: modernComplexModels[provider] };
@@ -3819,7 +3820,7 @@ function getCascadeConfig(config: RelayPlaneProxyConfigFile): CascadeConfig {
   const c = config.routing?.cascade;
   return {
     enabled: c?.enabled ?? true,
-    models: c?.models ?? ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'],
+    models: c?.models ?? ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-5-5'],
     escalateOn: c?.escalateOn ?? 'uncertainty',
     maxEscalations: c?.maxEscalations ?? 1,
   };
@@ -4274,7 +4275,7 @@ async function applyRoutingMode(mode){
   if(mode==='smart'){
     await fetch('/control/model/reset',{method:'POST'}).catch(function(){});
   }else{
-    var modelMap={opus:'claude-opus-5',sonnet:'claude-sonnet-5',haiku:'claude-haiku-4-5-20251001'};
+    var modelMap={opus:'claude-opus-5-5',sonnet:'claude-sonnet-5',haiku:'claude-haiku-4-5-20251001'};
     var model=modelMap[mode]||'claude-sonnet-5';
     await fetch('/control/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:model,reason:'dashboard'})});
   }
@@ -5029,7 +5030,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (availableProviders.includes('anthropic') && hasRegularApiKey) {
           // Full Anthropic API key - enable haiku 4-tier routing
           console.log('[RelayPlane] Auto-config: ANTHROPIC_API_KEY detected - enabling 4-tier routing (haiku/sonnet/opus/fable-elite)');
-          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
+          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
         } else if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
           // Non-Anthropic provider - use detected provider's tiers
           const providerTiers = buildDefaultComplexityTiers(availableProviders);
@@ -5043,7 +5044,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         } else {
           // OAuth only or no API key - skip Haiku (OAuth not supported for Haiku)
           console.warn('[RelayPlane] ⚠️  No ANTHROPIC_API_KEY (sk-ant-api*) - Haiku disabled. Set ANTHROPIC_API_KEY to enable full 4-tier routing.');
-          autoComplexity = { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5', elite: 'claude-fable-5-1' };
+          autoComplexity = { simple: 'claude-sonnet-5', moderate: 'claude-sonnet-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
         }
 
         const autoRouting = {
@@ -7799,7 +7800,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (estimatedTokens > 180000) { // 180K buffer below 200K limit
           const opusModel = proxyConfig.routing?.complexity?.complex
             ? parseComplexityModel(proxyConfig.routing.complexity.complex).model
-            : 'claude-opus-4-6';
+            : 'claude-opus-5-5';
           log(`Context guard: ${estimatedTokens} estimated tokens exceeds Sonnet 200K limit → upgrading to ${opusModel}`);
           targetModel = opusModel;
         }
@@ -9115,7 +9116,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       if (estimatedTokens > 180000) {
         const opusModel = proxyConfig.routing?.complexity?.complex
           ? parseComplexityModel(proxyConfig.routing.complexity.complex).model
-          : 'claude-opus-4-6';
+          : 'claude-opus-5-5';
         log(`Context guard: ${estimatedTokens} estimated tokens exceeds Sonnet 200K limit → upgrading to ${opusModel}`);
         targetModel = opusModel;
       }

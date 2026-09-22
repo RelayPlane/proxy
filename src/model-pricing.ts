@@ -29,6 +29,7 @@
  * | claude-mythos-5-1  | 10    | 50     | current |
  * | claude-fable-5     | 10    | 50     | current |
  * | claude-mythos-5    | 10    | 50     | current |
+ * | claude-opus-5-5    | 5     | 25     | current |
  * | claude-opus-5      | 5     | 25     | current |
  * | claude-opus-4-8    | 5     | 25     | current |
  * | claude-opus-4-7    | 5     | 25     | current |
@@ -93,6 +94,7 @@ export const ANTHROPIC_MODEL_PRICING: Readonly<Record<string, ModelPrice>> = {
   'claude-mythos-5-1': FRONTIER_5_1,
   'claude-fable-5': FRONTIER,
   'claude-mythos-5': FRONTIER,
+  'claude-opus-5-5': OPUS,
   'claude-opus-5': OPUS,
   'claude-opus-4-8': OPUS,
   'claude-opus-4-7': OPUS,
@@ -122,6 +124,7 @@ export const ANTHROPIC_MODEL_ALIASES: Readonly<Record<string, string>> = {
   'claude-3-5-haiku-latest': 'claude-3-5-haiku',
   'claude-fable-5.1': 'claude-fable-5-1',
   'claude-mythos-5.1': 'claude-mythos-5-1',
+  'claude-opus-5.5': 'claude-opus-5-5',
   'claude-opus-4.8': 'claude-opus-4-8',
   'claude-opus-4.7': 'claude-opus-4-7',
   'claude-opus-4.6': 'claude-opus-4-6',

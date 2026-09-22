@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { resolveLiveModel } from '../src/standalone-proxy.js';
 import type { RoutingPolicy } from '../src/agent-policy.js';
 
-const CANDIDATE = 'anthropic/claude-opus-5';
+const CANDIDATE = 'anthropic/claude-opus-5-5';
 const CHEAPER = 'anthropic/claude-haiku-4-5';
 
 function policyWith(rule: Record<string, unknown>): RoutingPolicy {

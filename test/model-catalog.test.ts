@@ -67,10 +67,10 @@ describe('model-catalog: new pricing entries', () => {
 });
 
 describe('model-catalog: snapshot - existing aliases unchanged', () => {
-  it('test_snapshot_opus_alias_resolves_to_opus_5', () => {
-    // opus resolves to Opus 5 (May 2026), the flagship agentic-coding model
-    // promoted over Opus 4.8 at the same $5/$25 pricing.
-    expect(MODEL_MAPPING['opus']).toEqual({ provider: 'anthropic', model: 'claude-opus-5' });
+  it('test_snapshot_opus_alias_resolves_to_opus_5_5', () => {
+    // opus resolves to Opus 5.5, the flagship agentic-coding model
+    // promoted over Opus 5 at the same $5/$25 pricing.
+    expect(MODEL_MAPPING['opus']).toEqual({ provider: 'anthropic', model: 'claude-opus-5-5' });
   });
 
   it('test_snapshot_existing_sonnet_haiku_unchanged', () => {
@@ -79,9 +79,9 @@ describe('model-catalog: snapshot - existing aliases unchanged', () => {
   });
 
   it('test_snapshot_existing_rp_aliases', () => {
-    // rp:best promoted to Opus 5 (flagship); fast/cheap/balanced on Sonnet 5
-    // (the current Sonnet) as part of the 2026-07 model update.
-    expect(SMART_ALIASES['rp:best']).toEqual({ provider: 'anthropic', model: 'claude-opus-5' });
+    // rp:best promoted to Opus 5.5 (flagship); fast/cheap/balanced on Sonnet 5
+    // (the current Sonnet) as part of the model update.
+    expect(SMART_ALIASES['rp:best']).toEqual({ provider: 'anthropic', model: 'claude-opus-5-5' });
     expect(SMART_ALIASES['rp:fast']).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5' });
     expect(SMART_ALIASES['rp:cheap']).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5' });
     expect(SMART_ALIASES['rp:balanced']).toEqual({ provider: 'anthropic', model: 'claude-sonnet-5' });

@@ -210,13 +210,13 @@ describe('elite complexity tier (PR B)', () => {
       expect(result.model).not.toBe('gpt-5.5');
     });
 
-    it('complex + allow_elite_auto:true + anthropic resolves to claude-opus-5 (flagship promotion)', () => {
-      // Opus 5 (May 2026) is the flagship agentic-coding model, the successor to
-      // Opus 4.8 at the same $5/$25 pricing; the gated complex path resolves to it.
+    it('complex + allow_elite_auto:true + anthropic resolves to claude-opus-5-5 (flagship promotion)', () => {
+      // Opus 5.5 is the flagship agentic-coding model, the successor to
+      // Opus 5 at the same $5/$25 pricing; the gated complex path resolves to it.
       const fn = mod['resolveComplexityTier'] as (...args: unknown[]) => { provider: string; model: string };
       expect(typeof fn).toBe('function');
       const result = fn('complex', { provider: 'anthropic', allow_elite_auto: true });
-      expect(result).toMatchObject({ provider: 'anthropic', model: 'claude-opus-5' });
+      expect(result).toMatchObject({ provider: 'anthropic', model: 'claude-opus-5-5' });
     });
 
     it('complex WITHOUT allow_elite_auto preserves existing model (no backwards-compat breakage)', () => {
@@ -270,11 +270,11 @@ describe('elite complexity tier (PR B)', () => {
       });
     });
 
-    it('static complex tier resolves to claude-opus-5 (flagship agentic-coding model)', () => {
-      // The static table's complex tier was promoted to Opus 5 (May 2026), the
-      // successor to Opus 4.8, so gated and ungated paths both land on the
-      // current flagship instead of the stale Opus 4.6.
-      expect(PROVIDER_COMPLEXITY_TIERS.anthropic.complex.model).toBe('claude-opus-5');
+    it('static complex tier resolves to claude-opus-5-5 (flagship agentic-coding model)', () => {
+      // The static table's complex tier was promoted to Opus 5.5, the
+      // successor to Opus 5, so gated and ungated paths both land on the
+      // current flagship instead of the stale Opus 5.
+      expect(PROVIDER_COMPLEXITY_TIERS.anthropic.complex.model).toBe('claude-opus-5-5');
     });
   });
 });

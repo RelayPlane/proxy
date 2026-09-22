@@ -38,6 +38,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
   anthropic: {
     openrouter: {
       // Current tier models (2026): keep quality tier comparable on the hop.
+      'claude-opus-5-5':           'anthropic/claude-opus-4-8',
       'claude-opus-5':             'anthropic/claude-opus-4-8',
       'claude-sonnet-5':           'anthropic/claude-sonnet-5',
       'claude-fable-5-1':          'anthropic/claude-opus-4-8',
@@ -52,6 +53,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
     },
     openai: {
       // Quality-comparable OpenAI analogs (used when OpenAI is the next eligible provider).
+      'claude-opus-5-5':   'gpt-5.4',
       'claude-opus-5':     'gpt-5.4',
       'claude-fable-5-1':  'gpt-5.5',
       'claude-sonnet-5':   'gpt-5.4',
@@ -60,6 +62,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
       'claude-sonnet-4-6': 'gpt-5.4',
     },
     google: {
+      'claude-opus-5-5':    'gemini-2.5-pro',
       'claude-opus-5':      'gemini-2.5-pro',
       'claude-sonnet-5':    'gemini-2.5-flash',
       'claude-haiku-4-5':   'gemini-2.5-flash-lite',
