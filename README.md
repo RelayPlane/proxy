@@ -1,10 +1,12 @@
 # RelayPlane
 
-**Know what every agent run costs. Kill the runaway before it drains your budget.**
+**RelayPlane is a free, open source LLM gateway** that meters what every agent
+run costs and kills the runaway before it drains your budget.
 
 A local proxy that sits between your AI agents and their model providers,
 prices every request as it happens, rolls the cost up per run and per agent,
-and lets you cap or kill spend before a loop turns into a bill.
+routes each request to the cheapest model that fits the task, and lets you
+cap or kill spend before a loop turns into a bill.
 
 [![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![license](https://img.shields.io/badge/license-MIT-blue)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
