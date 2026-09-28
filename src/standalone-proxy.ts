@@ -163,6 +163,48 @@ function isHaikuModel(model: string): boolean {
   return model.includes('haiku');
 }
 
+/**
+ * Sampling params Anthropic's newest model generation rejects outright.
+ * Verified live against api.anthropic.com (2026-09-28): claude-sonnet-5,
+ * claude-sonnet-5-5, claude-opus-5, claude-opus-5-5, claude-opus-4-8 and
+ * claude-fable-5-1 all 400 with "`<param>` is deprecated for this model"
+ * for temperature, top_p and top_k. claude-haiku-4-5(-20251001) still
+ * accepts all three.
+ */
+const ANTHROPIC_SAMPLING_PARAMS = ['temperature', 'top_p', 'top_k'] as const;
+
+/**
+ * True when `model` still accepts manual sampling params (temperature/
+ * top_p/top_k). Haiku is the only verified-accepting family; every other
+ * model routed to Anthropic gets the params stripped defensively so a
+ * caller that always sends e.g. temperature (OpenClaw's Telegram
+ * topic-label helper sends temperature: 0.3 unconditionally) does not 400
+ * just because auto-routing put it on Sonnet/Opus/Fable this time.
+ */
+function modelAcceptsSamplingParams(model: string): boolean {
+  return isHaikuModel(model);
+}
+
+/**
+ * Strip temperature/top_p/top_k from an outbound Anthropic request body
+ * when `model` is known to reject them. Returns `body` unchanged (same
+ * reference) when nothing needs stripping; otherwise returns a shallow
+ * copy with the offending keys removed and logs which ones were dropped.
+ */
+function stripUnsupportedSamplingParams(
+  body: Record<string, unknown>,
+  model: string,
+  log: (msg: string) => void
+): Record<string, unknown> {
+  if (modelAcceptsSamplingParams(model)) return body;
+  const present = ANTHROPIC_SAMPLING_PARAMS.filter((p) => p in body);
+  if (present.length === 0) return body;
+  const result = { ...body };
+  for (const p of present) delete result[p];
+  log(`Stripped unsupported sampling param(s) [${present.join(', ')}] for ${model} (deprecated for this model generation)`);
+  return result;
+}
+
 /** Beta flags that OAT tokens (sk-ant-oat*) do not support */
 const OAT_UNSUPPORTED_BETA_FLAGS = new Set(['max-tokens-3-5-sonnet-2025-04-14']);
 
@@ -2587,7 +2629,11 @@ function buildAnthropicBody(
   }
 
   if (request.temperature !== undefined) {
-    anthropicBody['temperature'] = request.temperature;
+    if (modelAcceptsSamplingParams(targetModel)) {
+      anthropicBody['temperature'] = request.temperature;
+    } else {
+      console.log(`[relayplane] Stripped unsupported sampling param(s) [temperature] for ${targetModel} (deprecated for this model generation)`);
+    }
   }
 
   // Convert OpenAI tools format to Anthropic tools format
@@ -8119,6 +8165,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 throw new CooldownError(resolved.provider);
               }
               let attemptBody: Record<string, unknown> = { ...requestBody, model: resolved.model };
+              attemptBody = stripUnsupportedSamplingParams(attemptBody, resolved.model, log);
               if ((isHaikuModel(resolved.model) || isHaikuModel(requestedModel)) && 'thinking' in attemptBody) {
                 const { thinking: _t, ...rest } = attemptBody;
                 attemptBody = rest;
@@ -8207,6 +8254,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           // model - the user's intent was a non-thinking model, so thinking params
           // (which may also be malformed, e.g. budget_tokens < 1024) should be dropped.
           let _nativeReqBody: Record<string, unknown> = { ...requestBody, model: finalModel };
+          _nativeReqBody = stripUnsupportedSamplingParams(_nativeReqBody, finalModel, log);
           if ((isHaikuModel(finalModel) || isHaikuModel(requestedModel)) && 'thinking' in _nativeReqBody) {
             const { thinking: _t, ...rest } = _nativeReqBody;
             _nativeReqBody = rest;
