@@ -40,6 +40,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
       // Current tier models (2026): keep quality tier comparable on the hop.
       'claude-opus-5-5':           'anthropic/claude-opus-4-8',
       'claude-opus-5':             'anthropic/claude-opus-4-8',
+      'claude-sonnet-5-5':         'anthropic/claude-sonnet-5.5',
       'claude-sonnet-5':           'anthropic/claude-sonnet-5',
       'claude-fable-5-1':          'anthropic/claude-opus-4-8',
       'claude-opus-4-8':           'anthropic/claude-opus-4-8',
@@ -56,6 +57,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
       'claude-opus-5-5':   'gpt-5.4',
       'claude-opus-5':     'gpt-5.4',
       'claude-fable-5-1':  'gpt-5.5',
+      'claude-sonnet-5-5': 'gpt-5.4',
       'claude-sonnet-5':   'gpt-5.4',
       'claude-haiku-4-5':  'gpt-4.1-mini',
       'claude-opus-4-6':   'gpt-5.4',
@@ -64,6 +66,7 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
     google: {
       'claude-opus-5-5':    'gemini-2.5-pro',
       'claude-opus-5':      'gemini-2.5-pro',
+      'claude-sonnet-5-5':  'gemini-2.5-flash',
       'claude-sonnet-5':    'gemini-2.5-flash',
       'claude-haiku-4-5':   'gemini-2.5-flash-lite',
       'claude-opus-4-6':    'gemini-2.0-flash',      // best available Gemini analog

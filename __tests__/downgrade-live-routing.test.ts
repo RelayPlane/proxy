@@ -31,7 +31,7 @@ describe('resolveLiveModel (live downgrade wiring)', () => {
       policy: policyWith({ preferred: CANDIDATE, downgradeTo: CHEAPER }),
       taskType: 'general',
     });
-    expect(out).toBe('claude-sonnet-5');
+    expect(out).toBe('claude-sonnet-5-5');
   });
 
   it('complex request is unchanged', () => {
@@ -75,7 +75,7 @@ describe('resolveLiveModel (live downgrade wiring)', () => {
       policy: { version: 1 } as RoutingPolicy,
       taskType: 'general',
     });
-    expect(out).toBe('claude-sonnet-5');
+    expect(out).toBe('claude-sonnet-5-5');
   });
 
   it('an unknown-priced policy downgradeTo is ignored; falls to the built-in tier', () => {
@@ -88,7 +88,7 @@ describe('resolveLiveModel (live downgrade wiring)', () => {
     // The unknown policy target is never used (its price can't be verified);
     // the policy-free tier downgrade still applies, landing on the Sonnet floor.
     expect(out).not.toBe('anthropic/not-a-real-model');
-    expect(out).toBe('claude-sonnet-5');
+    expect(out).toBe('claude-sonnet-5-5');
   });
 
   it('downgrade that is not strictly cheaper falls back to the candidate', () => {

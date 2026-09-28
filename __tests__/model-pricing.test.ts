@@ -40,6 +40,7 @@ describe('model-pricing doc table is the source of truth', () => {
   it('parses a non-trivial table', () => {
     expect(doc.size).toBeGreaterThanOrEqual(15);
     expect(doc.has('claude-sonnet-5')).toBe(true);
+    expect(doc.has('claude-sonnet-5-5')).toBe(true);
   });
 
   it('every Anthropic constant matches its doc row', () => {
@@ -82,10 +83,12 @@ describe('model-pricing doc table is the source of truth', () => {
 describe('verified prices (2026-09-04 audit)', () => {
   it('Sonnet 5 is $2/$10, not the pre-August $3/$15', () => {
     expect(ANTHROPIC_MODEL_PRICING['claude-sonnet-5']).toMatchObject({ input: 2, output: 10 });
+    // Sonnet 5.5 (2026-09-28) lists at the same $2/$10.
+    expect(ANTHROPIC_MODEL_PRICING['claude-sonnet-5-5']).toMatchObject({ input: 2, output: 10 });
   });
 
   it('current tier defaults are all priced', () => {
-    for (const id of ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-fable-5-1']) {
+    for (const id of ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-sonnet-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-fable-5-1']) {
       expect(lookupVerifiedPrice(id), id).toBeDefined();
     }
   });
@@ -96,6 +99,13 @@ describe('verified prices (2026-09-04 audit)', () => {
     }
   });
 
+  it('Opus 5.5 is $4/$20, a price cut from Opus 5, not the same $5/$25 rate', () => {
+    expect(ANTHROPIC_MODEL_PRICING['claude-opus-5-5']).toMatchObject({ input: 4, output: 20 });
+    expect(lookupVerifiedPrice('claude-opus-5-5')).toMatchObject({ input: 4, output: 20 });
+    expect(lookupVerifiedPrice('claude-opus-5.5')).toMatchObject({ input: 4, output: 20 });
+    expect(lookupVerifiedPrice('anthropic/claude-opus-5-5')).toMatchObject({ input: 4, output: 20 });
+  });
+
   it('models that do not exist or cannot be verified are excluded', () => {
     expect(lookupVerifiedPrice('claude-haiku-4-6')).toBeUndefined();
     expect(lookupVerifiedPrice('claude-3-7-sonnet')).toBeUndefined();
@@ -104,6 +114,7 @@ describe('verified prices (2026-09-04 audit)', () => {
 
   it('resolves provider-prefixed and dotted ids', () => {
     expect(lookupVerifiedPrice('anthropic/claude-sonnet-5')).toMatchObject({ input: 2, output: 10 });
+    expect(lookupVerifiedPrice('anthropic/claude-sonnet-5.5')).toMatchObject({ input: 2, output: 10 });
     expect(lookupVerifiedPrice('claude-opus-4.8')).toMatchObject({ input: 5, output: 25 });
   });
 });

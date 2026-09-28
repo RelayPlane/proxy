@@ -65,14 +65,14 @@ describe('always-on routing DOWN (no policy required)', () => {
       provider: 'anthropic',
       haikuCapable: true,
     });
-    expect(out).toBe('claude-sonnet-5');
+    expect(out).toBe('claude-sonnet-5-5');
   });
 
   it('1e: Haiku downgrade only when a supporting key is present; else floors at Sonnet', () => {
     const withKey = resolveDowngradeTarget('simple', 'anthropic', true);
     const withoutKey = resolveDowngradeTarget('simple', 'anthropic', false);
     expect(withKey).toBe('claude-haiku-4-5');
-    expect(withoutKey).toBe('claude-sonnet-5');
+    expect(withoutKey).toBe('claude-sonnet-5-5');
 
     // end-to-end through resolveLiveModel on OAuth (no Haiku key): Opus simple -> Sonnet, never Haiku
     const oauthRoute = resolveLiveModel({
@@ -83,7 +83,7 @@ describe('always-on routing DOWN (no policy required)', () => {
       provider: 'anthropic',
       haikuCapable: false,
     });
-    expect(oauthRoute).toBe('claude-sonnet-5');
+    expect(oauthRoute).toBe('claude-sonnet-5-5');
   });
 
   it('never upgrades: a request already on the cheap tier stays put', () => {

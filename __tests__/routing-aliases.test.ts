@@ -93,8 +93,8 @@ describe('getAvailableModelNames', () => {
 });
 
 describe('MODEL_MAPPING', () => {
-  it('should have updated sonnet pointing to claude-sonnet-5', () => {
-    expect(MODEL_MAPPING['sonnet'].model).toContain('claude-sonnet-5');
+  it('should have updated sonnet pointing to claude-sonnet-5-5', () => {
+    expect(MODEL_MAPPING['sonnet'].model).toContain('claude-sonnet-5-5');
   });
 
   it('should have updated opus pointing to claude-opus-5', () => {

@@ -28,12 +28,13 @@ export interface DowngradeResult {
 
 export const DEFAULT_DOWNGRADE_MAPPING: Record<string, string> = {
   // Anthropic
-  'claude-opus-5-5': 'claude-sonnet-5',
-  'claude-opus-4-6': 'claude-sonnet-5',
-  'claude-opus-4-8': 'claude-sonnet-5',
+  'claude-opus-5-5': 'claude-sonnet-5-5',
+  'claude-opus-4-6': 'claude-sonnet-5-5',
+  'claude-opus-4-8': 'claude-sonnet-5-5',
   'claude-opus-4-20250514': 'claude-sonnet-4-20250514',
   'claude-opus-4-latest': 'claude-sonnet-4-latest',
   'claude-3-opus-20240229': 'claude-3-5-sonnet-20241022',
+  'claude-sonnet-5-5': 'claude-3-5-haiku-20241022',
   'claude-sonnet-5': 'claude-3-5-haiku-20241022',
   'claude-sonnet-4-6': 'claude-3-5-haiku-20241022',
   'claude-sonnet-4-20250514': 'claude-3-5-haiku-20241022',

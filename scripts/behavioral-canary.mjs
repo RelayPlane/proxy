@@ -226,7 +226,7 @@ async function runChecks(ollamaReachable) {
   // 10. estimate_ungated (validates Part 1 - no Pro gate). No forward needed.
   {
     const r = await req('POST', '/v1/estimate', {
-      body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'How much will this cost?' }] },
+      body: { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'How much will this cost?' }] },
     });
     const cost = r.json?.estimated_cost_usd;
     if (r.status === 402 || r.json?.error === 'upgrade_required') {

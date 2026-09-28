@@ -19,9 +19,14 @@
  *
  * ANTHROPIC
  * Source:   https://platform.claude.com/docs/en/about-claude/pricing
- * Verified: 2026-09-04
+ * Verified: 2026-09-28 (re-verified against claude.com/pricing; only the
+ * claude-opus-5-5 row changed, see note below)
  * Note: Sonnet 5's $2/$10 launch price was made permanent on 2026-08-10;
  * the previously scheduled $3/$15 increase will not occur.
+ * Note: Opus 5.5 (GA 2026-09) lists at $4/$20, cheaper than Opus 5's
+ * $5/$25 - it is a price cut, not a same-price successor like Sonnet 5.5.
+ * Cache reads for Opus 5.5 are the standard 0.1x (verified, not the
+ * Fable-5.1-only 0.025x rate).
  *
  * | model              | input | output | status  |
  * |--------------------|-------|--------|---------|
@@ -29,7 +34,7 @@
  * | claude-mythos-5-1  | 10    | 50     | current |
  * | claude-fable-5     | 10    | 50     | current |
  * | claude-mythos-5    | 10    | 50     | current |
- * | claude-opus-5-5    | 5     | 25     | current |
+ * | claude-opus-5-5    | 4     | 20     | current |
  * | claude-opus-5      | 5     | 25     | current |
  * | claude-opus-4-8    | 5     | 25     | current |
  * | claude-opus-4-7    | 5     | 25     | current |
@@ -37,7 +42,8 @@
  * | claude-opus-4-5    | 5     | 25     | current |
  * | claude-opus-4-1    | 15    | 75     | retired |
  * | claude-opus-4      | 15    | 75     | retired |
- * | claude-sonnet-5    | 2     | 10     | current |
+ * | claude-sonnet-5-5  | 2     | 10     | current |
+ * | claude-sonnet-5    | 2     | 10     | legacy  |
  * | claude-sonnet-4-6  | 3     | 15     | current |
  * | claude-sonnet-4-5  | 3     | 15     | current |
  * | claude-sonnet-4    | 3     | 15     | retired |
@@ -72,14 +78,20 @@ export interface ModelPrice {
   cacheReadMultiplier?: number;
 }
 
-export const PRICING_VERIFIED_ON = '2026-09-04';
+export const PRICING_VERIFIED_ON = '2026-09-28';
 export const ANTHROPIC_PRICING_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing';
 export const OPENAI_PRICING_SOURCE = 'https://openrouter.ai/api/v1/models';
 
 const FRONTIER: ModelPrice = { input: 10.0, output: 50.0 };
 const FRONTIER_5_1: ModelPrice = { input: 10.0, output: 50.0, cacheReadMultiplier: 0.025 };
+// Opus 5.5 is a price cut versus Opus 5, not a same-price successor -
+// verified 2026-09-28 against claude.com/pricing. Do not fold into OPUS.
+const OPUS_5_5: ModelPrice = { input: 4.0, output: 20.0 };
 const OPUS: ModelPrice = { input: 5.0, output: 25.0 };
 const OPUS_LEGACY: ModelPrice = { input: 15.0, output: 75.0 };
+// Sonnet 5.5 (GA 2026-09-28) lists at the same $2/$10 as Sonnet 5; its
+// savings come from speed/token efficiency, not a lower rate. Verified
+// 2026-09-28 against ANTHROPIC_PRICING_SOURCE and claude.com/pricing.
 const SONNET_5: ModelPrice = { input: 2.0, output: 10.0 };
 const SONNET_LEGACY: ModelPrice = { input: 3.0, output: 15.0 };
 const HAIKU_4_5: ModelPrice = { input: 1.0, output: 5.0 };
@@ -94,7 +106,7 @@ export const ANTHROPIC_MODEL_PRICING: Readonly<Record<string, ModelPrice>> = {
   'claude-mythos-5-1': FRONTIER_5_1,
   'claude-fable-5': FRONTIER,
   'claude-mythos-5': FRONTIER,
-  'claude-opus-5-5': OPUS,
+  'claude-opus-5-5': OPUS_5_5,
   'claude-opus-5': OPUS,
   'claude-opus-4-8': OPUS,
   'claude-opus-4-7': OPUS,
@@ -102,6 +114,7 @@ export const ANTHROPIC_MODEL_PRICING: Readonly<Record<string, ModelPrice>> = {
   'claude-opus-4-5': OPUS,
   'claude-opus-4-1': OPUS_LEGACY,
   'claude-opus-4': OPUS_LEGACY,
+  'claude-sonnet-5-5': SONNET_5,
   'claude-sonnet-5': SONNET_5,
   'claude-sonnet-4-6': SONNET_LEGACY,
   'claude-sonnet-4-5': SONNET_LEGACY,
@@ -130,6 +143,7 @@ export const ANTHROPIC_MODEL_ALIASES: Readonly<Record<string, string>> = {
   'claude-opus-4.6': 'claude-opus-4-6',
   'claude-opus-4.5': 'claude-opus-4-5',
   'claude-opus-4.1': 'claude-opus-4-1',
+  'claude-sonnet-5.5': 'claude-sonnet-5-5',
   'claude-sonnet-4.6': 'claude-sonnet-4-6',
   'claude-sonnet-4.5': 'claude-sonnet-4-5',
   'claude-haiku-4.5': 'claude-haiku-4-5',
