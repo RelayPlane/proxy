@@ -68,6 +68,7 @@ import { getKillAudit } from './kill-audit.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
+import { shouldTierFallback, buildTierFallbackChain, resolveTierFallbackConfig, type TierFallbackConfig } from './model-tier-fallback.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
 import { EliteGuardrails, DEFAULT_ELITE_GUARDRAILS, type RouteDecision } from './elite-guardrails.js';
 import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
@@ -1131,6 +1132,18 @@ interface RelayPlaneProxyConfigFile {
    * ```
    */
   crossProviderCascade?: Partial<CrossProviderCascadeConfig>;
+  /**
+   * Same-provider model-tier fallback. When the requested Anthropic model
+   * itself is unavailable (429/503/529) on every pool account, step down to
+   * a lower tier on the SAME provider (same billing, same auth) before
+   * cross-provider cascade is attempted. See model-tier-fallback.ts.
+   *
+   * Example:
+   * ```json
+   * { "tierFallback": { "enabled": true, "triggerStatuses": [429, 503, 529] } }
+   * ```
+   */
+  tierFallback?: Partial<TierFallbackConfig>;
   /**
    * Ollama local model provider configuration.
    *
@@ -7757,6 +7770,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       const cascadeConfig = getCascadeConfig(proxyConfig);
+      const tierFallbackConfig = resolveTierFallbackConfig(proxyConfig.tierFallback);
       let useCascade =
         routingMode === 'auto' &&
         proxyConfig.routing?.mode === 'cascade' &&
@@ -8374,6 +8388,90 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             const errorPayload = (await providerResponse.json()) as Record<string, unknown>;
             if (proxyConfig.reliability?.cooldowns?.enabled) {
               cooldownManager.recordFailure(cooldownKey(targetProvider, ctx.authHeader), JSON.stringify(errorPayload));
+            }
+
+            // ── Same-provider model-tier fallback (2026-09-28 capacity incident) ──
+            // The credential-pool failover above already tried the OTHER account
+            // for this SAME model. If we're still failing, the model tier itself
+            // is unavailable upstream (verified: two independent Anthropic OAuth
+            // accounts both 429 on every non-Haiku model while their own weekly
+            // rate-limit headers show ample headroom - this is not a quota
+            // problem). Step down a tier on the SAME provider (same billing,
+            // same auth) before reaching for a different provider entirely.
+            if (
+              !isStreaming &&
+              targetProvider === 'anthropic' &&
+              shouldTierFallback(providerResponse.status, tierFallbackConfig)
+            ) {
+              const tierChain = buildTierFallbackChain(finalModel, tierFallbackConfig);
+              for (const fbModel of tierChain) {
+                const fbBody: Record<string, unknown> = { ..._nativeReqBody, model: fbModel };
+                const fbElite = isEliteModelName(fbModel);
+                let fbCred = _credentialPool && _credentialPoolTenant
+                  ? _credentialPool.selectCredential(_credentialPoolTenant, { elite: fbElite })
+                  : null;
+                const fbPoolToken = fbCred ? _credentialPool!.resolveToken(fbCred) : undefined;
+                // Prefer a pool/env token (so we can bookkeep + fail over between
+                // accounts); when neither is available (e.g. both accounts in the
+                // pool's own short cooldown), fall back to the client's OWN
+                // credentials rather than skipping the tier - mirrors the
+                // "every account cooled down" resolution used at request start.
+                const fbToken = fbPoolToken || useAnthropicEnvKey || undefined;
+                const fbCtx: RequestContext = fbToken
+                  ? { ...ctx, authHeader: undefined, apiKeyHeader: undefined }
+                  : ctx;
+                if (!fbToken && !hasAnthropicAuth(ctx, undefined)) continue; // nothing to authenticate this hop with
+                let fbResponse = await forwardNativeAnthropicRequest(
+                  fbBody, fbCtx, fbToken, !!fbToken && fbToken.startsWith('sk-ant-oat'), true,
+                );
+                if ((fbResponse.status === 429 || fbResponse.status === 401) && _credentialPool && _credentialPoolTenant && fbCred) {
+                  _credentialPool.recordFailure(fbCred.id, fbResponse.status);
+                  const fbNext = _credentialPool.selectCredential(_credentialPoolTenant, { elite: fbElite });
+                  if (fbNext && fbNext.id !== fbCred.id) {
+                    const fbNextToken = _credentialPool.resolveToken(fbNext);
+                    if (fbNextToken) {
+                      fbResponse = await forwardNativeAnthropicRequest(
+                        fbBody, fbCtx, fbNextToken, fbNextToken.startsWith('sk-ant-oat'), true,
+                      );
+                      fbCred = fbNext;
+                    }
+                  }
+                }
+                if (fbResponse.ok) {
+                  if (_credentialPool && fbCred) _credentialPool.recordSuccess(fbCred.id);
+                  if (proxyConfig.reliability?.cooldowns?.enabled) {
+                    cooldownManager.recordSuccess(cooldownKey('anthropic', ctx.authHeader));
+                  }
+                  const fbData = (await fbResponse.json()) as Record<string, unknown>;
+                  const fbDurationMs = Date.now() - startTime;
+                  logRequest(
+                    originalModel ?? 'unknown',
+                    fbModel,
+                    'anthropic',
+                    fbDurationMs,
+                    true,
+                    `${routingMode}+tier-fallback`,
+                    undefined,
+                    taskType, complexity,
+                  );
+                  const fbRpHeaders = buildRelayPlaneResponseHeaders(
+                    fbModel, originalModel ?? 'unknown', complexity, 'anthropic', `${routingMode}+tier-fallback`,
+                  );
+                  res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'X-RelayPlane-Tier-Fallback-Model': fbModel,
+                    'X-RelayPlane-Tier-Fallback-From': finalModel,
+                    ...fbRpHeaders,
+                  });
+                  res.end(JSON.stringify(fbData));
+                  return;
+                }
+                if (_credentialPool && fbCred && (fbResponse.status === 429 || fbResponse.status === 401)) {
+                  _credentialPool.recordFailure(fbCred.id, fbResponse.status);
+                }
+                // This tier also failed - loop continues to the next (cheaper) tier.
+              }
+              // Every tier exhausted - fall through to cross-provider cascade / error below.
             }
 
             // ── Cross-provider cascade for /v1/messages path (GH #38) ──
