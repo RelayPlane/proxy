@@ -25,8 +25,10 @@ describe('MODEL_PRICING constants', () => {
 
   it('contains Haiku pricing', () => {
     expect(MODEL_PRICING['claude-haiku-4-5']).toBeDefined();
-    expect(MODEL_PRICING['claude-haiku-4-5']!.inputPer1M).toBe(0.80);
-    expect(MODEL_PRICING['claude-haiku-4-5']!.outputPer1M).toBe(4.00);
+    // Haiku 4.5 lists at $1/$5 (the old $0.80/$4 was Haiku 3.5's price).
+    expect(MODEL_PRICING['claude-haiku-4-5']!.inputPer1M).toBe(1.00);
+    expect(MODEL_PRICING['claude-haiku-4-5']!.outputPer1M).toBe(5.00);
+    expect(MODEL_PRICING['claude-haiku-4-5-20251001']!.inputPer1M).toBe(1.00);
   });
 
   it('Opus 4.6 is cheaper than old claude-3-opus', () => {
@@ -46,9 +48,9 @@ describe('estimateCostFromTokens', () => {
   });
 
   it('computes cost for Haiku', () => {
-    // 100k input + 50k output at $0.80/$4.00
+    // 100k input + 50k output at $1.00/$5.00
     const cost = estimateCostFromTokens('claude-haiku-4-5', 100_000, 50_000);
-    expect(cost).toBeCloseTo(0.08 + 0.20, 5); // 0.28
+    expect(cost).toBeCloseTo(0.10 + 0.25, 5); // 0.35
   });
 
   it('returns 0 for unknown model', () => {
@@ -62,7 +64,7 @@ describe('estimateCostFromTokens', () => {
 
 // ─── BudgetTracker (memory-only, no SQLite) ──────────────────────────
 
-describe('BudgetTracker — unlimited (no cap)', () => {
+describe('BudgetTracker, unlimited (no cap)', () => {
   let tracker: BudgetTracker;
 
   beforeEach(() => {
@@ -94,11 +96,11 @@ describe('BudgetTracker — unlimited (no cap)', () => {
   });
 });
 
-describe('BudgetTracker — with dailyCapUSD', () => {
+describe('BudgetTracker, with dailyCapUSD', () => {
   let tracker: BudgetTracker;
 
   beforeEach(() => {
-    // Don't init() — skip SQLite, use memory-only
+    // Don't init(), skip SQLite, use memory-only
     tracker = new BudgetTracker({ dailyCapUSD: 10.00, warningThreshold: 0.8 });
   });
 
@@ -156,7 +158,7 @@ describe('BudgetTracker — with dailyCapUSD', () => {
   });
 });
 
-describe('BudgetTracker — updateConfig', () => {
+describe('BudgetTracker, updateConfig', () => {
   let tracker: BudgetTracker;
 
   beforeEach(() => {

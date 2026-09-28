@@ -2768,7 +2768,7 @@ async function handlePolicyCommand(subArgs: string[]): Promise<void> {
 
     for (const [fp, entry] of Object.entries(registry)) {
       const avgCost = entry.totalRequests > 0 ? entry.totalCost / entry.totalRequests : 0;
-      const preferred = avgCost > 0.01 ? 'anthropic/claude-sonnet-4-6' : 'cheapest-capable';
+      const preferred = avgCost > 0.01 ? 'anthropic/claude-sonnet-5-5' : 'cheapest-capable';
       agents[entry.name] = {
         fingerprint: fp,
         preferred,

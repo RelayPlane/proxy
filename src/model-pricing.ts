@@ -133,6 +133,7 @@ export const ANTHROPIC_MODEL_ALIASES: Readonly<Record<string, string>> = {
   'claude-opus-4-latest': 'claude-opus-4',
   'claude-sonnet-4-20250514': 'claude-sonnet-4',
   'claude-sonnet-4-latest': 'claude-sonnet-4',
+  'claude-haiku-4-5-20251001': 'claude-haiku-4-5',
   'claude-3-5-haiku-20241022': 'claude-3-5-haiku',
   'claude-3-5-haiku-latest': 'claude-3-5-haiku',
   'claude-fable-5.1': 'claude-fable-5-1',

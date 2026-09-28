@@ -38,11 +38,11 @@ export const BUILT_IN_MODEL_MAPPING: Record<string, Record<string, Record<string
   anthropic: {
     openrouter: {
       // Current tier models (2026): keep quality tier comparable on the hop.
-      'claude-opus-5-5':           'anthropic/claude-opus-4-8',
+      'claude-opus-5-5':           'anthropic/claude-opus-5.5',
       'claude-opus-5':             'anthropic/claude-opus-4-8',
       'claude-sonnet-5-5':         'anthropic/claude-sonnet-5.5',
       'claude-sonnet-5':           'anthropic/claude-sonnet-5',
-      'claude-fable-5-1':          'anthropic/claude-opus-4-8',
+      'claude-fable-5-1':          'anthropic/claude-fable-5.1',
       'claude-opus-4-8':           'anthropic/claude-opus-4-8',
       // Legacy names retained for older configs.
       'claude-opus-4-6':           'anthropic/claude-opus-4-6',

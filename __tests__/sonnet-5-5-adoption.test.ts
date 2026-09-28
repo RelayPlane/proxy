@@ -25,7 +25,7 @@ describe('Sonnet 5.5 adoption: downgrade map', () => {
   });
 
   it('claude-sonnet-5-5 has its own downgrade entry to haiku', () => {
-    expect(DEFAULT_DOWNGRADE_MAPPING['claude-sonnet-5-5']).toBe('claude-3-5-haiku-20241022');
+    expect(DEFAULT_DOWNGRADE_MAPPING['claude-sonnet-5-5']).toBe('claude-haiku-4-5-20251001');
   });
 
   it('preserves back-compat entries for claude-sonnet-5 and claude-sonnet-4-6', () => {

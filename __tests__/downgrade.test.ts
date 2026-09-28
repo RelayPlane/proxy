@@ -37,7 +37,7 @@ describe('Auto-Downgrade', () => {
     it('downgrades sonnet to haiku', () => {
       const result = checkDowngrade('claude-sonnet-4-6', 90, config);
       expect(result.downgraded).toBe(true);
-      expect(result.newModel).toBe('claude-3-5-haiku-20241022');
+      expect(result.newModel).toBe('claude-haiku-4-5-20251001');
     });
 
     it('downgrades gpt-4o to gpt-4o-mini', () => {

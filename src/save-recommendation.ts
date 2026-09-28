@@ -74,10 +74,10 @@ export function toYamlPatch(rec: SaveRecommendation): string {
   const weeklySavings = (rec.estimatedDailySavings * 7).toFixed(2);
   return (
     `routing:\n` +
-    `  default_model: claude-sonnet-4-5\n` +
+    `  default_model: claude-sonnet-5-5\n` +
     `  routing_mode: complexity\n` +
     `  # Estimated weekly savings: $${weeklySavings}\n` +
-    `  # Safe — last ${rec.windowSize} Opus requests classified simple/moderate ` +
+    `  # Safe: last ${rec.windowSize} Opus requests classified simple/moderate ` +
     `(avg complexity ${rec.avgComplexityScore.toFixed(2)})\n`
   );
 }

@@ -370,6 +370,7 @@ export const MODEL_MAPPING: Record<string, { provider: Provider; model: string }
   'claude-3-5-sonnet': { provider: 'anthropic', model: 'claude-3-5-sonnet-latest' },
   'claude-3-5-haiku': { provider: 'anthropic', model: 'claude-haiku-4-5' },
   'claude-haiku-4-5': { provider: 'anthropic', model: 'claude-haiku-4-5' },
+  'claude-haiku-4-5-20251001': { provider: 'anthropic', model: 'claude-haiku-4-5-20251001' },
   haiku: { provider: 'anthropic', model: 'claude-haiku-4-5' },
   sonnet: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
   opus: { provider: 'anthropic', model: 'claude-opus-5-5' },
@@ -661,6 +662,8 @@ interface ComplexityConfig {
   moderate?: string | { provider: string; model: string };
   complex?: string | { provider: string; model: string };
   elite?: string | { provider: string; model: string };
+  /** Content score at or above which a request routes to elite. Default DEFAULT_ELITE_THRESHOLD. */
+  eliteThreshold?: number;
 }
 
 /**
@@ -717,7 +720,7 @@ interface ComplexityTiers {
 // the direct successor to Opus 4.8 at the same $5/$25 price.
 export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
   anthropic: {
-    simple:   { provider: 'anthropic', model: 'claude-haiku-4-5' },
+    simple:   { provider: 'anthropic', model: 'claude-haiku-4-5-20251001' },
     moderate: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
     // complex is Opus 5.5, the flagship agentic-coding model;
     // resolveComplexityTier also resolves the elite auto-upgrade path to it.
@@ -753,7 +756,7 @@ export const PROVIDER_COMPLEXITY_TIERS: Record<string, ComplexityTiers> = {
     simple:   { provider: 'openrouter', model: 'google/gemini-2.5-flash-lite' },
     moderate: { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
     complex:  { provider: 'openrouter', model: 'anthropic/claude-sonnet-5.5' },
-    elite:    { provider: 'openrouter', model: 'anthropic/claude-opus-5-5' },
+    elite:    { provider: 'openrouter', model: 'anthropic/claude-fable-5.1' },
   },
 };
 
@@ -840,7 +843,7 @@ export function resolveFirstRunComplexityTiers(
   const hasRegularApiKey = !!envAnthropicKey && envAnthropicKey.startsWith('sk-ant-api');
   if (availableProviders.includes('anthropic') && hasRegularApiKey) {
     // Full Anthropic API key: Haiku is available, use the 4-tier ladder.
-    return { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
+    return { simple: 'claude-haiku-4-5-20251001', moderate: 'claude-sonnet-5-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
   }
   if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
     const t = buildDefaultComplexityTiers(availableProviders);
@@ -1547,7 +1550,7 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     cascade: {
       enabled: true,
       models: [
-        'claude-sonnet-4-6',
+        'claude-sonnet-5-5',
         'claude-opus-5-5',
       ],
       escalateOn: 'uncertainty',
@@ -1555,8 +1558,8 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     },
     complexity: {
       enabled: true,
-      simple: 'claude-sonnet-4-6',
-      moderate: 'claude-sonnet-4-6',
+      simple: 'claude-sonnet-5-5',
+      moderate: 'claude-sonnet-5-5',
       complex: 'claude-opus-5-5',
     },
   },
@@ -1870,17 +1873,13 @@ function extractMessageText(messages: Array<{ content?: unknown } | null | undef
     .join(' ');
 }
 
-export function classifyComplexity(messages: Array<{ role?: string; content?: unknown }>): Complexity {
-  // Only classify based on the last user message, not system prompts or conversation history.
-  // System prompts (AGENTS.md, SOUL.md, etc.) are always huge for agent workloads and would
-  // cause everything to be classified as "complex".
-  const userMessages = messages.filter((m) => m.role === 'user');
-  const lastUserMessage = userMessages.length > 0 ? [userMessages[userMessages.length - 1]] : messages;
-  const text = extractMessageText(lastUserMessage).toLowerCase();
-  const tokens = Math.ceil(text.length / 4);
-  
+/**
+ * Content signals of a request, scored on the request text only (no size).
+ * Each signal is presence-based, so a long prompt cannot score higher than a
+ * short one that asks for the same kind of work.
+ */
+function contentSignalScore(text: string): number {
   let score = 0;
-  
   // Code indicators
   if (/```/.test(text) || /function |class |const |let |import /.test(text)) score += 2;
   // Analytical tasks
@@ -1897,48 +1896,123 @@ export function classifyComplexity(messages: Array<{ role?: string; content?: un
   if (/implement|refactor|debug|optimize|migrate/.test(text)) score += 2;
   // Planning/strategy
   if (/strategy|roadmap|plan for|how (would|should|can) (we|i|you)/.test(text)) score += 1;
+  return score;
+}
+
+/**
+ * Multiple concepts/requirements. Counts "and"s, which grows with prompt
+ * length, so it only feeds the size-aware score, never the elite decision.
+ */
+function conjunctionScore(text: string): number {
+  const andCount = (text.match(/\band\b/g) || []).length;
+  let score = 0;
+  if (andCount >= 3) score += 1;
+  if (andCount >= 5) score += 1;
+  return score;
+}
+
+/**
+ * Agent harnesses inject ambient context into the user turn as
+ * <system-reminder> blocks (Claude Code puts CLAUDE.md, memory, skill and
+ * agent listings there). That text is the same on every turn of every session
+ * and says nothing about how hard THIS request is, so it is removed before
+ * the content-only elite score is computed.
+ */
+const SYSTEM_REMINDER_RE = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+export function stripAmbientContext(text: string): string {
+  return text.replace(SYSTEM_REMINDER_RE, ' ');
+}
+
+/**
+ * Harness context-compaction turns (Claude Code's auto-compact prompt) are a
+ * fixed ~6K-char summarization template full of words like "analyze", "code"
+ * and "architectural". The work is summarizing the session, never elite work,
+ * and it fires on every long session, so it gets no elite content score.
+ */
+const COMPACTION_MARKERS = [
+  'your task is to create a detailed summary of the conversation so far',
+];
+
+export function isContextCompactionRequest(text: string): boolean {
+  const lower = text.toLowerCase();
+  return COMPACTION_MARKERS.some((m) => lower.includes(m));
+}
+
+/**
+ * Default content score a request must reach to route to the elite tier
+ * (Fable). Calibrated 2026-09-28 by replaying 7 days of real proxy traffic
+ * (Claude Code pipeline + interactive sessions) through the content-only
+ * score: this value lands about 2-3% of requests on elite, down from 6% of
+ * requests (35% of spend) when session length could push a turn to Fable.
+ * Override with routing.complexity.eliteThreshold.
+ */
+export const DEFAULT_ELITE_THRESHOLD = 9;
+
+export interface ComplexityScore {
+  /** Content-only score of the last user message, ambient context stripped. Decides elite. */
+  content: number;
+  /** Size-aware score (content signals + last-message size + session size). Decides simple/moderate/complex. */
+  total: number;
+}
+
+export function scoreComplexity(messages: Array<{ role?: string; content?: unknown }>): ComplexityScore {
+  // Only classify based on the last user message, not system prompts or conversation history.
+  // System prompts (AGENTS.md, SOUL.md, etc.) are always huge for agent workloads and would
+  // cause everything to be classified as "complex".
+  const userMessages = messages.filter((m) => m.role === 'user');
+  const lastUserMessage = userMessages.length > 0 ? [userMessages[userMessages.length - 1]] : messages;
+  const text = extractMessageText(lastUserMessage).toLowerCase();
+  const tokens = Math.ceil(text.length / 4);
+
+  let score = contentSignalScore(text);
   // Token-based scaling (large context = likely complex)
   if (tokens > 500) score += 1;
   if (tokens > 2000) score += 2;
   if (tokens > 5000) score += 2;
-  // Multiple concepts/requirements
-  const andCount = (text.match(/\band\b/g) || []).length;
-  if (andCount >= 3) score += 1;
-  if (andCount >= 5) score += 1;
+  score += conjunctionScore(text);
 
-  // Whole-conversation size is a WEAK, capped signal - never a dominant one.
-  //
-  // Earlier this added up to +7 (a +5 "context floor" for >100K tokens plus a
-  // +2 message-count bonus), on the theory that agent requests have a tiny last
-  // message but real complexity hidden in a huge context. That was backwards:
-  // for agent workloads (OpenClaw, Claude Code, aider) the 100K+ context and
-  // long history are AMBIENT - the repo, files, and prior turns - not a measure
-  // of how hard THIS request is. That floor pushed nearly every agent request to
-  // complex/elite regardless of the actual task, defeating per-task routing and
-  // over-spending on Opus/Fable. Keep it as a small nudge (max +3) so the
-  // last-user-message content above decides the tier, while still leaning
-  // borderline turns in a genuinely large working session toward the premium
-  // model for quality. A genuinely large one-shot prompt is still caught by the
-  // last-message token scaling above.
+  // Whole-conversation size is a WEAK, capped signal (max +3) for the
+  // simple/moderate/complex split only. For agent workloads (OpenClaw, Claude
+  // Code, aider) the 100K+ context and long history are AMBIENT, not a measure
+  // of how hard THIS request is. 2026-09-28: size (session length, message
+  // count, last-message length) no longer feeds the elite decision at all;
+  // it pushed long Claude Code sessions to Fable on length alone.
   const allText = extractMessageText(messages);
   const totalTokens = Math.ceil(allText.length / 4);
   let ambient = 0;
   if (totalTokens > 100000) ambient += 2;       // very large context
   else if (totalTokens > 50000) ambient += 1;   // large context
   if (messages.length > 20) ambient += 1;       // long session
-  // 2026-07-06 merge fix: ambient was computed but never folded into score,
-  // so the "small nudge" this comment describes had been a no-op since
-  // 2026-07-02. Apply it before the elite check below can use it.
   score += ambient;
-  // Elite threshold is 16 (not 12): calibration against live pipeline traffic
-  // showed a sharply bimodal score distribution - routine agent turns at 1-2 and
-  // genuinely-dense task prompts at 13-24 with an empty gap. At 12 the borderline
-  // prompts (score ~13) were promoted to Fable; 16 reserves Fable for the clearly
-  // hardest cluster (~7% of pipeline traffic), routing the rest to Opus.
-  if (score >= 16) return 'elite';
-  if (score >= 4) return 'complex';
-  if (score >= 2) return 'moderate';
+
+  const content = isContextCompactionRequest(text) ? 0 : contentSignalScore(stripAmbientContext(text));
+  return { content, total: score };
+}
+
+export function classifyComplexity(
+  messages: Array<{ role?: string; content?: unknown }>,
+  opts?: { eliteThreshold?: number },
+): Complexity {
+  const { content, total } = scoreComplexity(messages);
+  const eliteThreshold = resolveEliteThreshold(opts?.eliteThreshold);
+  // Elite (Fable) is decided by what the request asks for, never by size.
+  if (content >= eliteThreshold) return 'elite';
+  // A size-aware score that used to reach elite now tops out at complex (Opus).
+  if (total >= 4) return 'complex';
+  if (total >= 2) return 'moderate';
   return 'simple';
+}
+
+/** A usable threshold is a finite positive number; anything else falls back to the calibrated default. */
+export function resolveEliteThreshold(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_ELITE_THRESHOLD;
+}
+
+/** routing.complexity.eliteThreshold from the proxy config, or the calibrated default. */
+export function getEliteThreshold(config: { routing?: { complexity?: unknown } } | null | undefined): number {
+  const complexity = config?.routing?.complexity as { eliteThreshold?: unknown } | undefined;
+  return resolveEliteThreshold(complexity?.eliteThreshold);
 }
 
 /**
@@ -3823,7 +3897,7 @@ function getCascadeConfig(config: RelayPlaneProxyConfigFile): CascadeConfig {
   const c = config.routing?.cascade;
   return {
     enabled: c?.enabled ?? true,
-    models: c?.models ?? ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-5-5'],
+    models: c?.models ?? ['claude-haiku-4-5-20251001', 'claude-sonnet-5-5', 'claude-opus-5-5'],
     escalateOn: c?.escalateOn ?? 'uncertainty',
     maxEscalations: c?.maxEscalations ?? 1,
   };
@@ -3877,7 +3951,7 @@ export function getQualityModel(config: RelayPlaneProxyConfigFile): string {
     nonAnthropicAliasFallback('rp:best') ||
     config.routing?.cascade?.models?.[config.routing?.cascade?.models?.length ? config.routing.cascade.models.length - 1 : 0] ||
     process.env['RELAYPLANE_QUALITY_MODEL'] ||
-    'claude-sonnet-4-6'
+    'claude-sonnet-5-5'
   );
 }
 
@@ -5033,7 +5107,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         if (availableProviders.includes('anthropic') && hasRegularApiKey) {
           // Full Anthropic API key - enable haiku 4-tier routing
           console.log('[RelayPlane] Auto-config: ANTHROPIC_API_KEY detected - enabling 4-tier routing (haiku/sonnet/opus/fable-elite)');
-          autoComplexity = { simple: 'claude-haiku-4-5', moderate: 'claude-sonnet-5-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
+          autoComplexity = { simple: 'claude-haiku-4-5-20251001', moderate: 'claude-sonnet-5-5', complex: 'claude-opus-5-5', elite: 'claude-fable-5-1' };
         } else if (availableProviders.length > 0 && !availableProviders.includes('anthropic')) {
           // Non-Anthropic provider - use detected provider's tiers
           const providerTiers = buildDefaultComplexityTiers(availableProviders);
@@ -7569,7 +7643,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // served a simple-tier cached answer if classification ever diverges from
       // the raw body hash (e.g. Jev vs heuristic, or a future tier-aware key).
       const nativeCacheComplexityTag: Complexity | undefined =
-        jevComplexity ?? (nativeMessagesForJev.length > 0 ? classifyComplexity(nativeMessagesForJev) : undefined);
+        jevComplexity ?? (nativeMessagesForJev.length > 0 ? classifyComplexity(nativeMessagesForJev, { eliteThreshold: getEliteThreshold(proxyConfig) }) : undefined);
 
       // ── Response Cache: check for cached response ──
       const cacheBypass = responseCache.shouldBypass(requestBody);
@@ -7632,7 +7706,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         confidence = getInferenceConfidence(promptText, taskType);
         // Jev tier (key-gated) takes precedence when present; otherwise the
         // free heuristic decides, exactly as before.
-        complexity = jevComplexity ?? classifyComplexity(messages);
+        complexity = jevComplexity ?? classifyComplexity(messages, { eliteThreshold: getEliteThreshold(proxyConfig) });
         log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
       }
 
@@ -8809,7 +8883,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // Trap (a): fold the CHOSEN complexity tier (Jev or heuristic) into the cache
     // identity so a complex request can never be served a simple-tier cached answer.
     const chatCacheComplexityTag: Complexity | undefined =
-      jevComplexityChat ?? (chatMessagesForJev.length > 0 ? classifyComplexity(chatMessagesForJev) : undefined);
+      jevComplexityChat ?? (chatMessagesForJev.length > 0 ? classifyComplexity(chatMessagesForJev, { eliteThreshold: getEliteThreshold(proxyConfig) }) : undefined);
 
     // ── Response Cache: check for cached response (chat/completions) ──
     const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
@@ -8978,7 +9052,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       confidence = getInferenceConfidence(promptText, taskType);
       // Jev tier (key-gated) takes precedence when present; otherwise the free
       // heuristic decides, exactly as before.
-      complexity = jevComplexityChat ?? classifyComplexity(request.messages);
+      complexity = jevComplexityChat ?? classifyComplexity(request.messages, { eliteThreshold: getEliteThreshold(proxyConfig) });
       log(`Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`);
     }
 

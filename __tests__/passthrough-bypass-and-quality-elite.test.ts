@@ -288,6 +288,6 @@ describe('getQualityModel (BUG 2: :quality suffix must reach elite tier)', () =>
 
   it('with nothing configured, falls back to the hardcoded default', () => {
     const config = {} as any;
-    expect(getQualityModel(config)).toBe('claude-sonnet-4-6');
+    expect(getQualityModel(config)).toBe('claude-sonnet-5-5');
   });
 });
