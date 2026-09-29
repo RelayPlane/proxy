@@ -33,6 +33,9 @@
  * @packageDocumentation
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 /** Statuses that indicate the requested tier itself is unavailable upstream. */
 export const DEFAULT_TIER_FALLBACK_TRIGGER_STATUSES = [429, 503, 529];
 
@@ -106,4 +109,66 @@ export function buildTierFallbackChain(
     current = next;
   }
   return chain;
+}
+
+// ── Make silent downgrades loud (2026-09-29) ──────────────────────────────
+// A tier fallback answers 200, so a caller that asked for Sonnet/Opus and got
+// Haiku never notices. Every fallback is warned on stderr and appended to a
+// JSONL events file that the ops health check (clawd system-status-report.py,
+// surfaced on Mission Control /system) reads.
+
+/** One line of ~/.relayplane/tier-fallback-events.jsonl. */
+export interface TierFallbackEvent {
+  ts: string;
+  /** The model that failed upstream (the tier we stepped down from). */
+  requested_model: string;
+  /** The model that actually answered, or null when every tier was exhausted. */
+  served_model: string | null;
+  /** The model the client originally asked for. */
+  original_model: string;
+  upstream_status: number;
+  agent: string | null;
+  run_id: string | null;
+  agent_label: string | null;
+  user_agent: string | null;
+  port: number | null;
+  /** Present and true only when every tier in the chain failed. */
+  exhausted?: boolean;
+}
+
+export interface RecordTierFallbackOptions {
+  filePath: string;
+  warn?: (msg: string) => void;
+  append?: (file: string, data: string) => void;
+}
+
+/** Path of the tier-fallback events file inside a RelayPlane state dir. */
+export function tierFallbackEventsPath(dir: string): string {
+  return path.join(dir, 'tier-fallback-events.jsonl');
+}
+
+/** Warn loudly and append the event as one JSONL line. Never throws. */
+export function recordTierFallback(event: TierFallbackEvent, opts: RecordTierFallbackOptions): void {
+  const warn = opts.warn ?? ((msg: string) => console.warn(msg));
+  const append = opts.append ?? ((file: string, data: string) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, data);
+  });
+  const clean = (v: string | null | undefined): string =>
+    (v == null || v === '' ? 'unknown' : String(v)).replace(/[\r\n]+/g, ' ');
+  const outcome = event.served_model
+    ? `${event.requested_model} -> ${event.served_model}`
+    : `${event.requested_model} -> (all tiers exhausted)`;
+  warn(
+    `[RelayPlane] WARNING tier-fallback: ${outcome} ` +
+    `(original=${clean(event.original_model)}, upstream_status=${event.upstream_status}, ` +
+    `agent=${clean(event.agent)}, run=${clean(event.run_id)}, ` +
+    `user_agent=${clean(event.user_agent)}, port=${event.port ?? 'unknown'}). ` +
+    `The caller did not get the model it asked for.`,
+  );
+  try {
+    append(opts.filePath, JSON.stringify(event) + '\n');
+  } catch (err) {
+    warn(`[RelayPlane] WARNING tier-fallback: could not append event to ${opts.filePath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }

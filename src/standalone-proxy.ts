@@ -68,7 +68,7 @@ import { getKillAudit } from './kill-audit.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
 import { checkDowngrade, applyDowngradeHeaders, type DowngradeConfig, DEFAULT_DOWNGRADE_CONFIG } from './downgrade.js';
-import { shouldTierFallback, buildTierFallbackChain, resolveTierFallbackConfig, type TierFallbackConfig } from './model-tier-fallback.js';
+import { shouldTierFallback, buildTierFallbackChain, resolveTierFallbackConfig, recordTierFallback, tierFallbackEventsPath, type TierFallbackConfig, type TierFallbackEvent } from './model-tier-fallback.js';
 import { loadAgentRegistry, flushAgentRegistry, trackAgent, extractSystemPromptFromBody, renameAgent, getAgentRegistry, getAgentSummaries, updateAgentCost } from './agent-tracker.js';
 import { EliteGuardrails, DEFAULT_ELITE_GUARDRAILS, type RouteDecision } from './elite-guardrails.js';
 import { appendRoutingLog, getRoutingLog, initRoutingLog, flushRoutingLog } from './routing-log.js';
@@ -8404,6 +8404,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
               shouldTierFallback(providerResponse.status, tierFallbackConfig)
             ) {
               const tierChain = buildTierFallbackChain(finalModel, tierFallbackConfig);
+              // Loud by design: a fallback answers 200, so without this a caller
+              // that asked for Sonnet/Opus silently gets Haiku (2026-09-29).
+              const tierUpstreamStatus = providerResponse.status;
+              const tierEvent = (servedModel: string | null): TierFallbackEvent => ({
+                ts: new Date().toISOString(),
+                requested_model: finalModel,
+                served_model: servedModel,
+                original_model: originalModel ?? 'unknown',
+                upstream_status: tierUpstreamStatus,
+                agent: nativeExplicitAgentId ?? null,
+                run_id: nativeRunCtx?.runId ?? null,
+                agent_label: nativeRunCtx?.agentLabel ?? null,
+                user_agent: ctx.userAgent ?? null,
+                port: typeof port === 'number' ? port : null,
+                ...(servedModel === null ? { exhausted: true } : {}),
+              });
+              const tierEventsFile = tierFallbackEventsPath(getRelayplaneDir());
               for (const fbModel of tierChain) {
                 const fbBody: Record<string, unknown> = { ..._nativeReqBody, model: fbModel };
                 const fbElite = isEliteModelName(fbModel);
@@ -8457,10 +8474,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                   const fbRpHeaders = buildRelayPlaneResponseHeaders(
                     fbModel, originalModel ?? 'unknown', complexity, 'anthropic', `${routingMode}+tier-fallback`,
                   );
+                  recordTierFallback(tierEvent(fbModel), { filePath: tierEventsFile });
                   res.writeHead(200, {
                     'Content-Type': 'application/json',
                     'X-RelayPlane-Tier-Fallback-Model': fbModel,
                     'X-RelayPlane-Tier-Fallback-From': finalModel,
+                    'X-RelayPlane-Tier-Fallback-Warning': `requested ${finalModel} was unavailable upstream (HTTP ${tierUpstreamStatus}); served by ${fbModel}`,
                     ...fbRpHeaders,
                   });
                   res.end(JSON.stringify(fbData));
@@ -8472,6 +8491,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
                 // This tier also failed - loop continues to the next (cheaper) tier.
               }
               // Every tier exhausted - fall through to cross-provider cascade / error below.
+              if (tierChain.length > 0) {
+                recordTierFallback(tierEvent(null), { filePath: tierEventsFile });
+              }
             }
 
             // ── Cross-provider cascade for /v1/messages path (GH #38) ──
