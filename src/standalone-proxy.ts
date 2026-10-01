@@ -64,6 +64,7 @@ import {
   type CascadeHop,
 } from './cross-provider-cascade.js';
 import { getBudgetManager, getBudgetTracker, type BudgetConfig, type SessionBudgetCheckResult } from './budget.js';
+import { reserveOutputTokens, type OutputLimitFields } from './budget-reservations.js';
 import { getKillAudit } from './kill-audit.js';
 import { getAnomalyDetector, type AnomalyConfig } from './anomaly.js';
 import { getAlertManager, type AlertsConfig } from './alerts.js';
@@ -94,6 +95,7 @@ import { getSessionId, upsertSession, getSessions, getActiveSessions } from './s
 import { TraceWriter, sha256Hex, defaultTracesConfig } from './trace-writer.js';
 import {
   runCtx, newRunRequestContext, attachRunIdentity, setRunTraceId, stampRunFields, recordRunRequest,
+  addBudgetHold, releaseBudgetHolds,
   checkRunCap, withRunHeaders, endRun, registerRun, configureRunAttribution, startRunAttributionTimers,
   stopRunAttributionTimers, RUN_REQUEST_HEADERS, RUN_RESPONSE_HEADERS, DEFAULT_ATTRIBUTION_CONFIG,
   getAttributionConfig, isRateLimitWave, suggestedBands, LABEL_STATS_WINDOW_DAYS,
@@ -5395,16 +5397,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
    * If the request should be blocked, returns { blocked: true }.
    */
   /**
-   * Best-effort cost of the request about to be forwarded: prompt text at
-   * the target model's input price, zero output. Used so a cap blocks the
-   * request that would cross it instead of the one after (install test
-   * 2026-09-04 row 3g: the first request after enabling was let through).
+   * What admission reserves against every cap for a request: prompt tokens at
+   * the input price plus the output it may generate (its max_tokens, clamped,
+   * see budget-reservations.ts) at the output price. Reserving output too is
+   * what makes concurrent admission exact: an input-only estimate is a few
+   * percent of a typical call, so a burst could reserve its way far past a cap.
    */
-  function projectedRequestCost(model: string, promptText: string): number {
+  function reservationCost(model: string, promptText: string, body: OutputLimitFields | null | undefined): number {
     const inputTokens = Math.ceil((promptText?.length ?? 0) / 4);
-    if (inputTokens <= 0) return 0;
+    const outputTokens = reserveOutputTokens(body);
     try {
-      return estimateCost(model, inputTokens, 0);
+      const cost = estimateCost(model, inputTokens, outputTokens);
+      return Number.isFinite(cost) && cost > 0 ? cost : 0;
     } catch {
       return 0;
     }
@@ -5491,6 +5495,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     if (trackerResult.warn && trackerResult.cap !== null) {
       headers['x-relayplane-budget-warning'] =
         `${((trackerResult.spent / trackerResult.cap) * 100).toFixed(1)}% of daily cap $${trackerResult.cap}`;
+    }
+
+    // Admitted: reserve the estimate against the daily/hourly budget and the
+    // daily cap in this same synchronous step (no await since the checks), so
+    // a concurrent request sees this one's spend before it is recorded.
+    const reserveUsd = Math.max(0, projectedCost ?? 0);
+    if (reserveUsd > 0) {
+      const rc = runCtx.getStore();
+      addBudgetHold(rc, budgetManager.reserveSpend(reserveUsd));
+      addBudgetHold(rc, budgetTracker.reserve(reserveUsd));
     }
 
     return { blocked: false, model: finalModel, headers, downgraded };
@@ -5586,7 +5600,18 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     log(`Cleared ${clearedCount} default routing rules (complexity config takes priority)`);
   }
 
-  const server = http.createServer((req, res) => runCtx.run(newRunRequestContext(req), async () => {
+  // Budget reservations taken during admission are released when the handler
+  // settles: by then the request's actual cost has been recorded (success), or
+  // it never will be (upstream error, client disconnect, timeout, early return).
+  const releasingBudgetHolds = (handler: () => Promise<void>) => async (): Promise<void> => {
+    try {
+      await handler();
+    } finally {
+      releaseBudgetHolds(runCtx.getStore());
+    }
+  };
+
+  const server = http.createServer((req, res) => runCtx.run(newRunRequestContext(req), releasingBudgetHolds(async () => {
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
@@ -7972,7 +7997,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // ── Budget check + auto-downgrade ──
       const budgetExtraHeaders: Record<string, string> = {};
       {
-        const nativeProjectedCost = projectedRequestCost(targetModel || requestedModel, promptText);
+        const nativeProjectedCost = reservationCost(targetModel || requestedModel, promptText, requestBody);
         const budgetCheck = preRequestBudgetCheck(targetModel || requestedModel, undefined, nativeProjectedCost);
         if (budgetCheck.blocked) {
           recordCapKill(nativeSessionId, nativeExplicitAgentId ?? nativeAgentFingerprint, nativeProjectedCost);
@@ -7996,7 +8021,12 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       // ── Session budget check (only when X-Claude-Code-Session-Id is present) ──
       let nativeSessionBudgetResult: SessionBudgetCheckResult | null = null;
       if (nativeSessionSource === 'claude-code') {
-        nativeSessionBudgetResult = budgetManager.checkSessionBudget(nativeSessionId, targetModel || requestedModel);
+        const nativeSessionReserve = reservationCost(targetModel || requestedModel, promptText, requestBody);
+        nativeSessionBudgetResult = budgetManager.checkSessionBudget(nativeSessionId, targetModel || requestedModel, nativeSessionReserve);
+        if (nativeSessionBudgetResult.allowed) {
+          // Same synchronous step as the check: in-flight session spend is visible to the next request.
+          addBudgetHold(runCtx.getStore(), budgetManager.reserveSession(nativeSessionId, nativeSessionReserve));
+        }
         if (!nativeSessionBudgetResult.allowed) {
           res.writeHead(429, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -8050,7 +8080,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       {
         const rc = runCtx.getStore();
         if (rc?.runId) {
-          const runProjected = projectedRequestCost(targetModel || requestedModel, promptText);
+          const runProjected = reservationCost(targetModel || requestedModel, promptText, requestBody);
           const capCheck = checkRunCap(rc, runProjected);
           if (capCheck.blocked) {
             recordCapKill(nativeSessionId, nativeExplicitAgentId ?? nativeAgentFingerprint, runProjected, rc.runId);
@@ -8994,7 +9024,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     );
 
     // Extract agent fingerprint for chat/completions
-    const chatSystemPrompt = extractSystemPromptFromBody(request as unknown as Record<string, unknown>);
+    const chatSystemPrompt = extractSystemPromptFromBody(request);
     const chatExplicitAgentId = getHeaderValue(req, 'x-relayplane-agent') || undefined;
     let chatAgentFingerprint: string | undefined;
     if (chatSystemPrompt) {
@@ -9054,10 +9084,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       jevComplexityChat ?? (chatMessagesForJev.length > 0 ? classifyComplexity(chatMessagesForJev, { eliteThreshold: getEliteThreshold(proxyConfig) }) : undefined);
 
     // ── Response Cache: check for cached response (chat/completions) ──
-    const chatCacheBypass = responseCache.shouldBypass(request as unknown as Record<string, unknown>);
+    const chatCacheBypass = responseCache.shouldBypass(request);
     let chatCacheHash: string | undefined;
     if (!chatCacheBypass) {
-      chatCacheHash = responseCache.computeKey(request as unknown as Record<string, unknown>, chatCacheComplexityTag);
+      chatCacheHash = responseCache.computeKey(request, chatCacheComplexityTag);
       const chatCached = responseCache.get(chatCacheHash);
       if (chatCached) {
         try {
@@ -9464,7 +9494,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     // response writers below can attach them.
     const chatBudgetExtraHeaders: Record<string, string> = {};
     {
-      const chatProjectedCost = projectedRequestCost(targetModel, promptText);
+      const chatProjectedCost = reservationCost(targetModel, promptText, request);
       const chatBudgetCheck = preRequestBudgetCheck(targetModel, undefined, chatProjectedCost);
       if (chatBudgetCheck.blocked) {
         recordCapKill(chatSessionId, chatExplicitAgentId ?? chatAgentFingerprint, chatProjectedCost);
@@ -9489,7 +9519,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     {
       const rc = runCtx.getStore();
       if (rc?.runId) {
-        const runProjected = projectedRequestCost(targetModel, promptText);
+        const runProjected = reservationCost(targetModel, promptText, request);
         const capCheck = checkRunCap(rc, runProjected);
         if (capCheck.blocked) {
           recordCapKill(chatSessionId, chatExplicitAgentId ?? chatAgentFingerprint, runProjected, rc.runId);
@@ -9759,7 +9789,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         );
       }
     }
-  }));
+  })));
 
   // ── Health Watchdog ──
   let watchdogFailures = 0;
@@ -10549,7 +10579,7 @@ async function handleNonStreamingRequest(
 
   // ── Cache: store non-streaming chat/completions response ──
   const chatRespCache = getResponseCache();
-  const chatReqAsRecord = request as unknown as Record<string, unknown>;
+  const chatReqAsRecord = request;
   const chatCacheBypassLocal = chatRespCache.shouldBypass(chatReqAsRecord);
   let chatCacheHeaderVal: string = chatCacheBypassLocal ? 'BYPASS' : 'MISS';
   if (!chatCacheBypassLocal) {

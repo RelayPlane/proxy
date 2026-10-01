@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.9.70 (2026-10-01)
+
+### Fixed
+
+- **Caps now hold under concurrency.** Admission was check-then-act: it read the spend
+  recorded so far, forwarded the request, and only recorded the cost when the response
+  came back, so every request in a burst passed the same check. The third-party
+  [per-run-budget-benchmark](https://github.com/domondi1/per-run-budget-benchmark)
+  (burst30, 2026-09-30) measured 1.9.69 letting 30 of 30 concurrent calls through a
+  per-run cap worth 10 calls; sequential calls were already capped correctly.
+  Admission now reserves the request's estimated cost in the same synchronous step as
+  the check, so concurrent requests see each other's in-flight spend. The reservation is
+  replaced by the actual cost when the response is recorded, and released on upstream
+  failure, client disconnect, stream end or any early return; a 15 minute expiry backstops
+  any hold that outlives its request. This covers every cap on the admission path: the
+  per-run cap (`X-RelayPlane-Run-Cap-Usd`, `--cap`, `defaultRunCapUsd`), the daily and
+  hourly budget (`budget.dailyUsd`, `budget.hourlyUsd`), the daily cap
+  (`budget.dailyCapUSD`, `relayplane cap set`) and the Claude Code per-session cap
+  (`budget.sessionCapUsd`), on both `/v1/messages` and `/v1/chat/completions`, streaming
+  and not. Benchmark after the fix: burst30 10 (+0), seq15 10, stream burst30 10 (+0),
+  stream seq15 10.
+- **Projected cost now includes output.** The admission estimate is prompt tokens at the
+  input price plus the request's `max_tokens` (or `max_completion_tokens`,
+  `max_output_tokens`, `generationConfig.maxOutputTokens`; 1024 when unstated; capped at
+  4096) at the output price. The old input-only estimate was a few percent of a typical
+  call, which is why a burst could reserve its way far past a cap. Very small caps now
+  block a request whose worst-case output would not fit.
+
 ## 1.10.0 (unreleased)
 
 Run attribution: tag work at dispatch time, and the proxy rolls cost up by run, agent

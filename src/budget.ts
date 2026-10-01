@@ -10,6 +10,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
+import { KeyedReservationPool, ReservationPool, fitsUnderCap, type ReleaseFn } from './budget-reservations.js';
 
 /**
  * Resolve the RelayPlane home directory, honoring RELAYPLANE_HOME_OVERRIDE.
@@ -243,6 +244,11 @@ export class BudgetManager {
   // In-memory session budget cache: sessionId → SessionBudgetRecord
   private sessionCache: Map<string, SessionBudgetRecord> = new Map();
 
+  // In-flight reservations (admitted, not yet recorded). Counted by every
+  // check so concurrent requests cannot all pass the same headroom.
+  private spendReservations = new ReservationPool();
+  private sessionReservations = new KeyedReservationPool();
+
   constructor(config?: Partial<BudgetConfig>) {
     this.config = { ...DEFAULT_BUDGET_CONFIG, ...config };
   }
@@ -391,9 +397,13 @@ export class BudgetManager {
     }
 
     const projected = Math.max(0, opts?.projectedCost ?? 0);
+    // Spend already committed = recorded spend + reservations held by requests in flight.
+    const inFlight = this.spendReservations.reserved();
+    const committedHourly = this.hourlySpendCache + inFlight;
+    const committedDaily = this.dailySpendCache + inFlight;
 
     // Hourly check (spend so far, or spend so far plus what this request would add)
-    if (this.hourlySpendCache >= this.config.hourlyUsd || (projected > 0 && this.hourlySpendCache + projected > this.config.hourlyUsd)) {
+    if (!fitsUnderCap(committedHourly, projected, this.config.hourlyUsd)) {
       return {
         allowed: this.config.onBreach !== 'block',
         breached: true,
@@ -406,7 +416,7 @@ export class BudgetManager {
     }
 
     // Daily check (spend so far, or spend so far plus what this request would add)
-    if (this.dailySpendCache >= this.config.dailyUsd || (projected > 0 && this.dailySpendCache + projected > this.config.dailyUsd)) {
+    if (!fitsUnderCap(committedDaily, projected, this.config.dailyUsd)) {
       return {
         allowed: this.config.onBreach !== 'block',
         breached: true,
@@ -435,6 +445,21 @@ export class BudgetManager {
       currentHourlySpend: this.hourlySpendCache,
       thresholdsCrossed,
     };
+  }
+
+  /**
+   * Reserve `amount` USD of daily/hourly headroom for an admitted request.
+   * Call in the same synchronous step as the passing checkBudget. Release
+   * once the request's actual cost has been recorded (or it failed).
+   */
+  reserveSpend(amount: number): ReleaseFn {
+    if (!this.config.enabled) return () => {};
+    return this.spendReservations.reserve(amount);
+  }
+
+  /** USD reserved by admitted requests that have not finished yet. */
+  getReservedSpend(): number {
+    return this.spendReservations.reserved();
   }
 
   /**
@@ -522,15 +547,17 @@ export class BudgetManager {
    * Returns whether the request is allowed, possibly with a downgraded model.
    * Called only when X-Claude-Code-Session-Id header is present.
    */
-  checkSessionBudget(sessionId: string, requestedModel: string): SessionBudgetCheckResult {
+  checkSessionBudget(sessionId: string, requestedModel: string, projectedCost?: number): SessionBudgetCheckResult {
     if (!this.config.enabled) {
       return { allowed: true, model: requestedModel, spent: 0, cap: 0 };
     }
     const record = this._getOrCreateSessionRecord(sessionId, this.config.sessionCapUsd);
     const spent = record.spentUsd;
     const cap = record.capUsd;
+    const projected = Math.max(0, projectedCost ?? 0);
+    const committed = spent + this.sessionReservations.reserved(sessionId);
 
-    if (spent >= cap) {
+    if (!fitsUnderCap(committed, projected, cap)) {
       return { allowed: false, model: requestedModel, reason: 'session_budget_exceeded', spent, cap };
     }
 
@@ -542,6 +569,17 @@ export class BudgetManager {
     }
 
     return { allowed: true, model, spent, cap };
+  }
+
+  /** Reserve session headroom for an admitted request (same synchronous step as the check). */
+  reserveSession(sessionId: string, amount: number): ReleaseFn {
+    if (!this.config.enabled) return () => {};
+    return this.sessionReservations.reserve(sessionId, amount);
+  }
+
+  /** USD reserved by in-flight requests of a session. */
+  getSessionReserved(sessionId: string): number {
+    return this.sessionReservations.reserved(sessionId);
   }
 
   /**
@@ -822,6 +860,9 @@ export class BudgetTracker {
   private dailySpend: number = 0;
   private cachedDay: string = '';
 
+  // In-flight reservations (admitted, not yet recorded)
+  private reservations = new ReservationPool();
+
   // Pending async writes
   private pendingWrites: Array<{ amount: number; model: string; dailyWindow: string; timestamp: number }> = [];
   private flushTimer: NodeJS.Timeout | null = null;
@@ -890,9 +931,21 @@ export class BudgetTracker {
     const cap = this.dailyCapUSD;
     const spent = this.dailySpend;
     const projected = Math.max(0, projectedCost ?? 0);
-    const allowed = spent < cap && !(projected > 0 && spent + projected > cap);
+    const committed = spent + this.reservations.reserved();
+    const allowed = fitsUnderCap(committed, projected, cap);
     const warn = allowed && cap > 0 && (spent / cap) >= this.warningThreshold;
     return { allowed, warn, spent, cap, warningThreshold: this.warningThreshold };
+  }
+
+  /** Reserve daily-cap headroom for an admitted request (same synchronous step as check). */
+  reserve(amount: number): ReleaseFn {
+    if (this.dailyCapUSD === null) return () => {};
+    return this.reservations.reserve(amount);
+  }
+
+  /** USD reserved by admitted requests that have not finished yet. */
+  getReserved(): number {
+    return this.reservations.reserved();
   }
 
   /**

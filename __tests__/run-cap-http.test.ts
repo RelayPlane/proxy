@@ -24,9 +24,13 @@ import {
   type SpawnedProxy,
 } from './helpers/p0-harness.js';
 
-/** ~40 chars, so the projected cost of request 1 stays under the cap. */
+/**
+ * ~40 chars. Admission reserves prompt input plus the requested output
+ * (messagesBody asks max_tokens 64, ~$0.001 on sonnet), so request 1 fits
+ * under a $0.002 cap.
+ */
 const SHORT_PROMPT = 'cap-1 first request, cheap and short.';
-/** Long enough that the projected input cost alone blows through the cap. */
+/** Long enough that its reservation on top of request 1's spend crosses the cap. */
 const LONG_PROMPT = `cap-1 second request. ${'expensive padding token stream. '.repeat(80)}`;
 
 describe('per-run cap in block mode', () => {
@@ -48,7 +52,7 @@ describe('per-run cap in block mode', () => {
   it('the first request under the cap goes through and arms the cap on the run', async () => {
     const res = await request(proxy.port, '/v1/messages', {
       body: messagesBody(SHORT_PROMPT),
-      headers: { 'X-RelayPlane-Run': 'cap-1', 'X-RelayPlane-Run-Cap-Usd': '0.0001' },
+      headers: { 'X-RelayPlane-Run': 'cap-1', 'X-RelayPlane-Run-Cap-Usd': '0.002' },
     });
     expect(res.status, res.text).toBe(200);
     expect(res.headers['x-relayplane-run-id']).toBe('cap-1');
@@ -56,7 +60,7 @@ describe('per-run cap in block mode', () => {
 
     const run = readRunsDb(home).runs.find((r) => r.run_id === 'cap-1');
     expect(run, 'no run row for cap-1').toBeTruthy();
-    expect(run!.cap_usd).toBeCloseTo(0.0001, 10);
+    expect(run!.cap_usd).toBeCloseTo(0.002, 10);
   }, 30_000);
 
   it('the second request over the cap is blocked with 429 run_budget_exceeded and never reaches the upstream', async () => {

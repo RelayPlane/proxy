@@ -36,6 +36,10 @@ export interface MockUpstream {
    * prompt text is the only way a test can slow one concurrent call down.
    */
   delays: Map<string, number>;
+  /** Override the usage block every completion reports (null = the canned defaults). */
+  usage: { prompt_tokens: number; completion_tokens: number } | null;
+  /** When set, every completion answers with this HTTP status and an OpenAI-shaped error. */
+  failStatus: number | null;
 }
 
 /** First user message text of an OpenAI-style or Anthropic-style body. */
@@ -99,7 +103,11 @@ function delayFor(delays: Map<string, number>, text: string): number {
  */
 export function startMockUpstream(): Promise<MockUpstream> {
   const calls: UpstreamCall[] = [];
-  const state = { omitUsage: false };
+  const state: {
+    omitUsage: boolean;
+    usage: { prompt_tokens: number; completion_tokens: number } | null;
+    failStatus: number | null;
+  } = { omitUsage: false, usage: null, failStatus: null };
   const delays = new Map<string, number>();
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -111,6 +119,14 @@ export function startMockUpstream(): Promise<MockUpstream> {
       const model = String(body['model'] ?? 'mock-model');
       const wait = delayFor(delays, firstUserText(body));
       const answer = (): void => {
+      if (state.failStatus !== null) {
+        res.writeHead(state.failStatus, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: `mock upstream ${state.failStatus}`, type: 'server_error' } }));
+        return;
+      }
+      const usage = state.usage
+        ? { ...state.usage, total_tokens: state.usage.prompt_tokens + state.usage.completion_tokens }
+        : null;
       if (body['stream'] === true) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         const chunk = (delta: Record<string, unknown>, finish: string | null = null) =>
@@ -120,7 +136,7 @@ export function startMockUpstream(): Promise<MockUpstream> {
         res.write(chunk({}, 'stop'));
         const so = body['stream_options'] as { include_usage?: boolean } | undefined;
         if (so?.include_usage === true && !state.omitUsage) {
-          res.write(`data: ${JSON.stringify({ id: 'chatcmpl-mock', object: 'chat.completion.chunk', created: 1, model, choices: [], usage: { prompt_tokens: 21, completion_tokens: 2, total_tokens: 23 } })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: 'chatcmpl-mock', object: 'chat.completion.chunk', created: 1, model, choices: [], usage: usage ?? { prompt_tokens: 21, completion_tokens: 2, total_tokens: 23 } })}\n\n`);
         }
         res.write('data: [DONE]\n\n');
         res.end();
@@ -133,7 +149,7 @@ export function startMockUpstream(): Promise<MockUpstream> {
         created: 1,
         model,
         choices: [{ index: 0, message: { role: 'assistant', content: 'PONG' }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 15, completion_tokens: 2, total_tokens: 17 },
+        usage: usage ?? { prompt_tokens: 15, completion_tokens: 2, total_tokens: 17 },
       }));
       };
       if (wait > 0) setTimeout(answer, wait); else answer();
@@ -148,6 +164,10 @@ export function startMockUpstream(): Promise<MockUpstream> {
         delays,
         get omitUsage() { return state.omitUsage; },
         set omitUsage(v: boolean) { state.omitUsage = v; },
+        get usage() { return state.usage; },
+        set usage(v: { prompt_tokens: number; completion_tokens: number } | null) { state.usage = v; },
+        get failStatus() { return state.failStatus; },
+        set failStatus(v: number | null) { state.failStatus = v; },
         close: () => new Promise<void>((r) => { server.closeAllConnections?.(); server.close(() => r()); }),
       });
     });

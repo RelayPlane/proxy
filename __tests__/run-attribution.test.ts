@@ -681,7 +681,7 @@ describe('caps and response headers', () => {
     expect(checkRunCap(uncapped, 999)).toMatchObject({ blocked: false, cap: null });
 
     const anonymous = newRunRequestContext({ headers: {} }, NOW);
-    expect(checkRunCap(anonymous, 1)).toEqual({ blocked: false, warn: false, spent: 0, cap: null, runId: null });
+    expect(checkRunCap(anonymous, 1)).toEqual({ blocked: false, warn: false, spent: 0, cap: null, runId: null, reserved: 0 });
   });
 
   it('applies attribution.defaultRunCapUsd when no header is present', () => {

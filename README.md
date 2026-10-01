@@ -54,7 +54,8 @@ Full walkthrough: [relayplane.com/docs/quickstart](https://relayplane.com/docs/q
   [Routing](https://relayplane.com/docs/concepts/routing)
 - **Budget caps.** Hard limits (daily, hourly, per-request, per-session, and
   per-run) that block, downgrade, or warn. A per-run cap 429s that one job
-  instead of stopping the whole machine.
+  instead of stopping the whole machine. Caps hold under concurrency:
+  in-flight requests reserve their estimated cost at admission.
   [Budget caps](https://relayplane.com/docs/budget-cap)
 - **Kill switch.** One command or one button halts all routed traffic
   instantly, with an audit trail of what was stopped and what it saved.
@@ -112,7 +113,10 @@ at all.
 | `X-RelayPlane-Run-Cap-Usd` | Per-run hard cap, in USD |
 
 Set an expected-cost band per label and the proxy tells you when today's run is
-not like the others. Set a per-run cap and it 429s that one job. Retries are
+not like the others. Set a per-run cap and it 429s that one job, including
+under a burst of concurrent calls: each call reserves its estimated cost
+before it is forwarded, so 30 simultaneous calls on a 10-call cap admit 10.
+Retries are
 counted apart from first attempts, so you can see how much of a run was rework.
 Every figure is notional list price for the traffic, never an invoice, and the
 ledger is SQLite on your machine.

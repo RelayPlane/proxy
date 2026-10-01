@@ -19,6 +19,7 @@ import * as crypto from 'node:crypto';
 import type * as http from 'node:http';
 
 import { sha256Hex } from './trace-writer.js';
+import { KeyedReservationPool, RequestHolds, fitsUnderCap, type ReleaseFn } from './budget-reservations.js';
 import { estimateCost } from './telemetry.js';
 import { maybeFireRunFirstAttributed, maybeFireRunMilestone } from './lifecycle-telemetry.js';
 import {
@@ -187,6 +188,8 @@ export interface RunRequestContext {
   requestedModel?: string;
   lastUserMessageHash?: string;
   historyEntry?: RunHistoryEntryLike;
+  /** Budget reservations this request holds; released when its handler settles. */
+  budgetHolds?: RequestHolds;
 }
 
 /** Structural mirror of standalone-proxy's RequestHistoryEntry (plus the run fields). */
@@ -1047,21 +1050,57 @@ export function recordRunRequest(entry: RunHistoryEntryLike, rc: RunRequestConte
 // Caps, headers, lifecycle
 // ---------------------------------------------------------------------------
 
+/** In-flight reservations per run id (see budget-reservations.ts). */
+const runReservations = new KeyedReservationPool();
+
+/** Attach a reservation release to this request so it is released when the handler settles. */
+export function addBudgetHold(rc: RunRequestContext | undefined, release: ReleaseFn): void {
+  if (!rc) { release(); return; }
+  if (!rc.budgetHolds) rc.budgetHolds = new RequestHolds();
+  rc.budgetHolds.add(release);
+}
+
+/** Release every reservation this request holds. Idempotent; safe on any exit path. */
+export function releaseBudgetHolds(rc: RunRequestContext | undefined): void {
+  rc?.budgetHolds?.releaseAll();
+}
+
+/** USD currently reserved by in-flight requests of a run. */
+export function runReservedUsd(runId: string): number {
+  return runReservations.reserved(runId);
+}
+
+/**
+ * Admission for the per-run cap. Check and reserve happen in one synchronous
+ * step: the request is admitted only if recorded spend, plus what requests
+ * already in flight have reserved, plus this request's estimate stays within
+ * the cap, and an admitted request reserves its estimate before returning.
+ * The reservation is released when the request settles (its actual cost is
+ * recorded into the run by then), so concurrent requests cannot all pass a
+ * check that only one of them fits under.
+ */
 export function checkRunCap(
   rc: RunRequestContext,
   projectedCost: number,
-): { blocked: boolean; warn: boolean; spent: number; cap: number | null; runId: string | null } {
+): { blocked: boolean; warn: boolean; spent: number; cap: number | null; runId: string | null; reserved: number } {
   const runId = rc.runId;
-  if (!runId) return { blocked: false, warn: false, spent: 0, cap: null, runId: null };
+  if (!runId) return { blocked: false, warn: false, spent: 0, cap: null, runId: null, reserved: 0 };
   const store = getRunStore();
   const run = store.getRun(runId);
-  if (!run) return { blocked: false, warn: false, spent: 0, cap: null, runId };
+  if (!run) return { blocked: false, warn: false, spent: 0, cap: null, runId, reserved: 0 };
   const cap = run.cap_usd;
-  if (cap === null) return { blocked: false, warn: false, spent: run.cost_usd, cap: null, runId };
-  if (run.cost_usd + projectedCost <= cap) {
-    return { blocked: false, warn: false, spent: run.cost_usd, cap, runId };
+  if (cap === null) return { blocked: false, warn: false, spent: run.cost_usd, cap: null, runId, reserved: 0 };
+  const estimate = Number.isFinite(projectedCost) && projectedCost > 0 ? projectedCost : 0;
+  const reserved = runReservations.reserved(runId);
+  const committed = run.cost_usd + reserved;
+  // A run that has already reached its cap admits nothing, even a zero-estimate request.
+  if (fitsUnderCap(committed, estimate, cap)) {
+    addBudgetHold(rc, runReservations.reserve(runId, estimate));
+    return { blocked: false, warn: false, spent: run.cost_usd, cap, runId, reserved };
   }
   const blocked = _config.runCapAction === 'block';
+  // warn mode still admits, so it still reserves: in-flight spend stays visible to the next check.
+  if (!blocked) addBudgetHold(rc, runReservations.reserve(runId, estimate));
   const now = Date.now();
   if (store.markCapHit(runId, now)) {
     const alert = store.addAlert({
@@ -1070,12 +1109,12 @@ export function checkRunCap(
       run_id: runId,
       agent_label: rc.agentLabel ?? null,
       severity: 'critical',
-      message: `Run ${runId} hit its cap: $${run.cost_usd.toFixed(4)} of $${cap.toFixed(4)}`,
-      data: { run_id: runId, spent: run.cost_usd, cap, projected: projectedCost, action: _config.runCapAction },
+      message: `Run ${runId} hit its cap: $${run.cost_usd.toFixed(4)} spent + $${reserved.toFixed(4)} in flight of $${cap.toFixed(4)}`,
+      data: { run_id: runId, spent: run.cost_usd, reserved, cap, projected: projectedCost, action: _config.runCapAction },
     });
     deliverAlert(alert);
   }
-  return { blocked, warn: !blocked, spent: run.cost_usd, cap, runId };
+  return { blocked, warn: !blocked, spent: run.cost_usd, cap, runId, reserved };
 }
 
 export function withRunHeaders<T extends Record<string, string>>(headers: T): T & Record<string, string> {
@@ -1224,6 +1263,7 @@ export function _resetRunAttributionForTests(): void {
   cacheTallyByRun.clear();
   rateLimitRingByRun.clear();
   waveFiredAtByRun.clear();
+  runReservations.clear();
   lastInvalidRunLogAt = 0;
   _config = resolveAttributionConfig(undefined);
   _deps = {};
