@@ -180,6 +180,38 @@ export function estimateCost(model: string, inputTokens: number, outputTokens: n
 }
 
 /**
+ * Per-provider rates (USD per 1M tokens) used only when a run's model has
+ * no row in MODEL_PRICING. Each row is the list price of the model named
+ * in its comment, so the fallback is a real price rather than a guess.
+ */
+export const PROVIDER_FALLBACK_PRICING: Record<string, ModelPrice> = {
+  anthropic: { input: 3.0, output: 15.0 }, // claude-sonnet-4-6
+  openai: { input: 2.5, output: 10.0 }, // gpt-4o
+  openrouter: { input: 3.0, output: 15.0 }, // varies; Sonnet-class default
+};
+
+/**
+ * Cost of a completed run when the caller knows the provider and the
+ * model. Prices by model id first (canonical ids, aliases and
+ * provider-prefixed ids such as 'anthropic/claude-sonnet-4-6'), then
+ * falls back to the provider's row in PROVIDER_FALLBACK_PRICING.
+ */
+export function estimateProviderCost(
+  provider: string,
+  model: string | undefined,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const bare = model && model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
+  const pricing =
+    (model ? MODEL_PRICING[model] : undefined) ??
+    (bare ? MODEL_PRICING[bare] : undefined) ??
+    PROVIDER_FALLBACK_PRICING[provider] ??
+    PROVIDER_FALLBACK_PRICING['anthropic']!;
+  return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
+}
+
+/**
  * Set audit mode - shows telemetry payload before sending
  */
 export function setAuditMode(enabled: boolean): void {

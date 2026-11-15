@@ -1,0 +1,29 @@
+name: llm-prices
+
+# Fails when a hard-coded model price in src/ drifts from the provider's
+# official pricing page (Anthropic, OpenAI, Google, DeepSeek). Prices are
+# compared per 1M tokens, so per-1K tables are checked too.
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  price-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Mattbusel/llm-prices@v1
+        with:
+          paths: 'src/**'
+          fail-on: drift
