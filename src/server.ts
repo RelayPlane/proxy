@@ -58,6 +58,7 @@ import {
 import { RelayPlaneMiddleware } from './middleware.js';
 import { type RelayPlaneConfig, type MeshConfig, resolveConfig, resolveMeshConfig } from './relay-config.js';
 import { initMesh, type MeshHandle } from './mesh.js';
+import { estimateProviderCost } from './telemetry.js';
 
 /**
  * Proxy server configuration
@@ -1110,7 +1111,7 @@ export class ProxyServer {
       const latencyMs = Date.now() - startTime;
 
       if (providerResponse.success) {
-        const costUsd = this.estimateCost(provider, providerResponse.usage);
+        const costUsd = this.estimateCost(provider, request.model, providerResponse.usage);
 
         // Complete run successfully
         await this.ledger.completeRun(runId, {
@@ -1349,25 +1350,17 @@ export class ProxyServer {
   }
 
   /**
-   * Estimate cost based on provider and usage
+   * Estimate cost from the run's model, falling back to the provider rate.
+   * Prices come from telemetry.ts MODEL_PRICING (model-pricing.ts for
+   * Claude and GPT-5 rows), so this path agrees with the dashboard.
    */
   private estimateCost(
     provider: string,
+    model: string | undefined,
     usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
   ): number {
     if (!usage) return 0;
-
-    // Approximate pricing per 1K tokens
-    const pricing: Record<string, { input: number; output: number }> = {
-      anthropic: { input: 0.003, output: 0.015 }, // Claude 3.5 Sonnet
-      openai: { input: 0.005, output: 0.015 }, // GPT-4o
-      openrouter: { input: 0.003, output: 0.015 }, // Varies
-    };
-
-    const rates = pricing[provider] ?? { input: 0.003, output: 0.015 };
-    return (
-      (usage.prompt_tokens / 1000) * rates.input + (usage.completion_tokens / 1000) * rates.output
-    );
+    return estimateProviderCost(provider, model, usage.prompt_tokens, usage.completion_tokens);
   }
 
   /**
